@@ -51,13 +51,18 @@ except Exception:
     QWebEngineView = None
 
 try:
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+except Exception:
+    QWebEngineSettings = None
+
+try:
     import pygame
 except Exception:
     pygame = None
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "2.7-input-search-trailer-fixes"
+APP_VERSION = "2.8-controller-trailer-continue-watching"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -90,6 +95,7 @@ def build_youtube_embed_html(video_key: str) -> str:
   <div id="player"></div>
   <script>
     let player = null;
+    let playRequested = false;
 
     function onYouTubeIframeAPIReady() {{
       player = new YT.Player('player', {{
@@ -101,11 +107,24 @@ def build_youtube_embed_html(video_key: str) -> str:
           enablejsapi: 1,
           origin: {safe_origin},
           widget_referrer: {safe_referrer}
+        }},
+        events: {{
+          onReady: function(event) {{
+            if (playRequested) event.target.playVideo();
+          }}
         }}
       }});
     }}
 
+    window.pistickPlayTrailer = function() {{
+      playRequested = true;
+      if (!player || typeof player.playVideo !== 'function') return false;
+      player.playVideo();
+      return true;
+    }};
+
     window.pistickPauseTrailer = function() {{
+      playRequested = false;
       if (!player || typeof player.pauseVideo !== 'function') return false;
       player.pauseVideo();
       return true;
@@ -353,7 +372,16 @@ class WatchStateStore:
             if entry.get("status") == "in_progress" and entry.get("media")
         ]
         entries.sort(key=lambda x: float(x.get("updated_at", 0.0)), reverse=True)
-        return [dict(entry.get("media", {})) for entry in entries]
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            media = dict(entry.get("media", {}))
+            key = self.media_key(media)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(media)
+        return items
 
 
 class TMDBClient:
@@ -559,6 +587,15 @@ if QWebEngineView is not None:
 
         def __init__(self, parent: Optional[QWidget] = None):
             super().__init__(parent)
+            if QWebEngineSettings is not None:
+                web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
+                playback_attribute = getattr(
+                    web_attribute,
+                    "PlaybackRequiresUserGesture",
+                    None,
+                )
+                if playback_attribute is not None:
+                    self.settings().setAttribute(playback_attribute, False)
             app = QApplication.instance()
             if app is not None:
                 app.installEventFilter(self)
@@ -579,6 +616,11 @@ if QWebEngineView is not None:
             ):
                 self.clicked.emit()
             return False
+
+        def play_trailer(self) -> None:
+            self.page().runJavaScript(
+                "window.pistickPlayTrailer && window.pistickPlayTrailer();"
+            )
 
         def pause_trailer(self) -> None:
             self.page().runJavaScript(
@@ -955,10 +997,30 @@ class MediaRow(QWidget):
         open_details: Callable[[dict[str, Any]], None],
         state_lookup: Optional[Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = None,
         show_progress: bool = False,
+        infinite: bool = True,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
-        self.items = list(items[:20])
+        unique_items: list[dict[str, Any]] = []
+        seen_items: set[tuple[str, str]] = set()
+        for item in items:
+            media_id = item.get("id")
+            if media_id is None:
+                identity = (
+                    "fallback",
+                    f"{item.get('title') or item.get('name', '')}|{item.get('poster_path', '')}",
+                )
+            else:
+                identity = (str(item.get("media_type") or "movie"), str(media_id))
+            if identity in seen_items:
+                continue
+            seen_items.add(identity)
+            unique_items.append(item)
+            if len(unique_items) >= 20:
+                break
+
+        self.items = unique_items
+        self.infinite = bool(infinite and len(self.items) > 1)
         self.cards: list[MediaCard] = []
         self.left_clone: Optional[MediaCard] = None
         self.right_clone: Optional[MediaCard] = None
@@ -1010,29 +1072,33 @@ class MediaRow(QWidget):
         # the rebase is invisible and the viewport never reaches an empty gap.
         if self.items:
             self.cards = [make_card(item) for item in self.items]
-            item_count = len(self.items)
-            repeat_count = max(3, (30 + item_count - 1) // item_count)
-            if repeat_count % 2 == 0:
-                repeat_count += 1
-            center_repeat = repeat_count // 2
-            display_cards: list[MediaCard] = []
+            if self.infinite:
+                item_count = len(self.items)
+                repeat_count = max(3, (30 + item_count - 1) // item_count)
+                if repeat_count % 2 == 0:
+                    repeat_count += 1
+                center_repeat = repeat_count // 2
+                display_cards: list[MediaCard] = []
 
-            for repeat_index in range(repeat_count):
-                for item_index, item in enumerate(self.items):
-                    if repeat_index == center_repeat:
-                        card = self.cards[item_index]
-                    else:
-                        card = make_card(
-                            item,
-                            clone=True,
-                            image_source=self.cards[item_index].poster,
-                        )
-                    display_cards.append(card)
+                for repeat_index in range(repeat_count):
+                    for item_index, item in enumerate(self.items):
+                        if repeat_index == center_repeat:
+                            card = self.cards[item_index]
+                        else:
+                            card = make_card(
+                                item,
+                                clone=True,
+                                image_source=self.cards[item_index].poster,
+                            )
+                        display_cards.append(card)
+                        self.row_layout.addWidget(card)
+
+                center_start = center_repeat * item_count
+                self.left_clone = display_cards[center_start - 1]
+                self.right_clone = display_cards[center_start + item_count]
+            else:
+                for card in self.cards:
                     self.row_layout.addWidget(card)
-
-            center_start = center_repeat * item_count
-            self.left_clone = display_cards[center_start - 1]
-            self.right_clone = display_cards[center_start + item_count]
 
         self.content.adjustSize()
         width = max(self.row_layout.sizeHint().width(), self.content.sizeHint().width())
@@ -1067,7 +1133,7 @@ class MediaRow(QWidget):
 
     def _rebase_scroll_position(self) -> None:
         """Move to an identical copy of the row before a physical edge appears."""
-        if not self.cards or self._wrapping:
+        if not self.infinite or not self.cards or self._wrapping:
             return
         bar = self.scroll.horizontalScrollBar()
         anchor = self.cards[0].x()
@@ -1795,6 +1861,15 @@ class DetailDialog(QDialog):
         ):
             self.trailer_web.pause_trailer()
 
+    def _watch_trailer_clicked(self) -> None:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "play_trailer"):
+            return
+        web.play_trailer()
+        # Match clicking the embedded player: playback begins inline, then the
+        # existing two-second fullscreen animation takes over.
+        self._schedule_trailer_fullscreen()
+
     def exit_trailer_fullscreen(self) -> bool:
         if not self._trailer_fullscreen or self.trailer_overlay is None:
             return False
@@ -1980,14 +2055,14 @@ class DetailDialog(QDialog):
             self.controller_actions.append(unwatched)
 
         trailer = self._pick_trailer(media)
-        if trailer:
-            external_button = QPushButton("↗  Open trailer")
-            external_button.setObjectName("secondaryButton")
-            external_button.setProperty("controllerSelected", False)
-            external_button.setFocusPolicy(Qt.StrongFocus)
-            external_button.clicked.connect(lambda: webbrowser.open(f"https://www.youtube.com/watch?v={trailer['key']}"))
-            buttons.addWidget(external_button)
-            self.controller_actions.append(external_button)
+        if trailer and TrailerWebView is not None:
+            trailer_button = QPushButton("▶  Watch Trailer")
+            trailer_button.setObjectName("secondaryButton")
+            trailer_button.setProperty("controllerSelected", False)
+            trailer_button.setFocusPolicy(Qt.StrongFocus)
+            trailer_button.clicked.connect(self._watch_trailer_clicked)
+            buttons.addWidget(trailer_button)
+            self.controller_actions.append(trailer_button)
         buttons.addStretch(1)
         info.addLayout(buttons)
         info.addStretch(1)
@@ -2023,7 +2098,7 @@ class DetailDialog(QDialog):
             self.trailer_placeholder = placeholder
             self.body.addWidget(placeholder, 1)
         elif trailer:
-            note = QLabel("Embedded trailer playback is unavailable. Use “Open trailer” above.")
+            note = QLabel("Embedded trailer playback is unavailable in this build.")
             note.setObjectName("mutedLabel")
             note.setAlignment(Qt.AlignCenter)
             self.body.addWidget(note, 1)
@@ -2619,7 +2694,13 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(24, 14, 24, 36)
         content_layout.setSpacing(28)
 
-        # Profile-specific row only appears when something was started but not finished.
+        trending = payload.get("trending") or []
+        if trending:
+            hero_candidates = [x for x in trending if x.get("backdrop_path")]
+            content_layout.addWidget(HeroBanner((hero_candidates or trending)[0], self.thread_pool, self.open_details))
+
+        # Keep each in-progress title visible exactly once. A short personal
+        # list should not be padded with infinite-row clones of the same movie.
         continue_items = self.watch_state.continue_watching(self.active_profile_id)
         if continue_items:
             content_layout.addWidget(
@@ -2630,13 +2711,9 @@ class MainWindow(QMainWindow):
                     self.open_details,
                     state_lookup=self._watch_entry,
                     show_progress=True,
+                    infinite=False,
                 )
             )
-
-        trending = payload.get("trending") or []
-        if trending:
-            hero_candidates = [x for x in trending if x.get("backdrop_path")]
-            content_layout.addWidget(HeroBanner((hero_candidates or trending)[0], self.thread_pool, self.open_details))
 
         self.home_sections = payload.get("sections", [])
         for title, items in self.home_sections:
