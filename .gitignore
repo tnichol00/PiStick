@@ -5,6 +5,7 @@ __pycache__/
 
 # Config files
 config.json
+pistick_state.json
 
 # C extensions
 *.so
