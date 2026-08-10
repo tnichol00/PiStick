@@ -154,7 +154,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.1-on-demand-trailers"
+APP_VERSION = "3.1.1-on-demand-trailers"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -1721,10 +1721,11 @@ def get_trailer_web_view_class():
                 self._profile = QWebEngineProfile(self)
             self._configure_profile(self._profile, QWebEngineProfile)
             self._page = QWebEnginePage(self._profile, self)
-            previous_page = self.page()
+            # QWebEngineView owns its automatically created page. On PySide6,
+            # setPage() can destroy that page immediately, which also
+            # invalidates its Python wrapper. Do not call deleteLater() on the
+            # old wrapper after setPage(); Qt has already handled its lifetime.
             self.setPage(self._page)
-            if previous_page is not self._page:
-                previous_page.deleteLater()
 
             web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
             for name, enabled in (
@@ -1811,12 +1812,11 @@ def get_trailer_web_view_class():
                 self.setUrl(QUrl("about:blank"))
             except RuntimeError:
                 pass
-            page = getattr(self, "_page", None)
-            profile = getattr(self, "_profile", None)
-            if page is not None:
-                page.deleteLater()
-            if profile is not None:
-                profile.deleteLater()
+            # The page and profile are QObject children of this view. The
+            # dialog schedules the view itself for deletion immediately after
+            # dispose(), so Qt will destroy both children in the correct order.
+            # Deleting them independently can race QWebEngineView teardown and
+            # leave PySide holding another invalid C++ wrapper.
 
     _TrailerWebView.__name__ = "TrailerWebView"
     TrailerWebView = _TrailerWebView
