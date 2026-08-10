@@ -5,9 +5,10 @@ import time
 import uuid
 import webbrowser
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from PySide6.QtCore import (
@@ -45,11 +46,9 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from PySide6.QtWebEngineCore import QWebEngineHttpRequest
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except Exception:
     QWebEngineView = None
-    QWebEngineHttpRequest = None
 
 try:
     import pygame
@@ -68,6 +67,42 @@ STATE_PATH = Path(__file__).with_name("pistick_state.json")
 # an HTTPS Referer. Keep this stable if PiStick is packaged later.
 YOUTUBE_APP_ID = "com.layeredkingdom.pistick"
 YOUTUBE_REFERER = f"https://{YOUTUBE_APP_ID}/"
+
+
+def build_youtube_embed_html(video_key: str) -> str:
+    """Create a YouTube iframe whose WebView base URL supplies app identity."""
+    origin = YOUTUBE_REFERER.rstrip("/")
+    query = urlencode(
+        {
+            "rel": "0",
+            "playsinline": "1",
+            "origin": origin,
+            "widget_referrer": YOUTUBE_REFERER,
+        }
+    )
+    safe_key = quote(str(video_key), safe="-_")
+    embed_url = escape(f"https://www.youtube.com/embed/{safe_key}?{query}", quote=True)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <style>
+    html, body {{ width:100%; height:100%; margin:0; background:#0b0b0d; overflow:hidden; }}
+    iframe {{ width:100%; height:100%; border:0; display:block; }}
+  </style>
+</head>
+<body>
+  <iframe
+    src="{embed_url}"
+    title="YouTube trailer"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    referrerpolicy="strict-origin-when-cross-origin"
+    allowfullscreen>
+  </iframe>
+</body>
+</html>"""
 
 
 # Keep background QRunnables alive until their run() methods finish.
@@ -1562,26 +1597,18 @@ class DetailDialog(QDialog):
         trailer_heading.setObjectName("rowHeading")
         self.body.addWidget(trailer_heading)
 
-        if trailer and QWebEngineView is not None and QWebEngineHttpRequest is not None:
+        if trailer and QWebEngineView is not None:
             web = QWebEngineView()
             web.setMinimumHeight(360)
             web.setFocusPolicy(Qt.NoFocus)
 
-            # Load the YouTube embed directly and identify PiStick with an HTTPS
-            # Referer. YouTube now requires this for desktop/WebView embeds.
-            origin = YOUTUBE_REFERER.rstrip("/")
-            query = urlencode(
-                {
-                    "rel": "0",
-                    "playsinline": "1",
-                    "origin": origin,
-                    "widget_referrer": YOUTUBE_REFERER,
-                }
+            # YouTube error 153 occurs when the player request has no client
+            # identity. The HTTPS base URL makes Chromium send PiStick's app ID
+            # as the iframe Referer instead of treating it as an anonymous load.
+            web.setHtml(
+                build_youtube_embed_html(trailer["key"]),
+                QUrl(f"{YOUTUBE_REFERER}trailer.html"),
             )
-            embed_url = f"https://www.youtube.com/embed/{trailer['key']}?{query}"
-            request = QWebEngineHttpRequest(QUrl(embed_url))
-            request.setHeader(b"Referer", YOUTUBE_REFERER.encode("utf-8"))
-            web.load(request)
             self.body.addWidget(web, 1)
         elif trailer:
             note = QLabel("Embedded trailer playback is unavailable. Use “Open trailer” above.")
@@ -1598,15 +1625,53 @@ class DetailDialog(QDialog):
             self.controlsReady.emit(self.preferred_controller_widget)
 
     def controller_focusables(self) -> list[QWidget]:
-        widgets: list[QWidget] = []
-        if getattr(self, "close_button", None) is not None and self.close_button.isVisible():
-            widgets.append(self.close_button)
-        widgets.extend(
+        widgets = [
             button
             for button in self.controller_actions
             if button is not None and button.isVisible() and button.isEnabled()
-        )
+        ]
+        if getattr(self, "close_button", None) is not None and self.close_button.isVisible():
+            widgets.append(self.close_button)
         return widgets
+
+    def controller_current_target(self, current: Optional[QWidget] = None) -> Optional[QWidget]:
+        focusables = self.controller_focusables()
+        if current in focusables:
+            return current
+        if self.preferred_controller_widget in focusables:
+            return self.preferred_controller_widget
+        return focusables[0] if focusables else None
+
+    def controller_move_target(
+        self,
+        direction: str,
+        current: Optional[QWidget] = None,
+    ) -> Optional[QWidget]:
+        """Return the next details control without relying on WebEngine focus."""
+        actions = [
+            button
+            for button in self.controller_actions
+            if button is not None and button.isVisible() and button.isEnabled()
+        ]
+        close_button = getattr(self, "close_button", None)
+        current = self.controller_current_target(current)
+
+        if current is close_button:
+            if actions and direction in {"down", "left", "right"}:
+                return actions[0]
+            return close_button
+
+        if current in actions:
+            index = actions.index(current)
+            if direction == "left":
+                return actions[(index - 1) % len(actions)]
+            if direction == "right":
+                return actions[(index + 1) % len(actions)]
+            if direction == "up" and close_button is not None:
+                return close_button
+            return current
+
+        return self.controller_current_target()
 
     @staticmethod
     def _pick_trailer(media: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1786,14 +1851,14 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         # Mouse/physical keyboard input turns off controller-only selection visuals.
         # ControllerManager does not generate Qt key events, so it will not trip this.
-        if event.type() in {
+        if event.spontaneous() and event.type() in {
             QEvent.MouseButtonPress,
             QEvent.MouseMove,
             QEvent.Wheel,
             QEvent.TouchBegin,
         }:
             self._clear_controller_selection()
-        elif event.type() == QEvent.KeyPress:
+        elif event.spontaneous() and event.type() == QEvent.KeyPress:
             self._clear_controller_selection()
 
         # Intercept wheel/trackpad input before poster/title child widgets can
@@ -2308,19 +2373,30 @@ class MainWindow(QMainWindow):
             lambda preferred, d=dialog: self._detail_controls_ready(d, preferred)
         )
         self._clear_controller_selection()
+        if self.controller.connected:
+            QTimer.singleShot(
+                0,
+                lambda d=dialog: self._focus_detail_control(d, d.close_button),
+            )
         dialog.exec()
         self._clear_controller_selection()
         self._refresh_home_from_state()
 
     def _detail_controls_ready(self, dialog: DetailDialog, preferred: QWidget) -> None:
+        QTimer.singleShot(
+            0,
+            lambda d=dialog, widget=preferred: self._focus_detail_control(d, widget),
+        )
+
+    def _focus_detail_control(self, dialog: DetailDialog, preferred: Optional[QWidget]) -> None:
         if not self.controller.connected:
             return
-        if QApplication.activeModalWidget() is not dialog:
+        if self._active_detail_dialog() is not dialog:
             return
-        if preferred is None or not preferred.isVisible():
+        target = dialog.controller_current_target(preferred)
+        if target is None:
             return
-        preferred.setFocus(Qt.OtherFocusReason)
-        self._set_controller_selected(preferred)
+        self._focus_controller_widget(target)
 
     def _show_home(self) -> None:
         if not self.active_profile_id:
@@ -2387,10 +2463,27 @@ class MainWindow(QMainWindow):
         self.controller_status.setVisible(connected and self.header.isVisible())
         if connected:
             self.controller_status.setToolTip(name or "Controller connected")
+            detail = self._active_detail_dialog()
+            if detail is not None:
+                QTimer.singleShot(
+                    0,
+                    lambda d=detail: self._focus_detail_control(d, d.controller_current_target()),
+                )
         else:
             self._clear_controller_selection()
 
+    @staticmethod
+    def _active_detail_dialog() -> Optional[DetailDialog]:
+        modal = QApplication.activeModalWidget()
+        if isinstance(modal, DetailDialog):
+            return modal
+        active = QApplication.activeWindow()
+        return active if isinstance(active, DetailDialog) and active.isModal() else None
+
     def _controller_root(self) -> QWidget:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            return detail
         modal = QApplication.activeModalWidget()
         if isinstance(modal, QWidget):
             return modal
@@ -2432,6 +2525,17 @@ class MainWindow(QMainWindow):
             self._ensure_focus_visible(candidates[0])
 
     def _controller_navigate(self, direction: str) -> None:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            current = self._controller_selected
+            if current not in detail.controller_focusables():
+                focus = QApplication.focusWidget()
+                current = focus if focus in detail.controller_focusables() else None
+            target = detail.controller_move_target(direction, current)
+            if target is not None:
+                self._focus_controller_widget(target)
+            return
+
         root = self._controller_root()
         candidates = self._controller_focusables(root)
         if not candidates:
@@ -2491,6 +2595,13 @@ class MainWindow(QMainWindow):
         if ensure_visible:
             self._ensure_focus_visible(card)
 
+    def _focus_controller_widget(self, widget: QWidget) -> None:
+        if widget is None or not widget.isVisible() or not widget.isEnabled():
+            return
+        widget.setFocus(Qt.OtherFocusReason)
+        self._set_controller_selected(widget)
+        self._ensure_focus_visible(widget)
+
     def _ensure_focus_visible(self, widget: QWidget) -> None:
         parent = widget.parentWidget()
         while parent is not None:
@@ -2501,6 +2612,18 @@ class MainWindow(QMainWindow):
             parent = parent.parentWidget()
 
     def _controller_activate(self) -> None:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            current = self._controller_selected
+            if current not in detail.controller_focusables():
+                focus = QApplication.focusWidget()
+                current = focus if focus in detail.controller_focusables() else None
+            target = detail.controller_current_target(current)
+            if target is not None:
+                self._focus_controller_widget(target)
+                target.click()
+            return
+
         root = self._controller_root()
         focus = QApplication.focusWidget()
         if focus is None or not focus.isVisibleTo(root):
@@ -2521,6 +2644,10 @@ class MainWindow(QMainWindow):
 
     def _controller_back(self) -> None:
         self._clear_controller_selection()
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            detail.reject()
+            return
         modal = QApplication.activeModalWidget()
         if isinstance(modal, QDialog):
             modal.reject()
