@@ -62,7 +62,7 @@ except Exception:
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "2.8-controller-trailer-continue-watching"
+APP_VERSION = "2.9-tv-season-episode-picker"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -167,8 +167,10 @@ def watch_title(media: dict[str, Any]) -> None:
     Replace this function with your Jellyfin API / playback code later.
 
     PiStick records that the current profile started this title before calling
-    this function. When you wire in Jellyfin, you can also update real playback
-    progress through WatchStateStore.set_progress().
+    this function. TV episode payloads include ``media_type="episode"``,
+    ``series_id``, ``season_number`` and ``episode_number``. When Jellyfin is
+    connected, report episode progress through
+    WatchStateStore.set_episode_progress().
     """
     pass
 
@@ -297,6 +299,8 @@ class WatchStateStore:
             "backdrop_path",
             "overview",
             "vote_average",
+            "number_of_seasons",
+            "seasons",
         )
         return {key: media.get(key) for key in keys if media.get(key) is not None}
 
@@ -307,6 +311,207 @@ class WatchStateStore:
 
     def entry(self, profile_id: Optional[str], media: dict[str, Any]) -> Optional[dict[str, Any]]:
         return self._profile_history(profile_id).get(self.media_key(media))
+
+    @staticmethod
+    def episode_key(season_number: int, episode_number: int) -> str:
+        return f"{int(season_number)}:{int(episode_number)}"
+
+    @staticmethod
+    def available_seasons(media: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return aired/known seasons, with regular seasons before specials."""
+        seasons = [
+            dict(season)
+            for season in media.get("seasons", [])
+            if isinstance(season, dict)
+            and int(season.get("episode_count", 0) or 0) > 0
+        ]
+        regular = sorted(
+            (season for season in seasons if int(season.get("season_number", 0) or 0) > 0),
+            key=lambda season: int(season.get("season_number", 0) or 0),
+        )
+        specials = sorted(
+            (season for season in seasons if int(season.get("season_number", 0) or 0) == 0),
+            key=lambda season: str(season.get("name", "")),
+        )
+        return regular + specials
+
+    @classmethod
+    def next_episode_position(
+        cls,
+        media: dict[str, Any],
+        season_number: int,
+        episode_number: int,
+    ) -> Optional[tuple[int, int]]:
+        seasons = cls.available_seasons(media)
+        season_numbers = [int(season.get("season_number", 0) or 0) for season in seasons]
+        counts = {
+            int(season.get("season_number", 0) or 0): int(season.get("episode_count", 0) or 0)
+            for season in seasons
+        }
+        current_count = counts.get(int(season_number), 0)
+        if current_count and int(episode_number) < current_count:
+            return int(season_number), int(episode_number) + 1
+
+        try:
+            index = season_numbers.index(int(season_number))
+        except ValueError:
+            return None
+        for next_season in season_numbers[index + 1 :]:
+            if next_season > 0 and counts.get(next_season, 0) > 0:
+                return next_season, 1
+        return None
+
+    def episode_entries(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry = self.entry(profile_id, media) or {}
+        episodes = entry.get("episodes", {})
+        return episodes if isinstance(episodes, dict) else {}
+
+    def episode_entry(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        season_number: int,
+        episode_number: int,
+    ) -> Optional[dict[str, Any]]:
+        return self.episode_entries(profile_id, media).get(
+            self.episode_key(season_number, episode_number)
+        )
+
+    def latest_episode_entry(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        episodes = list(self.episode_entries(profile_id, media).values())
+        episodes = [episode for episode in episodes if isinstance(episode, dict)]
+        if not episodes:
+            return None
+        return max(episodes, key=lambda episode: float(episode.get("updated_at", 0.0) or 0.0))
+
+    def resume_episode(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+    ) -> tuple[int, int]:
+        """Pick the latest unfinished episode, or the episode after a finished one."""
+        latest = self.latest_episode_entry(profile_id, media)
+        if latest is None:
+            seasons = self.available_seasons(media)
+            regular = [
+                int(season.get("season_number", 0) or 0)
+                for season in seasons
+                if int(season.get("season_number", 0) or 0) > 0
+            ]
+            return (regular[0] if regular else 1), 1
+
+        season_number = int(latest.get("season_number", 1) or 1)
+        episode_number = int(latest.get("episode_number", 1) or 1)
+        if latest.get("status") == "finished":
+            next_position = self.next_episode_position(media, season_number, episode_number)
+            if next_position is not None:
+                return next_position
+        return season_number, episode_number
+
+    @staticmethod
+    def episode_snapshot(episode: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "id",
+            "name",
+            "overview",
+            "air_date",
+            "still_path",
+            "runtime",
+            "season_number",
+            "episode_number",
+        )
+        return {key: episode.get(key) for key in keys if episode.get(key) is not None}
+
+    def _write_episode_progress(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+        progress: float,
+    ) -> None:
+        if not profile_id:
+            return
+        season_number = int(episode.get("season_number", 1) or 1)
+        episode_number = int(episode.get("episode_number", 1) or 1)
+        progress = max(0.0, min(1.0, float(progress)))
+        now = time.time()
+        history = self._profile_history(profile_id)
+        key = self.media_key(media)
+        show_entry = dict(history.get(key, {}))
+        episodes = dict(show_entry.get("episodes", {}))
+        episode_data = {
+            "status": "finished" if progress >= 0.98 else "in_progress",
+            "progress": 1.0 if progress >= 0.98 else progress,
+            "updated_at": now,
+            "season_number": season_number,
+            "episode_number": episode_number,
+            "episode": self.episode_snapshot(episode),
+        }
+        episodes[self.episode_key(season_number, episode_number)] = episode_data
+
+        next_position = self.next_episode_position(media, season_number, episode_number)
+        show_finished = episode_data["status"] == "finished" and next_position is None
+        history[key] = {
+            "status": "finished" if show_finished else "in_progress",
+            "progress": (
+                1.0
+                if show_finished
+                else 0.03
+                if episode_data["status"] == "finished"
+                else max(0.03, min(0.97, episode_data["progress"]))
+            ),
+            "updated_at": now,
+            "media": self.snapshot(media) or show_entry.get("media", {}),
+            "episodes": episodes,
+            "last_episode": {
+                "season_number": season_number,
+                "episode_number": episode_number,
+            },
+        }
+        self.save()
+
+    def mark_episode_started(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+    ) -> None:
+        previous = self.episode_entry(
+            profile_id,
+            media,
+            int(episode.get("season_number", 1) or 1),
+            int(episode.get("episode_number", 1) or 1),
+        ) or {}
+        progress = float(previous.get("progress", 0.0) or 0.0)
+        if previous.get("status") == "finished":
+            progress = 0.03
+        self._write_episode_progress(profile_id, media, episode, max(0.03, progress))
+
+    def mark_episode_finished(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+    ) -> None:
+        self._write_episode_progress(profile_id, media, episode, 1.0)
+
+    def set_episode_progress(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+        progress: float,
+    ) -> None:
+        """Call this from Jellyfin with progress for one TV episode."""
+        self._write_episode_progress(profile_id, media, episode, progress)
 
     def mark_started(self, profile_id: Optional[str], media: dict[str, Any]) -> None:
         if not profile_id:
@@ -447,6 +652,24 @@ class TMDBClient:
     def details(self, media_type: str, media_id: int) -> dict[str, Any]:
         data = self.get(f"/{media_type}/{media_id}", append_to_response="videos,credits")
         return self.normalize(data, media_type)
+
+    def season_details(self, series_id: int, season_number: int) -> dict[str, Any]:
+        """Load the episodes for one TV season from TMDB."""
+        data = self.get(f"/tv/{int(series_id)}/season/{int(season_number)}")
+        data["season_number"] = int(data.get("season_number", season_number) or season_number)
+        episodes = []
+        for raw_episode in data.get("episodes", []):
+            if not isinstance(raw_episode, dict):
+                continue
+            episode = dict(raw_episode)
+            episode["season_number"] = int(
+                episode.get("season_number", data["season_number"]) or data["season_number"]
+            )
+            episode["episode_number"] = int(episode.get("episode_number", 0) or 0)
+            if episode["episode_number"] > 0:
+                episodes.append(episode)
+        data["episodes"] = episodes
+        return data
 
 
 class WorkerSignals(QObject):
@@ -1660,6 +1883,21 @@ class DetailDialog(QDialog):
         self.profile_id = profile_id
         self.controller_actions: list[QPushButton] = []
         self.preferred_controller_widget: Optional[QWidget] = None
+        self.watch_show_button: Optional[QPushButton] = None
+        self.episode_panel: Optional[QFrame] = None
+        self.episode_panel_close_button: Optional[QPushButton] = None
+        self.episode_list_layout: Optional[QVBoxLayout] = None
+        self.episode_scroll: Optional[QScrollArea] = None
+        self.season_buttons: list[QPushButton] = []
+        self.episode_buttons: list[QPushButton] = []
+        self._season_cache: dict[int, dict[str, Any]] = {}
+        self._season_request_generation = 0
+        self._active_season: Optional[int] = None
+        self._resume_episode_position: tuple[int, int] = (1, 1)
+        self._episode_picker_open = False
+        self._episode_picker_animating = False
+        self._episode_panel_animation: Optional[QPropertyAnimation] = None
+        self._episode_after_close: Optional[Callable[[], None]] = None
         self.trailer_web: Optional[QWidget] = None
         self.trailer_placeholder: Optional[QWidget] = None
         self.trailer_overlay: Optional[QFrame] = None
@@ -1735,6 +1973,454 @@ class DetailDialog(QDialog):
                 item.widget().deleteLater()
             if item.layout():
                 DetailDialog._clear_nested_layout(item.layout())
+
+    def _discard_episode_picker(self) -> None:
+        self._season_request_generation += 1
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+            self._episode_panel_animation = None
+        if self.episode_panel is not None:
+            self.episode_panel.hide()
+            self.episode_panel.deleteLater()
+        self.episode_panel = None
+        self.episode_panel_close_button = None
+        self.episode_list_layout = None
+        self.episode_scroll = None
+        self.season_buttons = []
+        self.episode_buttons = []
+        self.watch_show_button = None
+        self._active_season = None
+        self._episode_picker_open = False
+        self._episode_picker_animating = False
+        self._episode_after_close = None
+
+    def _episode_panel_target_geometry(self) -> QRect:
+        margin = 28
+        width = max(320, min(880, self.width() - margin * 2))
+        height = max(300, min(520, self.height() - 112))
+        button = self.watch_show_button
+        if button is not None:
+            button_top_left = self.mapFromGlobal(button.mapToGlobal(QPoint(0, 0)))
+            desired_x = button_top_left.x()
+            desired_y = button_top_left.y() + button.height() + 12
+        else:
+            desired_x = (self.width() - width) // 2
+            desired_y = 84
+        x = max(margin, min(desired_x, self.width() - width - margin))
+        y = max(72, min(desired_y, self.height() - height - margin))
+        return QRect(x, y, width, height)
+
+    def _watch_button_geometry(self) -> QRect:
+        button = self.watch_show_button
+        if button is None:
+            center = self.rect().center()
+            return QRect(center.x(), center.y(), 1, 1)
+        top_left = self.mapFromGlobal(button.mapToGlobal(QPoint(0, 0)))
+        return QRect(top_left, button.size())
+
+    def _build_episode_picker(self, media: dict[str, Any]) -> None:
+        panel = QFrame(self)
+        panel.setObjectName("episodePicker")
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel.hide()
+
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(24, 20, 24, 22)
+        outer.setSpacing(13)
+
+        header = QHBoxLayout()
+        title = QLabel("Episodes")
+        title.setObjectName("episodePickerTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        close = QPushButton("✕")
+        close.setObjectName("episodePickerClose")
+        close.setProperty("controllerSelected", False)
+        close.setFocusPolicy(Qt.StrongFocus)
+        close.setFixedSize(38, 38)
+        close.clicked.connect(self.close_episode_picker)
+        header.addWidget(close)
+        outer.addLayout(header)
+
+        season_hint = QLabel("Choose a season")
+        season_hint.setObjectName("episodePickerHint")
+        outer.addWidget(season_hint)
+
+        season_scroll = QScrollArea()
+        season_scroll.setObjectName("seasonScroll")
+        season_scroll.setWidgetResizable(True)
+        season_scroll.setFrameShape(QFrame.NoFrame)
+        season_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        season_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        season_scroll.setFixedHeight(58)
+        season_host = QWidget()
+        season_host.setObjectName("transparentWidget")
+        season_layout = QHBoxLayout(season_host)
+        season_layout.setContentsMargins(0, 2, 0, 4)
+        season_layout.setSpacing(9)
+
+        seasons = self.watch_state.available_seasons(media)
+        for season in seasons:
+            number = int(season.get("season_number", 0) or 0)
+            label = str(season.get("name") or ("Specials" if number == 0 else f"Season {number}"))
+            button = QPushButton(label)
+            button.setObjectName("seasonButton")
+            button.setProperty("seasonNumber", number)
+            button.setProperty("activeSeason", False)
+            button.setProperty("controllerSelected", False)
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.setMinimumWidth(112)
+            button.clicked.connect(lambda _checked=False, n=number: self._select_season(n))
+            season_layout.addWidget(button)
+            self.season_buttons.append(button)
+        season_layout.addStretch(1)
+        season_host.setMinimumWidth(max(1, len(self.season_buttons)) * 121)
+        season_scroll.setWidget(season_host)
+        outer.addWidget(season_scroll)
+
+        episode_hint = QLabel("Pick an episode")
+        episode_hint.setObjectName("episodePickerHint")
+        outer.addWidget(episode_hint)
+
+        episode_scroll = QScrollArea()
+        episode_scroll.setObjectName("episodeScroll")
+        episode_scroll.setWidgetResizable(True)
+        episode_scroll.setFrameShape(QFrame.NoFrame)
+        episode_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        episode_host = QWidget()
+        episode_host.setObjectName("transparentWidget")
+        episode_layout = QVBoxLayout(episode_host)
+        episode_layout.setContentsMargins(0, 0, 8, 4)
+        episode_layout.setSpacing(9)
+        episode_scroll.setWidget(episode_host)
+        outer.addWidget(episode_scroll, 1)
+
+        self.episode_panel = panel
+        self.episode_panel_close_button = close
+        self.episode_list_layout = episode_layout
+        self.episode_scroll = episode_scroll
+
+        if not seasons:
+            self._show_episode_message("No seasons were returned for this show.", "mutedLabel")
+
+    def _show_episode_message(self, text: str, object_name: str = "loadingLabel") -> None:
+        layout = self.episode_list_layout
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.episode_buttons = []
+        label = QLabel(text)
+        label.setObjectName(object_name)
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        layout.addStretch(1)
+        layout.addWidget(label)
+        layout.addStretch(1)
+
+    def is_episode_picker_open(self) -> bool:
+        return self._episode_picker_open
+
+    def toggle_episode_picker(self) -> None:
+        if self._episode_picker_open:
+            self.close_episode_picker()
+        else:
+            self.open_episode_picker()
+
+    def open_episode_picker(self) -> None:
+        panel = self.episode_panel
+        if panel is None or self.media.get("media_type") != "tv":
+            return
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+        self._episode_picker_open = True
+        self._episode_picker_animating = True
+        self._resume_episode_position = self.watch_state.resume_episode(self.profile_id, self.media)
+        season_number = self._resume_episode_position[0]
+        available_numbers = [
+            int(button.property("seasonNumber")) for button in self.season_buttons
+        ]
+        if season_number not in available_numbers and available_numbers:
+            season_number = available_numbers[0]
+            self._resume_episode_position = (season_number, 1)
+
+        panel.setGeometry(self._watch_button_geometry())
+        panel.show()
+        panel.raise_()
+        self._select_season(season_number, self._resume_episode_position[1])
+
+        animation = QPropertyAnimation(panel, b"geometry", self)
+        self._episode_panel_animation = animation
+        animation.setDuration(360)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.setStartValue(panel.geometry())
+        animation.setEndValue(self._episode_panel_target_geometry())
+
+        def finish() -> None:
+            self._episode_picker_animating = False
+            self._episode_panel_animation = None
+            if self.episode_panel is not None:
+                self.episode_panel.setGeometry(self._episode_panel_target_geometry())
+                self.episode_panel.raise_()
+            target = self._find_episode_button(*self._resume_episode_position)
+            if target is None:
+                target = self._active_season_button()
+            if target is not None:
+                self.controlsReady.emit(target)
+
+        animation.finished.connect(finish)
+        animation.start()
+
+        active = self._active_season_button()
+        if active is not None:
+            self.controlsReady.emit(active)
+
+    def close_episode_picker(self) -> bool:
+        panel = self.episode_panel
+        if panel is None or not self._episode_picker_open:
+            return False
+        self._season_request_generation += 1
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+        self._episode_picker_animating = True
+        animation = QPropertyAnimation(panel, b"geometry", self)
+        self._episode_panel_animation = animation
+        animation.setDuration(300)
+        animation.setEasingCurve(QEasingCurve.InOutCubic)
+        animation.setStartValue(panel.geometry())
+        animation.setEndValue(self._watch_button_geometry())
+
+        def finish() -> None:
+            if self.episode_panel is not None:
+                self.episode_panel.hide()
+            self._episode_picker_open = False
+            self._episode_picker_animating = False
+            self._episode_panel_animation = None
+            after_close = self._episode_after_close
+            self._episode_after_close = None
+            if after_close is not None:
+                after_close()
+            elif self.watch_show_button is not None:
+                self.controlsReady.emit(self.watch_show_button)
+
+        animation.finished.connect(finish)
+        animation.start()
+        return True
+
+    def _active_season_button(self) -> Optional[QPushButton]:
+        return next(
+            (
+                button
+                for button in self.season_buttons
+                if int(button.property("seasonNumber")) == self._active_season
+            ),
+            None,
+        )
+
+    def _select_season(self, season_number: int, episode_number: Optional[int] = None) -> None:
+        if not self._episode_picker_open:
+            return
+        self._active_season = int(season_number)
+        for button in self.season_buttons:
+            button.setProperty(
+                "activeSeason",
+                int(button.property("seasonNumber")) == self._active_season,
+            )
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
+        target_episode = int(episode_number or 1)
+        if self._active_season == self._resume_episode_position[0]:
+            target_episode = int(episode_number or self._resume_episode_position[1])
+        self._show_episode_message("Loading episodes…")
+
+        cached = self._season_cache.get(self._active_season)
+        if cached is not None:
+            self._render_season(cached, target_episode)
+            return
+
+        self._season_request_generation += 1
+        generation = self._season_request_generation
+        series_id = int(self.media.get("id", 0) or 0)
+        selected_season = self._active_season
+        worker = FunctionWorker(
+            lambda: self.client.season_details(series_id, selected_season)
+        )
+        worker.signals.success.connect(
+            lambda data, s=selected_season, e=target_episode, g=generation: self._season_loaded(
+                s, e, g, data
+            )
+        )
+        worker.signals.error.connect(
+            lambda error, s=selected_season, g=generation: self._season_load_failed(s, g, error)
+        )
+        _start_worker(self.thread_pool, worker)
+
+    def _season_loaded(
+        self,
+        season_number: int,
+        episode_number: int,
+        generation: int,
+        data: dict[str, Any],
+    ) -> None:
+        self._season_cache[int(season_number)] = data
+        if (
+            generation != self._season_request_generation
+            or not self._episode_picker_open
+            or self._active_season != int(season_number)
+        ):
+            return
+        self._render_season(data, episode_number)
+
+    def _season_load_failed(self, season_number: int, generation: int, error: str) -> None:
+        if (
+            generation != self._season_request_generation
+            or not self._episode_picker_open
+            or self._active_season != int(season_number)
+        ):
+            return
+        self._show_episode_message(f"Could not load this season.\n\n{error}", "errorLabel")
+
+    def _render_season(self, season: dict[str, Any], target_episode: int) -> None:
+        layout = self.episode_list_layout
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.episode_buttons = []
+
+        episodes = [episode for episode in season.get("episodes", []) if isinstance(episode, dict)]
+        for episode in episodes:
+            season_number = int(episode.get("season_number", self._active_season or 1) or 1)
+            episode_number = int(episode.get("episode_number", 1) or 1)
+            state = self.watch_state.episode_entry(
+                self.profile_id,
+                self.media,
+                season_number,
+                episode_number,
+            ) or {}
+            is_resume = (season_number, episode_number) == self._resume_episode_position
+            button = QPushButton(self._episode_button_text(episode, state, is_resume))
+            button.setObjectName("episodeButton")
+            button.setProperty("seasonNumber", season_number)
+            button.setProperty("episodeNumber", episode_number)
+            button.setProperty("episodeStatus", state.get("status", "unwatched"))
+            button.setProperty("resumeTarget", is_resume)
+            button.setProperty("controllerSelected", False)
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumHeight(86)
+            button.setToolTip(episode.get("overview") or episode.get("name") or "")
+            button.clicked.connect(
+                lambda _checked=False, selected=dict(episode): self._watch_episode_clicked(selected)
+            )
+            layout.addWidget(button)
+            self.episode_buttons.append(button)
+        layout.addStretch(1)
+
+        if not self.episode_buttons:
+            self._show_episode_message("No episodes were returned for this season.", "mutedLabel")
+            return
+
+        target = self._find_episode_button(self._active_season or 1, target_episode)
+        if target is None:
+            target = self.episode_buttons[0]
+
+        def reveal() -> None:
+            if self.episode_scroll is not None and target is not None:
+                self.episode_scroll.ensureWidgetVisible(target, 12, 24)
+            if target is not None:
+                self.controlsReady.emit(target)
+
+        QTimer.singleShot(0, reveal)
+
+    @staticmethod
+    def _episode_button_text(
+        episode: dict[str, Any],
+        state: dict[str, Any],
+        is_resume: bool,
+    ) -> str:
+        number = int(episode.get("episode_number", 1) or 1)
+        name = episode.get("name") or f"Episode {number}"
+        runtime = episode.get("runtime")
+        status = state.get("status")
+        icon = "✓" if status == "finished" else "▶"
+        if is_resume:
+            if status == "in_progress":
+                action = "RESUME"
+            elif status == "finished":
+                action = "REPLAY"
+            else:
+                action = "UP NEXT"
+        else:
+            action = "WATCHED" if status == "finished" else ""
+        meta = f"{int(runtime)} min" if runtime else (episode.get("air_date") or "")
+        overview = " ".join(str(episode.get("overview") or "No description available.").split())
+        if len(overview) > 105:
+            overview = overview[:102].rstrip() + "…"
+        action_text = f"   •   {action}" if action else ""
+        meta_text = f"{meta}   •   " if meta else ""
+        return f"{icon}   {number}. {name}{action_text}\n      {meta_text}{overview}"
+
+    def _find_episode_button(
+        self,
+        season_number: int,
+        episode_number: int,
+    ) -> Optional[QPushButton]:
+        return next(
+            (
+                button
+                for button in self.episode_buttons
+                if int(button.property("seasonNumber")) == int(season_number)
+                and int(button.property("episodeNumber")) == int(episode_number)
+            ),
+            None,
+        )
+
+    def _episode_for_position(self, season_number: int, episode_number: int) -> dict[str, Any]:
+        season = self._season_cache.get(int(season_number), {})
+        for episode in season.get("episodes", []):
+            if int(episode.get("episode_number", 0) or 0) == int(episode_number):
+                return dict(episode)
+        return {
+            "season_number": int(season_number),
+            "episode_number": int(episode_number),
+            "name": f"Episode {int(episode_number)}",
+        }
+
+    def _episode_playback_payload(self, episode: dict[str, Any]) -> dict[str, Any]:
+        season_number = int(episode.get("season_number", 1) or 1)
+        episode_number = int(episode.get("episode_number", 1) or 1)
+        show_title = self.media.get("title") or self.media.get("name") or "TV Show"
+        payload = dict(episode)
+        payload.update(
+            {
+                "media_type": "episode",
+                "series_id": self.media.get("id"),
+                "show_title": show_title,
+                "title": (
+                    f"{show_title} — S{season_number}:E{episode_number} — "
+                    f"{episode.get('name') or f'Episode {episode_number}'}"
+                ),
+                "season_number": season_number,
+                "episode_number": episode_number,
+                "show": self.watch_state.snapshot(self.media),
+            }
+        )
+        return payload
+
+    def _watch_episode_clicked(self, episode: dict[str, Any]) -> None:
+        self.watch_state.mark_episode_started(self.profile_id, self.media, episode)
+        self.stateChanged.emit()
+        watch_title(self._episode_playback_payload(episode))
+        media = dict(self.media)
+        self._episode_after_close = lambda: self._render(media)
+        self.close_episode_picker()
 
     def _discard_trailer_state(self) -> None:
         self._trailer_fullscreen_timer.stop()
@@ -1865,6 +2551,7 @@ class DetailDialog(QDialog):
         web = self.trailer_web
         if web is None or not hasattr(web, "play_trailer"):
             return
+        self.close_episode_picker()
         web.play_trailer()
         # Match clicking the embedded player: playback begins inline, then the
         # existing two-second fullscreen animation takes over.
@@ -1934,19 +2621,31 @@ class DetailDialog(QDialog):
                 self.setGeometry(self._trailer_window_geometry)
 
     def _escape_requested(self) -> None:
-        if not self.exit_trailer_fullscreen():
-            self.reject()
+        if self.exit_trailer_fullscreen():
+            return
+        if self.close_episode_picker():
+            return
+        self.reject()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._trailer_fullscreen and not self._trailer_animating and self.trailer_overlay is not None:
             self.trailer_overlay.setGeometry(self.rect())
             self._position_trailer_hint()
+        if (
+            self._episode_picker_open
+            and not self._episode_picker_animating
+            and self.episode_panel is not None
+        ):
+            self.episode_panel.setGeometry(self._episode_panel_target_geometry())
+            self.episode_panel.raise_()
 
     def closeEvent(self, event) -> None:
         self._trailer_fullscreen_timer.stop()
         if self._trailer_animation is not None:
             self._trailer_animation.stop()
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
         super().closeEvent(event)
 
     def _render(self, media: dict[str, Any]) -> None:
@@ -1954,6 +2653,7 @@ class DetailDialog(QDialog):
         self.controller_actions = []
         self.preferred_controller_widget = None
         self._discard_trailer_state()
+        self._discard_episode_picker()
         self._clear_body()
 
         hero = QFrame()
@@ -1982,8 +2682,24 @@ class DetailDialog(QDialog):
             watched_label.setObjectName("detailWatchedBadge")
             info.addWidget(watched_label, 0, Qt.AlignLeft)
         elif entry and entry.get("status") == "in_progress":
-            progress_pct = max(1, int(float(entry.get("progress", 0.0)) * 100))
-            progress_label = QLabel(f"Continue watching  •  {progress_pct}%")
+            latest_episode = self.watch_state.latest_episode_entry(self.profile_id, media)
+            if media.get("media_type") == "tv" and latest_episode is not None:
+                resume_season, resume_episode = self.watch_state.resume_episode(self.profile_id, media)
+                if latest_episode.get("status") == "finished":
+                    progress_text = f"Up next  •  S{resume_season}:E{resume_episode}"
+                else:
+                    progress_pct = max(
+                        1,
+                        int(float(latest_episode.get("progress", 0.0) or 0.0) * 100),
+                    )
+                    progress_text = (
+                        f"Continue watching  •  S{resume_season}:E{resume_episode}  •  "
+                        f"{progress_pct}%"
+                    )
+            else:
+                progress_pct = max(1, int(float(entry.get("progress", 0.0)) * 100))
+                progress_text = f"Continue watching  •  {progress_pct}%"
+            progress_label = QLabel(progress_text)
             progress_label.setObjectName("continueLabel")
             info.addWidget(progress_label, 0, Qt.AlignLeft)
 
@@ -2031,18 +2747,26 @@ class DetailDialog(QDialog):
         watch_button.setProperty("controllerSelected", False)
         watch_button.setCursor(Qt.PointingHandCursor)
         watch_button.setFocusPolicy(Qt.StrongFocus)
-        watch_button.clicked.connect(lambda: self._watch_clicked(media))
+        if media.get("media_type") == "tv":
+            self.watch_show_button = watch_button
+            watch_button.clicked.connect(self.toggle_episode_picker)
+        else:
+            watch_button.clicked.connect(lambda: self._watch_clicked(media))
         buttons.addWidget(watch_button)
         self.controller_actions.append(watch_button)
         self.preferred_controller_widget = watch_button
 
         entry = self.watch_state.entry(self.profile_id, media)
         if entry and entry.get("status") == "in_progress":
-            finished = QPushButton("✓  Mark as Finished")
+            if media.get("media_type") == "tv":
+                finished = QPushButton("✓  Mark Episode Finished")
+                finished.clicked.connect(lambda: self._mark_current_episode_finished(media))
+            else:
+                finished = QPushButton("✓  Mark as Finished")
+                finished.clicked.connect(lambda: self._mark_finished(media))
             finished.setObjectName("secondaryButton")
             finished.setProperty("controllerSelected", False)
             finished.setFocusPolicy(Qt.StrongFocus)
-            finished.clicked.connect(lambda: self._mark_finished(media))
             buttons.addWidget(finished)
             self.controller_actions.append(finished)
         elif entry and entry.get("status") == "finished":
@@ -2068,6 +2792,9 @@ class DetailDialog(QDialog):
         info.addStretch(1)
         hero_layout.addLayout(info, 1)
         self.body.addWidget(hero)
+
+        if media.get("media_type") == "tv":
+            self._build_episode_picker(media)
 
         trailer_heading = QLabel("Trailer")
         trailer_heading.setObjectName("rowHeading")
@@ -2114,6 +2841,18 @@ class DetailDialog(QDialog):
     def controller_focusables(self) -> list[QWidget]:
         if self._trailer_fullscreen:
             return []
+        if self._episode_picker_open:
+            widgets: list[QWidget] = [
+                button
+                for button in self.season_buttons + self.episode_buttons
+                if button is not None and button.isVisible() and button.isEnabled()
+            ]
+            if (
+                self.episode_panel_close_button is not None
+                and self.episode_panel_close_button.isVisible()
+            ):
+                widgets.append(self.episode_panel_close_button)
+            return widgets
         widgets = [
             button
             for button in self.controller_actions
@@ -2129,6 +2868,14 @@ class DetailDialog(QDialog):
         focusables = self.controller_focusables()
         if current in focusables:
             return current
+        if self._episode_picker_open:
+            target = self._find_episode_button(*self._resume_episode_position)
+            if target in focusables:
+                return target
+            active_season = self._active_season_button()
+            if active_season in focusables:
+                return active_season
+            return focusables[0] if focusables else None
         if self.preferred_controller_widget in focusables:
             return self.preferred_controller_widget
         return focusables[0] if focusables else None
@@ -2141,6 +2888,45 @@ class DetailDialog(QDialog):
         """Return the next details control without relying on WebEngine focus."""
         if self._trailer_fullscreen:
             return None
+        if self._episode_picker_open:
+            focusables = self.controller_focusables()
+            current = self.controller_current_target(current)
+            panel_close = self.episode_panel_close_button
+            seasons = [button for button in self.season_buttons if button in focusables]
+            episodes = [button for button in self.episode_buttons if button in focusables]
+
+            if current is panel_close:
+                if direction == "down":
+                    active = self._active_season_button()
+                    return active if active in seasons else (seasons[0] if seasons else current)
+                return current
+
+            if current in seasons:
+                index = seasons.index(current)
+                if direction == "left":
+                    return seasons[(index - 1) % len(seasons)]
+                if direction == "right":
+                    return seasons[(index + 1) % len(seasons)]
+                if direction == "up" and panel_close is not None:
+                    return panel_close
+                if direction == "down" and episodes:
+                    target = self._find_episode_button(*self._resume_episode_position)
+                    return target if target in episodes else episodes[0]
+                return current
+
+            if current in episodes:
+                index = episodes.index(current)
+                if direction == "up":
+                    if index > 0:
+                        return episodes[index - 1]
+                    active = self._active_season_button()
+                    return active if active in seasons else current
+                if direction == "down":
+                    return episodes[min(index + 1, len(episodes) - 1)]
+                return current
+
+            return self.controller_current_target()
+
         actions = [
             button
             for button in self.controller_actions
@@ -2175,6 +2961,9 @@ class DetailDialog(QDialog):
         return (official or trailers or youtube)[0] if youtube else None
 
     def _watch_clicked(self, media: dict[str, Any]) -> None:
+        if media.get("media_type") == "tv":
+            self.toggle_episode_picker()
+            return
         self.watch_state.mark_started(self.profile_id, media)
         self.stateChanged.emit()
         # Intentionally blank until you add Jellyfin logic to watch_title().
@@ -2185,6 +2974,14 @@ class DetailDialog(QDialog):
         self.watch_state.mark_finished(self.profile_id, media)
         self.stateChanged.emit()
         self._render(media)
+
+    def _mark_current_episode_finished(self, media: dict[str, Any]) -> None:
+        season_number, episode_number = self.watch_state.resume_episode(self.profile_id, media)
+        episode = self._episode_for_position(season_number, episode_number)
+        self.watch_state.mark_episode_finished(self.profile_id, media, episode)
+        self.stateChanged.emit()
+        self._render(media)
+        QTimer.singleShot(0, self.open_episode_picker)
 
     def _mark_unwatched(self, media: dict[str, Any]) -> None:
         self.watch_state.mark_unwatched(self.profile_id, media)
@@ -3224,6 +4021,8 @@ class MainWindow(QMainWindow):
         if detail is not None:
             if detail.exit_trailer_fullscreen():
                 return
+            if detail.close_episode_picker():
+                return
             self._clear_controller_selection()
             detail.reject()
             return
@@ -3405,6 +4204,67 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
 }
 #iconButton:hover { background: #3a3a40; }
 #detailTitle { font-size: 35px; font-weight: 900; }
+#episodePicker {
+    background:#17171b;
+    border:1px solid #3b3b42;
+    border-radius:16px;
+}
+#episodePickerTitle {
+    color:#ffffff;
+    font-size:27px;
+    font-weight:900;
+}
+#episodePickerHint {
+    color:#9d9da4;
+    font-size:12px;
+    font-weight:700;
+    letter-spacing:1px;
+}
+#episodePickerClose {
+    background:#2b2b31;
+    color:#ffffff;
+    border:3px solid transparent;
+    border-radius:19px;
+    font-size:16px;
+    font-weight:800;
+}
+#episodePickerClose:hover { background:#3b3b42; }
+#seasonButton {
+    background:#29292e;
+    color:#f3f3f4;
+    border:3px solid transparent;
+    border-radius:8px;
+    padding:8px 15px;
+    font-size:14px;
+    font-weight:800;
+}
+#seasonButton:hover { background:#38383e; }
+#seasonButton[activeSeason="true"] {
+    background:#f3f3f3;
+    color:#101012;
+}
+#episodeButton {
+    background:#222227;
+    color:#f4f4f5;
+    border:3px solid transparent;
+    border-radius:10px;
+    padding:11px 14px;
+    text-align:left;
+    font-size:13px;
+    font-weight:650;
+}
+#episodeButton:hover { background:#303036; }
+#episodeButton[episodeStatus="finished"] { color:#b8b8bd; }
+#episodeButton[resumeTarget="true"] {
+    background:#2a2023;
+    border:3px solid #e50914;
+}
+#seasonButton[controllerSelected="true"],
+#episodeButton[controllerSelected="true"],
+#episodePickerClose[controllerSelected="true"],
+#seasonButton:focus, #episodeButton:focus, #episodePickerClose:focus {
+    border:3px solid #ffffff;
+}
 #detailWatchedBadge {
     background:#1e7e47;
     color:#ffffff;
