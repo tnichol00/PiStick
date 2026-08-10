@@ -7,6 +7,7 @@ import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlencode
 
 import requests
 from PySide6.QtCore import (
@@ -41,13 +42,14 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QVBoxLayout,
     QWidget,
-    QInputDialog,
 )
 
 try:
+    from PySide6.QtWebEngineCore import QWebEngineHttpRequest
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except Exception:
     QWebEngineView = None
+    QWebEngineHttpRequest = None
 
 try:
     import pygame
@@ -56,11 +58,16 @@ except Exception:
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "2.2-profiles"
+APP_VERSION = "2.6-merged-controller-carousel"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 CONFIG_PATH = Path(__file__).with_name("config.json")
 STATE_PATH = Path(__file__).with_name("pistick_state.json")
+
+# YouTube requires embedded desktop/WebView clients to identify themselves with
+# an HTTPS Referer. Keep this stable if PiStick is packaged later.
+YOUTUBE_APP_ID = "com.layeredkingdom.pistick"
+YOUTUBE_REFERER = f"https://{YOUTUBE_APP_ID}/"
 
 
 # Keep background QRunnables alive until their run() methods finish.
@@ -537,6 +544,125 @@ class SmoothScrollArea(QScrollArea):
         self._animate(vbar, self._v_animation, vtarget, 240)
 
 
+class HorizontalMediaScrollArea(SmoothScrollArea):
+    """A truly horizontal-only carousel.
+
+    The row itself never handles vertical movement. Vertical wheel/trackpad
+    input is forwarded to the outer page, while horizontal input moves only
+    this carousel.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWidgetResizable(False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.verticalScrollBar().setSingleStep(0)
+        self.verticalScrollBar().setPageStep(0)
+
+    def _parent_vertical_scroll_area(self) -> Optional[SmoothScrollArea]:
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, SmoothScrollArea) and parent is not self:
+                if parent.verticalScrollBar().maximum() > parent.verticalScrollBar().minimum():
+                    return parent
+            parent = parent.parentWidget()
+        return None
+
+    @staticmethod
+    def _event_deltas(event) -> tuple[int, int, bool, bool]:
+        angle = event.angleDelta()
+        pixel = event.pixelDelta()
+        precise_x = not pixel.isNull() and bool(pixel.x())
+        precise_y = not pixel.isNull() and bool(pixel.y())
+        delta_x = pixel.x() if precise_x else angle.x()
+        delta_y = pixel.y() if precise_y else angle.y()
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+        return int(delta_x), int(delta_y), precise_x, shift
+
+    def forward_vertical_delta(self, delta_y: int, precise: bool = False) -> bool:
+        page_scroll = self._parent_vertical_scroll_area()
+        if page_scroll is None or not delta_y:
+            return False
+        bar = page_scroll.verticalScrollBar()
+        multiplier = 3.0 if precise else 1.55
+        target = bar.value() - int(delta_y * multiplier)
+        page_scroll._animate(bar, page_scroll._v_animation, target, 260)
+        return True
+
+    def handle_filtered_wheel(self, event) -> bool:
+        """Called by MainWindow's application-wide event filter.
+
+        This catches wheel events even when they land on a poster/title child
+        instead of the QScrollArea viewport.
+        """
+        angle = event.angleDelta()
+        pixel = event.pixelDelta()
+        precise_y = not pixel.isNull() and bool(pixel.y())
+        precise_x = not pixel.isNull() and bool(pixel.x())
+        delta_y = pixel.y() if precise_y else angle.y()
+        delta_x = pixel.x() if precise_x else angle.x()
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+
+        # Any normal vertical component belongs to the main page. Do not let a
+        # diagonal trackpad gesture move the horizontal row vertically.
+        if delta_y and not shift:
+            self.forward_vertical_delta(int(delta_y), precise_y)
+            event.accept()
+            return True
+
+        # Pure horizontal trackpad input (or Shift+wheel) moves only the row.
+        horizontal_delta = delta_x or (delta_y if shift else 0)
+        if horizontal_delta:
+            bar = self.horizontalScrollBar()
+            multiplier = 3.0 if precise_x else 1.55
+            target = bar.value() - int(horizontal_delta * multiplier)
+            bounds_provider = getattr(self, "horizontal_bounds_provider", None)
+            if callable(bounds_provider):
+                logical_min, logical_max = bounds_provider()
+                target = max(logical_min, min(logical_max, target))
+            self._animate(bar, self._h_animation, target, 240)
+            event.accept()
+            return True
+
+        return False
+
+    def wheelEvent(self, event) -> None:
+        if self.handle_filtered_wheel(event):
+            return
+        event.ignore()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # A hidden vertical bar can still retain a stale value after resizes.
+        self.verticalScrollBar().setValue(self.verticalScrollBar().minimum())
+
+    def smooth_ensure_widget_visible(self, widget: QWidget, xmargin: int = 40, ymargin: int = 40) -> None:
+        """Controller focus may move the row left/right, never up/down."""
+        content = self.widget()
+        if content is None:
+            return
+        try:
+            top_left = widget.mapTo(content, QPoint(0, 0))
+        except Exception:
+            return
+
+        left = top_left.x()
+        right = left + widget.width()
+        hbar = self.horizontalScrollBar()
+        viewport_w = self.viewport().width()
+
+        target = hbar.value()
+        if left < target + xmargin:
+            target = left - xmargin
+        elif right > target + viewport_w - xmargin:
+            target = right - viewport_w + xmargin
+        self._animate(hbar, self._h_animation, target, 210)
+
+        # The row has no valid vertical movement.
+        self.verticalScrollBar().setValue(self.verticalScrollBar().minimum())
+
+
 class ClickableFrame(QFrame):
     clicked = Signal()
 
@@ -641,6 +767,8 @@ class MediaCard(ClickableFrame):
 
 
 class MediaRow(QWidget):
+    """Movie/show row with controller-only seamless circular wrapping."""
+
     def __init__(
         self,
         title: str,
@@ -652,6 +780,13 @@ class MediaRow(QWidget):
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
+        self.items = list(items[:20])
+        self.cards: list[MediaCard] = []
+        self.left_clone: Optional[MediaCard] = None
+        self.right_clone: Optional[MediaCard] = None
+        self._wrapping = False
+        self._wrap_animation: Optional[QPropertyAnimation] = None
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(10)
@@ -660,33 +795,191 @@ class MediaRow(QWidget):
         heading.setObjectName("rowHeading")
         outer.addWidget(heading)
 
-        scroll = SmoothScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFrameShape(QFrame.NoFrame)
-        # The old 310px height clipped the card's bottom/controller outline.
-        scroll.setFixedHeight(355 if show_progress else 346)
-        scroll.viewport().setStyleSheet("background: transparent;")
+        self.scroll = HorizontalMediaScrollArea()
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll_height = 364 if show_progress else 354
+        self.scroll.setFixedHeight(self.scroll_height)
+        self.scroll.viewport().setStyleSheet("background: transparent;")
 
-        content = QWidget()
-        content.setObjectName("transparentWidget")
-        row = QHBoxLayout(content)
-        row.setContentsMargins(0, 0, 18, 8)
-        row.setSpacing(12)
-        for item in items[:20]:
-            row.addWidget(
-                MediaCard(
-                    item,
-                    thread_pool,
-                    open_details,
-                    state_lookup=state_lookup,
-                    show_progress=show_progress,
-                )
+        self.content = QWidget()
+        self.content.setObjectName("transparentWidget")
+        self.row_layout = QHBoxLayout(self.content)
+        self.row_layout.setContentsMargins(0, 0, 18, 0)
+        self.row_layout.setSpacing(12)
+
+        def make_card(item: dict[str, Any], clone: bool = False) -> MediaCard:
+            card = MediaCard(
+                item,
+                thread_pool,
+                open_details,
+                state_lookup=state_lookup,
+                show_progress=show_progress,
             )
-        row.addStretch(1)
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
+            card.controller_row = self
+            card.setProperty("controllerClone", clone)
+            if clone:
+                card.setFocusPolicy(Qt.NoFocus)
+            return card
+
+        # Large invisible buffers give the row room to invisibly rebase after a
+        # wrap while preserving the selected card's exact screen position.
+        # This avoids the visible "rewind" that happens if there is no spare
+        # scroll space on the opposite edge.
+        self.left_buffer = QWidget()
+        self.left_buffer.setFixedWidth(4096)
+        self.left_buffer.setFocusPolicy(Qt.NoFocus)
+        self.row_layout.addWidget(self.left_buffer)
+
+        # One duplicate on each edge is enough for the visible wrap animation.
+        if len(self.items) > 1:
+            self.left_clone = make_card(self.items[-1], clone=True)
+            self.row_layout.addWidget(self.left_clone)
+
+        for item in self.items:
+            card = make_card(item)
+            self.cards.append(card)
+            self.row_layout.addWidget(card)
+
+        if len(self.items) > 1:
+            self.right_clone = make_card(self.items[0], clone=True)
+            self.row_layout.addWidget(self.right_clone)
+
+        self.right_buffer = QWidget()
+        self.right_buffer.setFixedWidth(4096)
+        self.right_buffer.setFocusPolicy(Qt.NoFocus)
+        self.row_layout.addWidget(self.right_buffer)
+        self.content.adjustSize()
+        width = max(self.row_layout.sizeHint().width(), self.content.sizeHint().width())
+        self.content.setFixedSize(width, self.scroll_height - 2)
+        self.scroll.setWidget(self.content)
+        self.scroll.horizontal_bounds_provider = self._normal_scroll_bounds
+        outer.addWidget(self.scroll)
+
+        # Start on the first real card, with the left-side duplicate clipped away.
+        if self.cards:
+            QTimer.singleShot(0, self._position_on_first_real)
+            QTimer.singleShot(80, self._position_on_first_real)
+
+    @property
+    def wrapping(self) -> bool:
+        return self._wrapping
+
+    def _position_on_first_real(self) -> None:
+        if not self.cards:
+            return
+        self.content.adjustSize()
+        bar = self.scroll.horizontalScrollBar()
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), self.cards[0].x())))
+
+    def _normal_scroll_bounds(self) -> tuple[int, int]:
+        """Mouse/trackpad horizontal scrolling stays inside the real row."""
+        if not self.cards:
+            return (0, 0)
+        viewport_w = max(1, self.scroll.viewport().width())
+        minimum = self.cards[0].x()
+        maximum = max(
+            minimum,
+            self.cards[-1].x() + self.cards[-1].width() - viewport_w,
+        )
+        return minimum, maximum
+
+    def _card_step(self) -> int:
+        if len(self.cards) >= 2:
+            return max(1, self.cards[1].x() - self.cards[0].x())
+        if self.cards:
+            return max(1, self.cards[0].width() + self.row_layout.spacing())
+        return 1
+
+    def _animate_wrap(
+        self,
+        current: MediaCard,
+        clone: MediaCard,
+        destination: MediaCard,
+        direction: str,
+        select_callback: Callable[[MediaCard, bool], None],
+    ) -> None:
+        if self._wrapping:
+            return
+        self._wrapping = True
+
+        bar = self.scroll.horizontalScrollBar()
+        start_value = bar.value()
+        step = self._card_step()
+        if direction == "right":
+            target = min(bar.maximum(), start_value + step)
+        else:
+            target = max(bar.minimum(), start_value - step)
+
+        # Move the controller outline onto the edge duplicate during the short
+        # animation so it looks like the row genuinely continues forever.
+        try:
+            current.set_controller_selected(False)
+            clone.set_controller_selected(True)
+        except RuntimeError:
+            pass
+
+        animation = QPropertyAnimation(bar, b"value", self)
+        self._wrap_animation = animation
+        animation.setDuration(220)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.setStartValue(start_value)
+        animation.setEndValue(target)
+
+        def finish() -> None:
+            try:
+                clone.set_controller_selected(False)
+            except RuntimeError:
+                pass
+
+            # Preserve the duplicate's exact screen position while switching to
+            # its real twin. This is the invisible rebase that avoids a rewind.
+            if direction == "right":
+                clone_x = clone.x()
+                dest_x = destination.x()
+                snap = target - (clone_x - dest_x)
+            else:
+                clone_x = clone.x()
+                dest_x = destination.x()
+                snap = target + (dest_x - clone_x)
+
+            bar.setValue(max(bar.minimum(), min(bar.maximum(), int(snap))))
+            self._wrapping = False
+            self._wrap_animation = None
+            select_callback(destination, False)
+
+        animation.finished.connect(finish)
+        animation.start()
+
+    def controller_move(
+        self,
+        current: MediaCard,
+        direction: str,
+        select_callback: Callable[[MediaCard, bool], None],
+    ) -> bool:
+        """Handle left/right controller motion within this row.
+
+        Returns True when the row consumed the controller input.
+        """
+        if direction not in ("left", "right") or current not in self.cards:
+            return False
+        if self._wrapping:
+            return True
+        if len(self.cards) <= 1:
+            return True
+
+        index = self.cards.index(current)
+        if direction == "right":
+            if index < len(self.cards) - 1:
+                select_callback(self.cards[index + 1], True)
+            elif self.right_clone is not None:
+                self._animate_wrap(current, self.right_clone, self.cards[0], "right", select_callback)
+            return True
+
+        if index > 0:
+            select_callback(self.cards[index - 1], True)
+        elif self.left_clone is not None:
+            self._animate_wrap(current, self.left_clone, self.cards[-1], "left", select_callback)
+        return True
 
 
 class ProfileCard(ClickableFrame):
@@ -996,8 +1289,77 @@ class OnScreenKeyboard(QDialog):
         return self.text_box.text().strip()
 
 
+class TextInputDialog(QDialog):
+    """PiStick-styled physical-keyboard text dialog (no native white popup)."""
+
+    def __init__(
+        self,
+        title_text: str,
+        label_text: str,
+        initial_text: str = "",
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("textInputDialog")
+        self.setWindowTitle(title_text)
+        self.setModal(True)
+        self.setFixedSize(470, 220)
+        self.setStyleSheet(APP_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(12)
+
+        title = QLabel(title_text)
+        title.setObjectName("textInputTitle")
+        layout.addWidget(title)
+
+        label = QLabel(label_text)
+        label.setObjectName("textInputLabel")
+        layout.addWidget(label)
+
+        self.edit = QLineEdit(initial_text)
+        self.edit.setObjectName("textInputField")
+        self.edit.setMinimumHeight(44)
+        self.edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.edit)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("textDialogCancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+
+        ok = QPushButton("Save" if initial_text else "Add")
+        ok.setObjectName("textDialogAccept")
+        ok.clicked.connect(self.accept)
+        buttons.addWidget(ok)
+        layout.addLayout(buttons)
+
+        QTimer.singleShot(0, self._focus_edit)
+
+    def _focus_edit(self) -> None:
+        self.edit.setFocus(Qt.OtherFocusReason)
+        self.edit.selectAll()
+
+    @classmethod
+    def get_text(
+        cls,
+        parent: QWidget,
+        title_text: str,
+        label_text: str,
+        initial_text: str = "",
+    ) -> tuple[str, bool]:
+        dialog = cls(title_text, label_text, initial_text, parent)
+        accepted = dialog.exec() == QDialog.Accepted
+        return dialog.edit.text().strip(), accepted
+
+
 class DetailDialog(QDialog):
     stateChanged = Signal()
+    controlsReady = Signal(object)
 
     def __init__(
         self,
@@ -1014,6 +1376,8 @@ class DetailDialog(QDialog):
         self.thread_pool = thread_pool
         self.watch_state = watch_state
         self.profile_id = profile_id
+        self.controller_actions: list[QPushButton] = []
+        self.preferred_controller_widget: Optional[QWidget] = None
         self.setWindowTitle(initial_media.get("title", APP_NAME))
         self.resize(1080, 760)
         self.setMinimumSize(860, 620)
@@ -1028,8 +1392,10 @@ class DetailDialog(QDialog):
         topbar.setContentsMargins(24, 18, 24, 12)
         topbar.addStretch(1)
         close_btn = QPushButton("✕")
+        self.close_button = close_btn
         close_btn.setObjectName("iconButton")
         close_btn.setProperty("controllerSelected", False)
+        close_btn.setFocusPolicy(Qt.StrongFocus)
         close_btn.setFixedSize(42, 42)
         close_btn.clicked.connect(self.reject)
         topbar.addWidget(close_btn)
@@ -1075,6 +1441,8 @@ class DetailDialog(QDialog):
 
     def _render(self, media: dict[str, Any]) -> None:
         self.media = media
+        self.controller_actions = []
+        self.preferred_controller_widget = None
         self._clear_body()
 
         hero = QFrame()
@@ -1151,30 +1519,39 @@ class DetailDialog(QDialog):
         watch_button.setObjectName("watchButton")
         watch_button.setProperty("controllerSelected", False)
         watch_button.setCursor(Qt.PointingHandCursor)
+        watch_button.setFocusPolicy(Qt.StrongFocus)
         watch_button.clicked.connect(lambda: self._watch_clicked(media))
         buttons.addWidget(watch_button)
+        self.controller_actions.append(watch_button)
+        self.preferred_controller_widget = watch_button
 
         entry = self.watch_state.entry(self.profile_id, media)
         if entry and entry.get("status") == "in_progress":
             finished = QPushButton("✓  Mark as Finished")
             finished.setObjectName("secondaryButton")
             finished.setProperty("controllerSelected", False)
+            finished.setFocusPolicy(Qt.StrongFocus)
             finished.clicked.connect(lambda: self._mark_finished(media))
             buttons.addWidget(finished)
+            self.controller_actions.append(finished)
         elif entry and entry.get("status") == "finished":
             unwatched = QPushButton("Mark as Unwatched")
             unwatched.setObjectName("secondaryButton")
             unwatched.setProperty("controllerSelected", False)
+            unwatched.setFocusPolicy(Qt.StrongFocus)
             unwatched.clicked.connect(lambda: self._mark_unwatched(media))
             buttons.addWidget(unwatched)
+            self.controller_actions.append(unwatched)
 
         trailer = self._pick_trailer(media)
         if trailer:
             external_button = QPushButton("↗  Open trailer")
             external_button.setObjectName("secondaryButton")
             external_button.setProperty("controllerSelected", False)
+            external_button.setFocusPolicy(Qt.StrongFocus)
             external_button.clicked.connect(lambda: webbrowser.open(f"https://www.youtube.com/watch?v={trailer['key']}"))
             buttons.addWidget(external_button)
+            self.controller_actions.append(external_button)
         buttons.addStretch(1)
         info.addLayout(buttons)
         info.addStretch(1)
@@ -1185,19 +1562,26 @@ class DetailDialog(QDialog):
         trailer_heading.setObjectName("rowHeading")
         self.body.addWidget(trailer_heading)
 
-        if trailer and QWebEngineView is not None:
+        if trailer and QWebEngineView is not None and QWebEngineHttpRequest is not None:
             web = QWebEngineView()
-            web.setMinimumHeight(330)
-            web.setHtml(
-                f"""
-                <!doctype html><html><body style='margin:0;background:#000;overflow:hidden;'>
-                <iframe width='100%' height='100%' style='position:absolute;inset:0;border:0;'
-                    src='https://www.youtube.com/embed/{trailer['key']}?rel=0&modestbranding=1'
-                    title='Trailer' allow='accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share'
-                    allowfullscreen></iframe></body></html>
-                """,
-                QUrl("https://www.youtube.com/"),
+            web.setMinimumHeight(360)
+            web.setFocusPolicy(Qt.NoFocus)
+
+            # Load the YouTube embed directly and identify PiStick with an HTTPS
+            # Referer. YouTube now requires this for desktop/WebView embeds.
+            origin = YOUTUBE_REFERER.rstrip("/")
+            query = urlencode(
+                {
+                    "rel": "0",
+                    "playsinline": "1",
+                    "origin": origin,
+                    "widget_referrer": YOUTUBE_REFERER,
+                }
             )
+            embed_url = f"https://www.youtube.com/embed/{trailer['key']}?{query}"
+            request = QWebEngineHttpRequest(QUrl(embed_url))
+            request.setHeader(b"Referer", YOUTUBE_REFERER.encode("utf-8"))
+            web.load(request)
             self.body.addWidget(web, 1)
         elif trailer:
             note = QLabel("Embedded trailer playback is unavailable. Use “Open trailer” above.")
@@ -1209,6 +1593,20 @@ class DetailDialog(QDialog):
             note.setObjectName("mutedLabel")
             note.setAlignment(Qt.AlignCenter)
             self.body.addWidget(note, 1)
+
+        if self.preferred_controller_widget is not None:
+            self.controlsReady.emit(self.preferred_controller_widget)
+
+    def controller_focusables(self) -> list[QWidget]:
+        widgets: list[QWidget] = []
+        if getattr(self, "close_button", None) is not None and self.close_button.isVisible():
+            widgets.append(self.close_button)
+        widgets.extend(
+            button
+            for button in self.controller_actions
+            if button is not None and button.isVisible() and button.isEnabled()
+        )
+        return widgets
 
     @staticmethod
     def _pick_trailer(media: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1397,7 +1795,25 @@ class MainWindow(QMainWindow):
             self._clear_controller_selection()
         elif event.type() == QEvent.KeyPress:
             self._clear_controller_selection()
+
+        # Intercept wheel/trackpad input before poster/title child widgets can
+        # consume it. Any vertical component over a movie row scrolls the main
+        # page; the carousel itself has no vertical movement.
+        if event.type() == QEvent.Wheel and isinstance(watched, QWidget):
+            row_scroll = self._find_ancestor(watched, HorizontalMediaScrollArea)
+            if row_scroll is not None and row_scroll.handle_filtered_wheel(event):
+                return True
+
         return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _find_ancestor(widget: QWidget, cls):
+        current: Optional[QWidget] = widget
+        while current is not None:
+            if isinstance(current, cls):
+                return current
+            current = current.parentWidget()
+        return None
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -1528,7 +1944,7 @@ class MainWindow(QMainWindow):
         if self.controller.connected:
             self._open_text_keyboard("Add Profile", "", "Add", self._create_profile)
             return
-        name, ok = QInputDialog.getText(self, "Add Profile", "Profile name:")
+        name, ok = TextInputDialog.get_text(self, "Add Profile", "Profile name:")
         if ok and name.strip():
             self._create_profile(name.strip())
 
@@ -1593,7 +2009,7 @@ class MainWindow(QMainWindow):
 
             self._open_text_keyboard("Rename Profile", profile.get("name", ""), "Save", finish)
             return
-        name, ok = QInputDialog.getText(self, "Rename Profile", "Profile name:", text=profile.get("name", ""))
+        name, ok = TextInputDialog.get_text(self, "Rename Profile", "Profile name:", profile.get("name", ""))
         if ok and name.strip():
             self.watch_state.rename_profile(profile["id"], name)
             edit_dialog.accept()
@@ -1888,8 +2304,23 @@ class MainWindow(QMainWindow):
             self,
         )
         dialog.stateChanged.connect(self._refresh_home_from_state)
+        dialog.controlsReady.connect(
+            lambda preferred, d=dialog: self._detail_controls_ready(d, preferred)
+        )
+        self._clear_controller_selection()
         dialog.exec()
+        self._clear_controller_selection()
         self._refresh_home_from_state()
+
+    def _detail_controls_ready(self, dialog: DetailDialog, preferred: QWidget) -> None:
+        if not self.controller.connected:
+            return
+        if QApplication.activeModalWidget() is not dialog:
+            return
+        if preferred is None or not preferred.isVisible():
+            return
+        preferred.setFocus(Qt.OtherFocusReason)
+        self._set_controller_selected(preferred)
 
     def _show_home(self) -> None:
         if not self.active_profile_id:
@@ -1970,9 +2401,14 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _controller_focusables(root: QWidget) -> list[QWidget]:
+        if isinstance(root, DetailDialog):
+            return root.controller_focusables()
+
         widgets: list[QWidget] = []
         for widget in root.findChildren(QWidget):
             if not widget.isVisibleTo(root) or not widget.isEnabled():
+                continue
+            if isinstance(widget, MediaCard) and bool(widget.property("controllerClone")):
                 continue
             if isinstance(widget, (QAbstractButton, QLineEdit, MediaCard, ProfileCard)):
                 if isinstance(widget, QLineEdit) and widget.isReadOnly():
@@ -2006,6 +2442,15 @@ class MainWindow(QMainWindow):
             return
 
         self._set_controller_selected(current)
+
+        # Left/right inside a movie row is row-local and circular. It never
+        # falls through to the next/previous row at the edge.
+        if isinstance(current, MediaCard) and direction in ("left", "right"):
+            media_row = getattr(current, "controller_row", None)
+            if isinstance(media_row, MediaRow):
+                if media_row.controller_move(current, direction, self._select_media_card_from_row):
+                    return
+
         current_center = self._widget_center_global(current)
         best = None
         best_score = float("inf")
@@ -2037,6 +2482,14 @@ class MainWindow(QMainWindow):
             best.setFocus(Qt.OtherFocusReason)
             self._set_controller_selected(best)
             self._ensure_focus_visible(best)
+
+    def _select_media_card_from_row(self, card: MediaCard, ensure_visible: bool = True) -> None:
+        if card is None:
+            return
+        card.setFocus(Qt.OtherFocusReason)
+        self._set_controller_selected(card)
+        if ensure_visible:
+            self._ensure_focus_visible(card)
 
     def _ensure_focus_visible(self, widget: QWidget) -> None:
         parent = widget.parentWidget()
@@ -2358,10 +2811,72 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
 #profileEditDialog { background:#141414; }
 #profileEditTitle { font-size:28px; font-weight:800; }
 QToolTip { background: #242429; color: white; border: 1px solid #4c4c52; }
+
+#textInputDialog {
+    background:#141414;
+}
+#textInputTitle {
+    color:#ffffff;
+    font-size:24px;
+    font-weight:800;
+}
+#textInputLabel {
+    color:#e8e8e8;
+    font-size:14px;
+    font-weight:600;
+}
+#textInputField {
+    background:#232327;
+    color:#ffffff;
+    selection-background-color:#e50914;
+    selection-color:#ffffff;
+    border:2px solid #66666e;
+    border-radius:7px;
+    padding:8px 10px;
+    font-size:16px;
+}
+#textInputField:focus {
+    border:2px solid #ffffff;
+}
+#textDialogAccept, #textDialogCancel {
+    min-width:100px;
+    min-height:38px;
+    border-radius:6px;
+    font-size:14px;
+    font-weight:800;
+    padding:6px 14px;
+}
+#textDialogAccept {
+    background:#ffffff;
+    color:#111111;
+    border:2px solid #ffffff;
+}
+#textDialogCancel {
+    background:#2b2b30;
+    color:#ffffff;
+    border:2px solid #55555d;
+}
+QMessageBox {
+    background:#141414;
+}
+QMessageBox QLabel {
+    color:#ffffff;
+    background:transparent;
+}
+QMessageBox QPushButton {
+    background:#2b2b30;
+    color:#ffffff;
+    border:1px solid #66666e;
+    border-radius:5px;
+    min-width:90px;
+    min-height:32px;
+    padding:4px 10px;
+}
 """
 
 
 def main() -> int:
+    print(f"Starting {APP_NAME} {APP_VERSION}")
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")

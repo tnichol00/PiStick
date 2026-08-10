@@ -1,19 +1,19 @@
 {
-  "active_profile": "profile-1",
+  "active_profile": "profile-641d4be205",
   "profiles": [
     {
       "id": "profile-1",
-      "name": "Thomas",
+      "name": "TJN",
       "avatar": "red"
     },
     {
-      "id": "profile-641af2ebb0",
-      "name": "Karen",
+      "id": "profile-641d4be205",
+      "name": "KN",
       "avatar": "blue"
     }
   ],
   "watch_state": {
     "profile-1": {},
-    "profile-641af2ebb0": {}
+    "profile-641d4be205": {}
   }
 }
