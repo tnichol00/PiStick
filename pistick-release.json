@@ -1,0 +1,5 @@
+{
+  "installer_schema": 1,
+  "entrypoint": "main.py",
+  "updater": "install.sh"
+}
