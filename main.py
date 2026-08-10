@@ -154,7 +154,8 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.0-efficiency-overhaul"
+APP_VERSION = "3.1-on-demand-trailers"
+TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -843,7 +844,10 @@ class TMDBClient:
     def __init__(self, read_token: str):
         self.read_token = read_token
         self._thread_local = threading.local()
-        self._cache = _JsonResponseCache(CACHE_ROOT / "api")
+        self._cache = _JsonResponseCache(
+            CACHE_ROOT / "api",
+            max_memory_entries=24 if RUNTIME.low_memory else 64,
+        )
 
     def _session(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
@@ -877,10 +881,151 @@ class TMDBClient:
             return 6 * 60 * 60
         return 6 * 60 * 60
 
-    def get(self, endpoint: str, **params: Any) -> dict[str, Any]:
+    @staticmethod
+    def _fields(source: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+        return {name: source.get(name) for name in names if source.get(name) is not None}
+
+    @classmethod
+    def _compact_list_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        item_fields = (
+            "id",
+            "media_type",
+            "title",
+            "name",
+            "release_date",
+            "first_air_date",
+            "poster_path",
+            "backdrop_path",
+            "overview",
+            "vote_average",
+        )
+        compact = cls._fields(payload, ("page", "total_pages", "total_results"))
+        compact["results"] = [
+            cls._fields(item, item_fields)
+            for item in payload.get("results", [])
+            if isinstance(item, dict)
+        ]
+        return compact
+
+    @classmethod
+    def _compact_details_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        compact = cls._fields(
+            payload,
+            (
+                "id",
+                "title",
+                "name",
+                "release_date",
+                "first_air_date",
+                "poster_path",
+                "backdrop_path",
+                "overview",
+                "vote_average",
+                "runtime",
+                "episode_run_time",
+                "number_of_seasons",
+            ),
+        )
+        compact["genres"] = [
+            cls._fields(genre, ("id", "name"))
+            for genre in payload.get("genres", [])
+            if isinstance(genre, dict)
+        ]
+        compact["seasons"] = [
+            cls._fields(
+                season,
+                (
+                    "id",
+                    "name",
+                    "season_number",
+                    "episode_count",
+                    "air_date",
+                    "poster_path",
+                    "overview",
+                ),
+            )
+            for season in payload.get("seasons", [])
+            if isinstance(season, dict)
+        ]
+        videos = payload.get("videos", {})
+        youtube = [
+            video
+            for video in (videos.get("results", []) if isinstance(videos, dict) else [])
+            if isinstance(video, dict) and video.get("site") == "YouTube" and video.get("key")
+        ]
+        ranked_videos = (
+            [video for video in youtube if video.get("type") == "Trailer" and video.get("official")]
+            + [video for video in youtube if video.get("type") == "Trailer" and not video.get("official")]
+            + [video for video in youtube if video.get("type") != "Trailer"]
+        )
+        unique_videos: list[dict[str, Any]] = []
+        seen_video_keys: set[str] = set()
+        for video in ranked_videos:
+            key = str(video.get("key", ""))
+            if not key or key in seen_video_keys:
+                continue
+            seen_video_keys.add(key)
+            unique_videos.append(video)
+            if len(unique_videos) >= 16:
+                break
+        compact["videos"] = {
+            "results": [
+                cls._fields(
+                    video,
+                    ("id", "key", "name", "site", "type", "official", "published_at"),
+                )
+                for video in unique_videos
+            ]
+        }
+        credits = payload.get("credits", {})
+        compact["credits"] = {
+            "cast": [
+                cls._fields(person, ("id", "name"))
+                for person in (credits.get("cast", []) if isinstance(credits, dict) else [])
+                if isinstance(person, dict) and person.get("name")
+            ][:5]
+        }
+        return compact
+
+    @classmethod
+    def _compact_season_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        compact = cls._fields(
+            payload,
+            ("id", "name", "overview", "air_date", "poster_path", "season_number"),
+        )
+        episode_fields = (
+            "id",
+            "name",
+            "overview",
+            "air_date",
+            "still_path",
+            "runtime",
+            "season_number",
+            "episode_number",
+        )
+        compact["episodes"] = [
+            cls._fields(episode, episode_fields)
+            for episode in payload.get("episodes", [])
+            if isinstance(episode, dict)
+        ]
+        return compact
+
+    def get(
+        self,
+        endpoint: str,
+        *,
+        _cache_variant: str = "raw",
+        _transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+        **params: Any,
+    ) -> dict[str, Any]:
         params.setdefault("language", "en-US")
         cache_source = json.dumps(
-            [endpoint, sorted((str(key), str(value)) for key, value in params.items())],
+            [
+                TMDB_CACHE_SCHEMA,
+                _cache_variant,
+                endpoint,
+                sorted((str(key), str(value)) for key, value in params.items()),
+            ],
             separators=(",", ":"),
         )
         cache_key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
@@ -898,6 +1043,8 @@ class TMDBClient:
             data = response.json()
             if not isinstance(data, dict):
                 raise ValueError("TMDB returned an invalid response")
+            if _transform is not None:
+                data = _transform(data)
         except Exception:
             stale = self._cache.get(cache_key, allow_stale=True)
             if stale is not None:
@@ -921,7 +1068,11 @@ class TMDBClient:
         return item
 
     def trending(self) -> list[dict[str, Any]]:
-        data = self.get("/trending/all/week")
+        data = self.get(
+            "/trending/all/week",
+            _cache_variant="media-list",
+            _transform=self._compact_list_payload,
+        )
         return [
             self.normalize(x)
             for x in data.get("results", [])
@@ -929,19 +1080,45 @@ class TMDBClient:
         ]
 
     def popular_movies(self) -> list[dict[str, Any]]:
-        return [self.normalize(x, "movie") for x in self.get("/movie/popular").get("results", [])]
+        data = self.get(
+            "/movie/popular",
+            _cache_variant="media-list",
+            _transform=self._compact_list_payload,
+        )
+        return [self.normalize(x, "movie") for x in data.get("results", [])]
 
     def popular_tv(self) -> list[dict[str, Any]]:
-        return [self.normalize(x, "tv") for x in self.get("/tv/popular").get("results", [])]
+        data = self.get(
+            "/tv/popular",
+            _cache_variant="media-list",
+            _transform=self._compact_list_payload,
+        )
+        return [self.normalize(x, "tv") for x in data.get("results", [])]
 
     def top_rated_movies(self) -> list[dict[str, Any]]:
-        return [self.normalize(x, "movie") for x in self.get("/movie/top_rated").get("results", [])]
+        data = self.get(
+            "/movie/top_rated",
+            _cache_variant="media-list",
+            _transform=self._compact_list_payload,
+        )
+        return [self.normalize(x, "movie") for x in data.get("results", [])]
 
     def upcoming_movies(self) -> list[dict[str, Any]]:
-        return [self.normalize(x, "movie") for x in self.get("/movie/upcoming").get("results", [])]
+        data = self.get(
+            "/movie/upcoming",
+            _cache_variant="media-list",
+            _transform=self._compact_list_payload,
+        )
+        return [self.normalize(x, "movie") for x in data.get("results", [])]
 
     def search(self, query: str) -> list[dict[str, Any]]:
-        data = self.get("/search/multi", query=query, include_adult="false")
+        data = self.get(
+            "/search/multi",
+            query=query,
+            include_adult="false",
+            _cache_variant="media-list",
+            _transform=self._compact_list_payload,
+        )
         items = []
         for item in data.get("results", []):
             if item.get("media_type") not in {"movie", "tv"} or not item.get("poster_path"):
@@ -950,12 +1127,23 @@ class TMDBClient:
         return items
 
     def details(self, media_type: str, media_id: int) -> dict[str, Any]:
-        data = self.get(f"/{media_type}/{media_id}", append_to_response="videos,credits")
+        data = self.get(
+            f"/{media_type}/{media_id}",
+            append_to_response="videos,credits",
+            _cache_variant="details",
+            _transform=self._compact_details_payload,
+        )
         return self.normalize(data, media_type)
 
     def season_details(self, series_id: int, season_number: int) -> dict[str, Any]:
         """Load the episodes for one TV season from TMDB."""
-        data = dict(self.get(f"/tv/{int(series_id)}/season/{int(season_number)}"))
+        data = dict(
+            self.get(
+                f"/tv/{int(series_id)}/season/{int(season_number)}",
+                _cache_variant="season",
+                _transform=self._compact_season_payload,
+            )
+        )
         data["season_number"] = int(data.get("season_number", season_number) or season_number)
         episodes = []
         for raw_episode in data.get("episodes", []):
@@ -1040,7 +1228,7 @@ def _image_disk_path(url: str) -> Path:
 
 
 def _load_image_bytes(url: str) -> bytes:
-    """Read a poster from the local cache or download it with a strict cap."""
+    """Read a poster from cache or stream it there without a second RAM copy."""
     path = _image_disk_path(url)
     try:
         if path.is_file() and path.stat().st_size > 0:
@@ -1048,35 +1236,65 @@ def _load_image_bytes(url: str) -> bytes:
     except OSError:
         pass
 
-    chunks: list[bytes] = []
-    total = 0
-    with _image_http_session().get(url, timeout=(4, 14), stream=True) as response:
-        response.raise_for_status()
-        for chunk in response.iter_content(64 * 1024):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > 12 * 1024 * 1024:
-                raise ValueError("Image response exceeded PiStick's safety limit")
-            chunks.append(chunk)
-    data = b"".join(chunks)
-    if not data:
-        raise ValueError("Image response was empty")
-
-    temporary = path.with_name(f".{path.stem}-{os.getpid()}-{threading.get_ident()}.tmp")
+    temporary = path.with_name(
+        f".{path.stem}-{os.getpid()}-{threading.get_ident()}.tmp"
+    )
+    sink = None
+    fallback_chunks: Optional[list[bytes]] = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
-        _trim_image_disk_cache_periodically(path.parent)
+        sink = temporary.open("wb")
     except OSError:
+        fallback_chunks = []
+
+    total = 0
+    try:
+        with _image_http_session().get(url, timeout=(4, 14), stream=True) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > 12 * 1024 * 1024:
+                    raise ValueError("Image response exceeded PiStick's safety limit")
+                if sink is not None:
+                    sink.write(chunk)
+                elif fallback_chunks is not None:
+                    fallback_chunks.append(chunk)
+    except Exception:
+        if sink is not None:
+            sink.close()
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-    return data
+        raise
 
+    if sink is not None:
+        sink.close()
+    if total <= 0:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ValueError("Image response was empty")
 
+    if fallback_chunks is not None:
+        return b"".join(fallback_chunks)
+
+    try:
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            data = temporary.read_bytes()
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return data
+    _trim_image_disk_cache_periodically(path.parent)
+    return path.read_bytes()
 def _trim_image_disk_cache_periodically(root: Path) -> None:
     global _IMAGE_CACHE_WRITES
     with _IMAGE_CACHE_WRITE_LOCK:
@@ -1242,6 +1460,19 @@ class ImagePipeline(QObject):
             return False
 
     def _scan_and_dispatch(self) -> None:
+        # A poster can appear in the registry and again as a subscriber to a
+        # coalesced request. Cache geometry answers for this scan so scrolling
+        # never performs the same nested map-to-viewport walk twice.
+        visibility: dict[tuple[int, int], bool] = {}
+
+        def near(target: "RemoteImage", margin: int) -> bool:
+            key = (id(target), int(margin))
+            cached = visibility.get(key)
+            if cached is None:
+                cached = self._near_viewport(target, margin)
+                visibility[key] = cached
+            return cached
+
         live_registered: list[weakref.ReferenceType] = []
         for target_ref in self._registered:
             target = target_ref()
@@ -1252,14 +1483,14 @@ class ImagePipeline(QObject):
                 if (
                     RUNTIME.low_memory
                     and target._has_image
-                    and not self._near_viewport(target, RUNTIME.image_release_margin)
+                    and not near(target, RUNTIME.image_release_margin)
                 ):
                     target._release_pixmap()
                 elif (
                     target._image_url
                     and not target._has_image
                     and not target._image_failed
-                    and self._near_viewport(target, RUNTIME.image_prefetch_margin)
+                    and near(target, RUNTIME.image_prefetch_margin)
                 ):
                     self.request(target, target._image_url)
             except RuntimeError:
@@ -1281,7 +1512,7 @@ class ImagePipeline(QObject):
             for key, request in self._pending.items():
                 if any(
                     target is not None
-                    and self._near_viewport(target, RUNTIME.image_prefetch_margin)
+                    and near(target, RUNTIME.image_prefetch_margin)
                     for target in (target_ref() for target_ref in request.subscribers)
                 ):
                     selected_key = key
@@ -1448,7 +1679,7 @@ _WEBENGINE_ATTEMPTED = False
 
 
 def get_trailer_web_view_class():
-    """Import Chromium only when a details screen actually has a trailer."""
+    """Import Chromium only after the user opens the trailer screen."""
     global TrailerWebView, _WEBENGINE_ATTEMPTED
     if TrailerWebView is not None:
         return TrailerWebView
@@ -1457,10 +1688,15 @@ def get_trailer_web_view_class():
     _WEBENGINE_ATTEMPTED = True
     try:
         if QT_BINDING == "PySide6":
-            from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+            from PySide6.QtWebEngineCore import (
+                QWebEnginePage,
+                QWebEngineProfile,
+                QWebEngineSettings,
+            )
             from PySide6.QtWebEngineWidgets import QWebEngineView
         else:
             from PyQt5.QtWebEngineWidgets import (  # type: ignore[no-redef]
+                QWebEnginePage,
                 QWebEngineProfile,
                 QWebEngineSettings,
                 QWebEngineView,
@@ -1472,11 +1708,24 @@ def get_trailer_web_view_class():
         """Web player that observes clicks without stealing controller focus."""
 
         clicked = Signal()
-        _profile_configured = False
 
         def __init__(self, parent: Optional[QWidget] = None):
-            type(self)._configure_profile(QWebEngineProfile)
             super().__init__(parent)
+            # A trailer-scoped profile/page lets Chromium's renderer and page
+            # data be torn down when this one screen closes. Using Qt's default
+            # profile would keep the heavy browser session alive for the rest
+            # of PiStick even after the trailer was gone.
+            try:
+                self._profile = QWebEngineProfile("pistick-trailer", self)
+            except TypeError:
+                self._profile = QWebEngineProfile(self)
+            self._configure_profile(self._profile, QWebEngineProfile)
+            self._page = QWebEnginePage(self._profile, self)
+            previous_page = self.page()
+            self.setPage(self._page)
+            if previous_page is not self._page:
+                previous_page.deleteLater()
+
             web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
             for name, enabled in (
                 ("PlaybackRequiresUserGesture", False),
@@ -1493,13 +1742,9 @@ def get_trailer_web_view_class():
                 app.installEventFilter(self)
                 self._filter_installed = True
 
-        @classmethod
-        def _configure_profile(cls, profile_type) -> None:
-            if cls._profile_configured:
-                return
-            cls._profile_configured = True
+        @staticmethod
+        def _configure_profile(profile, profile_type) -> None:
             try:
-                profile = profile_type.defaultProfile()
                 cache_path = CACHE_ROOT / "webengine"
                 cache_path.mkdir(parents=True, exist_ok=True)
                 profile.setCachePath(str(cache_path))
@@ -1508,7 +1753,20 @@ def get_trailer_web_view_class():
                 disk_cache = getattr(cache_enum_type, "DiskHttpCache", None)
                 if disk_cache is not None:
                     profile.setHttpCacheType(disk_cache)
-            except (OSError, RuntimeError):
+                profile.setSpellCheckEnabled(False)
+                cookie_enum_type = getattr(
+                    profile_type,
+                    "PersistentCookiesPolicy",
+                    profile_type,
+                )
+                no_persistent_cookies = getattr(
+                    cookie_enum_type,
+                    "NoPersistentCookies",
+                    None,
+                )
+                if no_persistent_cookies is not None:
+                    profile.setPersistentCookiesPolicy(no_persistent_cookies)
+            except (AttributeError, OSError, RuntimeError):
                 pass
 
         def _contains_widget(self, widget: QObject) -> bool:
@@ -1547,8 +1805,18 @@ def get_trailer_web_view_class():
             try:
                 self.stop()
                 self.page().setAudioMuted(True)
+                self.page().runJavaScript(
+                    "window.pistickPauseTrailer && window.pistickPauseTrailer();"
+                )
+                self.setUrl(QUrl("about:blank"))
             except RuntimeError:
                 pass
+            page = getattr(self, "_page", None)
+            profile = getattr(self, "_profile", None)
+            if page is not None:
+                page.deleteLater()
+            if profile is not None:
+                profile.deleteLater()
 
     _TrailerWebView.__name__ = "TrailerWebView"
     TrailerWebView = _TrailerWebView
@@ -1825,6 +2093,9 @@ class MediaCard(ClickableFrame):
         super().__init__(parent)
         self.media = media
         self.state_lookup = state_lookup
+        self.show_progress = bool(show_progress)
+        self.watched_badge: Optional[QLabel] = None
+        self.progress_bar: Optional[QProgressBar] = None
         self.setObjectName("mediaCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1834,11 +2105,13 @@ class MediaCard(ClickableFrame):
         outline_space = 6
         self.setFixedWidth(width + outline_space * 2)
         layout = QVBoxLayout(self)
+        self.card_layout = layout
         layout.setContentsMargins(outline_space, outline_space, outline_space, outline_space)
         layout.setSpacing(7)
 
         poster_height = int(width * 1.5)
         poster_holder = QFrame()
+        self.poster_holder = poster_holder
         poster_holder.setObjectName("posterHolder")
         poster_holder.setFixedSize(width, poster_height)
         self.poster = RemoteImage(thread_pool, width, poster_height, radius=8, parent=poster_holder)
@@ -1852,24 +2125,7 @@ class MediaCard(ClickableFrame):
             # no visible benefit at this rendered size.
             self.poster.load(f"{TMDB_IMAGE_BASE}/w185{poster_path}")
 
-        entry = state_lookup(media) if state_lookup else None
-        if entry and entry.get("status") == "finished":
-            watched = QLabel("✓  WATCHED", poster_holder)
-            watched.setObjectName("watchedBadge")
-            watched.adjustSize()
-            watched.move(8, 8)
-            watched.raise_()
-
         layout.addWidget(poster_holder)
-
-        if show_progress and entry and entry.get("status") == "in_progress":
-            progress = QProgressBar()
-            progress.setObjectName("watchProgress")
-            progress.setRange(0, 1000)
-            progress.setValue(int(float(entry.get("progress", 0.0)) * 1000))
-            progress.setTextVisible(False)
-            progress.setFixedHeight(5)
-            layout.addWidget(progress)
 
         title = QLabel(media.get("title", "Untitled"))
         title.setObjectName("cardTitle")
@@ -1884,6 +2140,43 @@ class MediaCard(ClickableFrame):
         layout.addWidget(meta)
 
         self.clicked.connect(lambda: open_details(self.media))
+        self.refresh_watch_state()
+
+    def refresh_watch_state(self) -> None:
+        entry = self.state_lookup(self.media) if self.state_lookup else None
+        finished = bool(entry and entry.get("status") == "finished")
+        in_progress = bool(entry and entry.get("status") == "in_progress")
+
+        if finished and self.watched_badge is None:
+            watched = QLabel("✓  WATCHED", self.poster_holder)
+            watched.setObjectName("watchedBadge")
+            watched.adjustSize()
+            watched.move(8, 8)
+            watched.raise_()
+            watched.show()
+            self.watched_badge = watched
+        elif not finished and self.watched_badge is not None:
+            self.watched_badge.hide()
+            self.watched_badge.deleteLater()
+            self.watched_badge = None
+
+        if self.show_progress and in_progress:
+            if self.progress_bar is None:
+                progress = QProgressBar()
+                progress.setObjectName("watchProgress")
+                progress.setRange(0, 1000)
+                progress.setTextVisible(False)
+                progress.setFixedHeight(5)
+                self.card_layout.insertWidget(1, progress)
+                self.progress_bar = progress
+            self.progress_bar.setValue(
+                int(float(entry.get("progress", 0.0) or 0.0) * 1000)
+            )
+        elif self.progress_bar is not None:
+            self.card_layout.removeWidget(self.progress_bar)
+            self.progress_bar.hide()
+            self.progress_bar.deleteLater()
+            self.progress_bar = None
 
     def set_controller_selected(self, selected: bool) -> None:
         self.setProperty("controllerSelected", bool(selected))
@@ -2622,6 +2915,330 @@ class TextInputDialog(QDialog):
         return dialog.edit.text().strip(), accepted
 
 
+class TrailerDialog(QDialog):
+    """On-demand trailer player whose Chromium lifetime matches this screen."""
+
+    controlsReady = Signal(object)
+
+    def __init__(
+        self,
+        title: str,
+        trailer: dict[str, Any],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.trailer = dict(trailer)
+        self.trailer_web: Optional[QWidget] = None
+        self.trailer_placeholder: Optional[QFrame] = None
+        self.trailer_overlay: Optional[QFrame] = None
+        self.trailer_overlay_hint: Optional[QLabel] = None
+        self._trailer_animation: Optional[QPropertyAnimation] = None
+        self._trailer_fullscreen = False
+        self._trailer_animating = False
+        self._trailer_original_global_rect: Optional[QRect] = None
+        self._window_geometry: Optional[QRect] = None
+        self._was_fullscreen = False
+        self._was_maximized = False
+        self._play_started = False
+        self._disposed = False
+
+        self._fullscreen_timer = QTimer(self)
+        self._fullscreen_timer.setSingleShot(True)
+        self._fullscreen_timer.setInterval(2000)
+        self._fullscreen_timer.timeout.connect(self.enter_fullscreen)
+
+        self.setWindowTitle(f"{title} — Trailer")
+        self.resize(1080, 700)
+        self.setMinimumSize(860, 540)
+        self.setModal(True)
+        _ensure_app_stylesheet()
+
+        main = QVBoxLayout(self)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
+
+        topbar = QHBoxLayout()
+        topbar.setContentsMargins(28, 18, 24, 12)
+        heading = QLabel(f"Trailer  •  {title}")
+        heading.setObjectName("rowHeading")
+        topbar.addWidget(heading)
+        topbar.addStretch(1)
+        close = QPushButton("✕")
+        self.close_button = close
+        close.setObjectName("iconButton")
+        close.setProperty("controllerSelected", False)
+        close.setFocusPolicy(Qt.StrongFocus)
+        close.setFixedSize(42, 42)
+        close.clicked.connect(self.reject)
+        topbar.addWidget(close)
+        main.addLayout(topbar)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(34, 0, 34, 34)
+        body.setSpacing(0)
+        main.addLayout(body, 1)
+
+        placeholder = QFrame()
+        placeholder.setObjectName("trailerPlaceholder")
+        placeholder.setMinimumHeight(360)
+        placeholder_layout = QVBoxLayout(placeholder)
+        placeholder_layout.setContentsMargins(0, 0, 0, 0)
+        placeholder_layout.setSpacing(0)
+        body.addWidget(placeholder, 1)
+        self.trailer_placeholder = placeholder
+
+        trailer_view_class = get_trailer_web_view_class()
+        if trailer_view_class is None:
+            note = QLabel("Embedded trailer playback is unavailable in this build.")
+            note.setObjectName("mutedLabel")
+            note.setAlignment(Qt.AlignCenter)
+            placeholder_layout.addWidget(note, 1)
+        else:
+            web = trailer_view_class(placeholder)
+            web.setMinimumHeight(360)
+            web.setFocusPolicy(Qt.NoFocus)
+            web.clicked.connect(self._schedule_fullscreen)
+            web.setHtml(
+                build_youtube_embed_html(str(trailer.get("key", ""))),
+                QUrl(f"{YOUTUBE_REFERER}trailer.html"),
+            )
+            placeholder_layout.addWidget(web)
+            self.trailer_web = web
+
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._escape_requested)
+        QTimer.singleShot(0, self._start_playback)
+        QTimer.singleShot(0, lambda: self.controlsReady.emit(self.close_button))
+
+    def _start_playback(self) -> None:
+        if self._play_started or self.trailer_web is None:
+            return
+        self._play_started = True
+        if hasattr(self.trailer_web, "play_trailer"):
+            self.trailer_web.play_trailer()
+        self._schedule_fullscreen()
+
+    def _schedule_fullscreen(self) -> None:
+        if self._trailer_fullscreen or self._trailer_animating or self.trailer_web is None:
+            return
+        self._fullscreen_timer.start()
+
+    def enter_fullscreen(self) -> None:
+        web = self.trailer_web
+        placeholder = self.trailer_placeholder
+        if (
+            web is None
+            or placeholder is None
+            or self._trailer_fullscreen
+            or not web.isVisible()
+        ):
+            return
+
+        self._fullscreen_timer.stop()
+        self._trailer_original_global_rect = QRect(
+            web.mapToGlobal(QPoint(0, 0)),
+            web.size(),
+        )
+        self._window_geometry = self.geometry()
+        self._was_fullscreen = self.isFullScreen()
+        self._was_maximized = self.isMaximized()
+
+        placeholder_layout = placeholder.layout()
+        if placeholder_layout is not None:
+            placeholder_layout.removeWidget(web)
+
+        overlay = QFrame(self)
+        overlay.setObjectName("trailerFullscreenOverlay")
+        overlay.setStyleSheet("background:#000000; border:0;")
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(0)
+        web.setParent(overlay)
+        overlay_layout.addWidget(web)
+
+        hint = QLabel("Controller: X pause  •  B back     Keyboard: Esc back", overlay)
+        hint.setObjectName("trailerFullscreenHint")
+        hint.setStyleSheet(
+            "background:rgba(0,0,0,185); color:#ffffff; border-radius:8px; "
+            "padding:8px 12px; font-size:13px; font-weight:700;"
+        )
+        hint.adjustSize()
+
+        self.trailer_overlay = overlay
+        self.trailer_overlay_hint = hint
+        self._trailer_fullscreen = True
+        self._trailer_animating = True
+        overlay.show()
+        overlay.raise_()
+        hint.raise_()
+
+        self.showFullScreen()
+        QTimer.singleShot(0, self._animate_open)
+
+    def _animate_open(self) -> None:
+        overlay = self.trailer_overlay
+        original = self._trailer_original_global_rect
+        if overlay is None or original is None or not self._trailer_fullscreen:
+            return
+        start = QRect(self.mapFromGlobal(original.topLeft()), original.size())
+        overlay.setGeometry(start)
+        self._position_hint()
+
+        animation = QPropertyAnimation(overlay, b"geometry", self)
+        self._trailer_animation = animation
+        animation.setDuration(420)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.setStartValue(start)
+        animation.setEndValue(self.rect())
+        animation.valueChanged.connect(lambda _value: self._position_hint())
+
+        def finish() -> None:
+            if self.trailer_overlay is not None:
+                self.trailer_overlay.setGeometry(self.rect())
+            self._trailer_animating = False
+            self._trailer_animation = None
+            self._position_hint()
+
+        animation.finished.connect(finish)
+        animation.start()
+
+    def _position_hint(self) -> None:
+        overlay = self.trailer_overlay
+        hint = self.trailer_overlay_hint
+        if overlay is None or hint is None:
+            return
+        hint.adjustSize()
+        hint.move(max(18, overlay.width() - hint.width() - 24), 20)
+        hint.raise_()
+
+    def is_fullscreen(self) -> bool:
+        return self._trailer_fullscreen
+
+    def pause_fullscreen(self) -> None:
+        if (
+            self._trailer_fullscreen
+            and self.trailer_web is not None
+            and hasattr(self.trailer_web, "pause_trailer")
+        ):
+            self.trailer_web.pause_trailer()
+
+    def exit_fullscreen(self) -> bool:
+        if not self._trailer_fullscreen or self.trailer_overlay is None:
+            return False
+        self._fullscreen_timer.stop()
+        if self._trailer_animation is not None:
+            self._trailer_animation.stop()
+
+        overlay = self.trailer_overlay
+        original = self._trailer_original_global_rect
+        if original is None:
+            target = QRect(self.rect().center(), QSize(1, 1))
+        else:
+            target = QRect(self.mapFromGlobal(original.topLeft()), original.size())
+
+        self._trailer_animating = True
+        animation = QPropertyAnimation(overlay, b"geometry", self)
+        self._trailer_animation = animation
+        animation.setDuration(380)
+        animation.setEasingCurve(QEasingCurve.InOutCubic)
+        animation.setStartValue(overlay.geometry())
+        animation.setEndValue(target)
+        animation.valueChanged.connect(lambda _value: self._position_hint())
+        animation.finished.connect(self._finish_exit)
+        animation.start()
+        return True
+
+    def _finish_exit(self) -> None:
+        web = self.trailer_web
+        placeholder = self.trailer_placeholder
+        overlay = self.trailer_overlay
+        if web is not None and placeholder is not None:
+            overlay_layout = overlay.layout() if overlay is not None else None
+            if overlay_layout is not None:
+                overlay_layout.removeWidget(web)
+            web.setParent(placeholder)
+            placeholder_layout = placeholder.layout()
+            if placeholder_layout is not None:
+                placeholder_layout.addWidget(web)
+            web.show()
+
+        if overlay is not None:
+            overlay.hide()
+            overlay.deleteLater()
+        self.trailer_overlay = None
+        self.trailer_overlay_hint = None
+        self._trailer_animation = None
+        self._trailer_animating = False
+        self._trailer_fullscreen = False
+        self._restore_window()
+        self.controlsReady.emit(self.close_button)
+
+    def _restore_window(self) -> None:
+        if self._was_fullscreen:
+            self.showFullScreen()
+        elif self._was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+            if self._window_geometry is not None:
+                self.setGeometry(self._window_geometry)
+
+    def controller_focusables(self) -> list[QWidget]:
+        if self._trailer_fullscreen:
+            return []
+        return [self.close_button] if self.close_button.isVisible() else []
+
+    def controller_current_target(self, current: Optional[QWidget] = None) -> Optional[QWidget]:
+        focusables = self.controller_focusables()
+        if current in focusables:
+            return current
+        return focusables[0] if focusables else None
+
+    def controller_move_target(
+        self,
+        _direction: str,
+        current: Optional[QWidget] = None,
+    ) -> Optional[QWidget]:
+        return self.controller_current_target(current)
+
+    def controller_back(self) -> bool:
+        if self.exit_fullscreen():
+            return True
+        self.reject()
+        return True
+
+    def _escape_requested(self) -> None:
+        if not self.exit_fullscreen():
+            self.reject()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._trailer_fullscreen and not self._trailer_animating and self.trailer_overlay is not None:
+            self.trailer_overlay.setGeometry(self.rect())
+            self._position_hint()
+
+    def _dispose_player(self) -> None:
+        if self._disposed:
+            return
+        self._disposed = True
+        self._fullscreen_timer.stop()
+        if self._trailer_animation is not None:
+            self._trailer_animation.stop()
+            self._trailer_animation = None
+        web = self.trailer_web
+        self.trailer_web = None
+        if web is not None and hasattr(web, "dispose"):
+            try:
+                web.dispose()
+            except RuntimeError:
+                pass
+        if web is not None:
+            web.deleteLater()
+
+    def closeEvent(self, event) -> None:
+        self._dispose_player()
+        super().closeEvent(event)
+
+
 class DetailDialog(QDialog):
     stateChanged = Signal()
     controlsReady = Signal(object)
@@ -2658,21 +3275,9 @@ class DetailDialog(QDialog):
         self._episode_picker_animating = False
         self._episode_panel_animation: Optional[QPropertyAnimation] = None
         self._episode_after_close: Optional[Callable[[], None]] = None
-        self.trailer_web: Optional[QWidget] = None
-        self.trailer_placeholder: Optional[QWidget] = None
-        self.trailer_overlay: Optional[QFrame] = None
-        self.trailer_overlay_hint: Optional[QLabel] = None
-        self._trailer_animation: Optional[QPropertyAnimation] = None
-        self._trailer_fullscreen = False
-        self._trailer_animating = False
-        self._trailer_original_global_rect: Optional[QRect] = None
-        self._trailer_window_geometry: Optional[QRect] = None
-        self._trailer_was_fullscreen = False
-        self._trailer_was_maximized = False
-        self._trailer_fullscreen_timer = QTimer(self)
-        self._trailer_fullscreen_timer.setSingleShot(True)
-        self._trailer_fullscreen_timer.setInterval(2000)
-        self._trailer_fullscreen_timer.timeout.connect(self.enter_trailer_fullscreen)
+        self.trailer: Optional[dict[str, Any]] = None
+        self.trailer_button: Optional[QPushButton] = None
+        self._trailer_dialog: Optional[TrailerDialog] = None
         self.setWindowTitle(initial_media.get("title", APP_NAME))
         self.resize(1080, 760)
         self.setMinimumSize(860, 620)
@@ -3182,222 +3787,87 @@ class DetailDialog(QDialog):
         self._episode_after_close = lambda: self._render(media)
         self.close_episode_picker()
 
+    def _active_trailer_dialog(self) -> Optional[TrailerDialog]:
+        dialog = self._trailer_dialog
+        if dialog is None:
+            return None
+        try:
+            if dialog.isVisible():
+                return dialog
+        except RuntimeError:
+            pass
+        self._trailer_dialog = None
+        return None
+
     def _discard_trailer_state(self) -> None:
-        self._trailer_fullscreen_timer.stop()
-        if self._trailer_animation is not None:
-            self._trailer_animation.stop()
-            self._trailer_animation = None
-        if self._trailer_fullscreen:
-            self._restore_detail_window()
-        web = self.trailer_web
-        if web is not None and hasattr(web, "dispose"):
-            try:
-                web.dispose()
-            except RuntimeError:
-                pass
-        if self.trailer_overlay is not None:
-            self.trailer_overlay.deleteLater()
-        self.trailer_web = None
-        self.trailer_placeholder = None
-        self.trailer_overlay = None
-        self.trailer_overlay_hint = None
-        self._trailer_fullscreen = False
-        self._trailer_animating = False
-        self._trailer_original_global_rect = None
-
-    def _schedule_trailer_fullscreen(self) -> None:
-        if self._trailer_fullscreen or self._trailer_animating or self.trailer_web is None:
+        dialog = self._trailer_dialog
+        self._trailer_dialog = None
+        if dialog is None:
             return
-        # Let the first click start/interact with the YouTube player, then grow
-        # it into fullscreen two seconds later as requested.
-        self._trailer_fullscreen_timer.start()
-
-    def enter_trailer_fullscreen(self) -> None:
-        web = self.trailer_web
-        placeholder = self.trailer_placeholder
-        if (
-            web is None
-            or placeholder is None
-            or self._trailer_fullscreen
-            or not web.isVisible()
-        ):
-            return
-
-        self._trailer_fullscreen_timer.stop()
-        self._trailer_original_global_rect = QRect(
-            web.mapToGlobal(QPoint(0, 0)),
-            web.size(),
-        )
-        self._trailer_window_geometry = self.geometry()
-        self._trailer_was_fullscreen = self.isFullScreen()
-        self._trailer_was_maximized = self.isMaximized()
-
-        placeholder_layout = placeholder.layout()
-        if placeholder_layout is not None:
-            placeholder_layout.removeWidget(web)
-
-        overlay = QFrame(self)
-        overlay.setObjectName("trailerFullscreenOverlay")
-        overlay.setStyleSheet("background:#000000; border:0;")
-        overlay_layout = QVBoxLayout(overlay)
-        overlay_layout.setContentsMargins(0, 0, 0, 0)
-        overlay_layout.setSpacing(0)
-        web.setParent(overlay)
-        overlay_layout.addWidget(web)
-
-        hint = QLabel("Controller: X pause  •  B back     Keyboard: Esc back", overlay)
-        hint.setObjectName("trailerFullscreenHint")
-        hint.setStyleSheet(
-            "background:rgba(0,0,0,185); color:#ffffff; border-radius:8px; "
-            "padding:8px 12px; font-size:13px; font-weight:700;"
-        )
-        hint.adjustSize()
-
-        self.trailer_overlay = overlay
-        self.trailer_overlay_hint = hint
-        self._trailer_fullscreen = True
-        self._trailer_animating = True
-        overlay.show()
-        overlay.raise_()
-        hint.raise_()
-
-        # Use the real display fullscreen. The overlay starts at the trailer's
-        # old global rectangle, then expands so there is no teleport.
-        self.showFullScreen()
-        QTimer.singleShot(0, self._animate_trailer_open)
-
-    def _animate_trailer_open(self) -> None:
-        overlay = self.trailer_overlay
-        original = self._trailer_original_global_rect
-        if overlay is None or original is None or not self._trailer_fullscreen:
-            return
-        start = QRect(self.mapFromGlobal(original.topLeft()), original.size())
-        overlay.setGeometry(start)
-        self._position_trailer_hint()
-
-        animation = QPropertyAnimation(overlay, b"geometry", self)
-        self._trailer_animation = animation
-        animation.setDuration(420)
-        animation.setEasingCurve(QEasingCurve.OutCubic)
-        animation.setStartValue(start)
-        animation.setEndValue(self.rect())
-        animation.valueChanged.connect(lambda _value: self._position_trailer_hint())
-
-        def finish() -> None:
-            if self.trailer_overlay is not None:
-                self.trailer_overlay.setGeometry(self.rect())
-            self._trailer_animating = False
-            self._trailer_animation = None
-            self._position_trailer_hint()
-
-        animation.finished.connect(finish)
-        animation.start()
-
-    def _position_trailer_hint(self) -> None:
-        overlay = self.trailer_overlay
-        hint = self.trailer_overlay_hint
-        if overlay is None or hint is None:
-            return
-        hint.adjustSize()
-        hint.move(max(18, overlay.width() - hint.width() - 24), 20)
-        hint.raise_()
-
-    def is_trailer_fullscreen(self) -> bool:
-        return self._trailer_fullscreen
-
-    def pause_fullscreen_trailer(self) -> None:
-        if (
-            self._trailer_fullscreen
-            and self.trailer_web is not None
-            and hasattr(self.trailer_web, "pause_trailer")
-        ):
-            self.trailer_web.pause_trailer()
+        try:
+            dialog.close()
+        except RuntimeError:
+            pass
 
     def _watch_trailer_clicked(self) -> None:
-        web = self.trailer_web
-        if web is None or not hasattr(web, "play_trailer"):
+        if not self.trailer:
             return
+        active = self._active_trailer_dialog()
+        if active is not None:
+            active.raise_()
+            active.activateWindow()
+            return
+
         self.close_episode_picker()
-        web.play_trailer()
-        # Match clicking the embedded player: playback begins inline, then the
-        # existing two-second fullscreen animation takes over.
-        self._schedule_trailer_fullscreen()
+        dialog = TrailerDialog(
+            str(self.media.get("title") or "Trailer"),
+            self.trailer,
+            self,
+        )
+        self._trailer_dialog = dialog
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.controlsReady.connect(self.controlsReady.emit)
+        dialog.finished.connect(lambda _result, d=dialog: self._trailer_finished(d))
+        dialog.open()
+
+    def _trailer_finished(self, dialog: TrailerDialog) -> None:
+        if self._trailer_dialog is dialog:
+            self._trailer_dialog = None
+        preferred = self.trailer_button or self.preferred_controller_widget
+        if preferred is not None:
+            self.controlsReady.emit(preferred)
+
+    def is_trailer_screen_open(self) -> bool:
+        return self._active_trailer_dialog() is not None
+
+    def is_trailer_fullscreen(self) -> bool:
+        dialog = self._active_trailer_dialog()
+        return bool(dialog is not None and dialog.is_fullscreen())
 
     def exit_trailer_fullscreen(self) -> bool:
-        if not self._trailer_fullscreen or self.trailer_overlay is None:
-            return False
-        self._trailer_fullscreen_timer.stop()
-        if self._trailer_animation is not None:
-            self._trailer_animation.stop()
+        dialog = self._active_trailer_dialog()
+        return bool(dialog is not None and dialog.exit_fullscreen())
 
-        overlay = self.trailer_overlay
-        original = self._trailer_original_global_rect
-        if original is None:
-            target = QRect(self.rect().center(), QSize(1, 1))
-        else:
-            target = QRect(self.mapFromGlobal(original.topLeft()), original.size())
+    def pause_fullscreen_trailer(self) -> None:
+        dialog = self._active_trailer_dialog()
+        if dialog is not None:
+            dialog.pause_fullscreen()
 
-        self._trailer_animating = True
-        animation = QPropertyAnimation(overlay, b"geometry", self)
-        self._trailer_animation = animation
-        animation.setDuration(380)
-        animation.setEasingCurve(QEasingCurve.InOutCubic)
-        animation.setStartValue(overlay.geometry())
-        animation.setEndValue(target)
-        animation.valueChanged.connect(lambda _value: self._position_trailer_hint())
-        animation.finished.connect(self._finish_trailer_exit)
-        animation.start()
-        return True
-
-    def _finish_trailer_exit(self) -> None:
-        web = self.trailer_web
-        placeholder = self.trailer_placeholder
-        overlay = self.trailer_overlay
-        if web is not None and placeholder is not None:
-            overlay_layout = overlay.layout() if overlay is not None else None
-            if overlay_layout is not None:
-                overlay_layout.removeWidget(web)
-            web.setParent(placeholder)
-            placeholder_layout = placeholder.layout()
-            if placeholder_layout is not None:
-                placeholder_layout.addWidget(web)
-            web.show()
-
-        if overlay is not None:
-            overlay.hide()
-            overlay.deleteLater()
-        self.trailer_overlay = None
-        self.trailer_overlay_hint = None
-        self._trailer_animation = None
-        self._trailer_animating = False
-        self._trailer_fullscreen = False
-        self._restore_detail_window()
-
-        if self.preferred_controller_widget is not None:
-            self.controlsReady.emit(self.preferred_controller_widget)
-
-    def _restore_detail_window(self) -> None:
-        if self._trailer_was_fullscreen:
-            self.showFullScreen()
-        elif self._trailer_was_maximized:
-            self.showMaximized()
-        else:
-            self.showNormal()
-            if self._trailer_window_geometry is not None:
-                self.setGeometry(self._trailer_window_geometry)
+    def controller_back(self) -> bool:
+        dialog = self._active_trailer_dialog()
+        if dialog is not None:
+            return dialog.controller_back()
+        if self.close_episode_picker():
+            return True
+        return False
 
     def _escape_requested(self) -> None:
-        if self.exit_trailer_fullscreen():
-            return
-        if self.close_episode_picker():
+        if self.controller_back():
             return
         self.reject()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._trailer_fullscreen and not self._trailer_animating and self.trailer_overlay is not None:
-            self.trailer_overlay.setGeometry(self.rect())
-            self._position_trailer_hint()
         if (
             self._episode_picker_open
             and not self._episode_picker_animating
@@ -3407,22 +3877,16 @@ class DetailDialog(QDialog):
             self.episode_panel.raise_()
 
     def closeEvent(self, event) -> None:
-        self._trailer_fullscreen_timer.stop()
-        if self._trailer_animation is not None:
-            self._trailer_animation.stop()
+        self._discard_trailer_state()
         if self._episode_panel_animation is not None:
             self._episode_panel_animation.stop()
-        if self.trailer_web is not None and hasattr(self.trailer_web, "dispose"):
-            try:
-                self.trailer_web.dispose()
-            except RuntimeError:
-                pass
         super().closeEvent(event)
 
     def _render(self, media: dict[str, Any]) -> None:
         self.media = media
         self.controller_actions = []
         self.preferred_controller_widget = None
+        self.trailer_button = None
         self._discard_trailer_state()
         self._discard_episode_picker()
         self._clear_body()
@@ -3549,10 +4013,10 @@ class DetailDialog(QDialog):
             buttons.addWidget(unwatched)
             self.controller_actions.append(unwatched)
 
-        trailer = self._pick_trailer(media)
-        trailer_view_class = get_trailer_web_view_class() if trailer else None
-        if trailer and trailer_view_class is not None:
+        self.trailer = self._pick_trailer(media)
+        if self.trailer:
             trailer_button = QPushButton("▶  Watch Trailer")
+            self.trailer_button = trailer_button
             trailer_button.setObjectName("secondaryButton")
             trailer_button.setProperty("controllerSelected", False)
             trailer_button.setFocusPolicy(Qt.StrongFocus)
@@ -3567,52 +4031,15 @@ class DetailDialog(QDialog):
 
         if media.get("media_type") == "tv":
             self._build_episode_picker(media)
-
-        trailer_heading = QLabel("Trailer")
-        trailer_heading.setObjectName("rowHeading")
-        self.body.addWidget(trailer_heading)
-
-        if trailer and trailer_view_class is not None:
-            placeholder = QFrame()
-            placeholder.setObjectName("trailerPlaceholder")
-            placeholder.setMinimumHeight(360)
-            placeholder_layout = QVBoxLayout(placeholder)
-            placeholder_layout.setContentsMargins(0, 0, 0, 0)
-            placeholder_layout.setSpacing(0)
-
-            web = trailer_view_class()
-            web.setMinimumHeight(360)
-            web.setFocusPolicy(Qt.NoFocus)
-            web.clicked.connect(self._schedule_trailer_fullscreen)
-
-            # YouTube error 153 occurs when the player request has no client
-            # identity. The HTTPS base URL makes Chromium send PiStick's app ID
-            # as the iframe Referer instead of treating it as an anonymous load.
-            web.setHtml(
-                build_youtube_embed_html(trailer["key"]),
-                QUrl(f"{YOUTUBE_REFERER}trailer.html"),
-            )
-            placeholder_layout.addWidget(web)
-            self.trailer_web = web
-            self.trailer_placeholder = placeholder
-            self.body.addWidget(placeholder, 1)
-        elif trailer:
-            note = QLabel("Embedded trailer playback is unavailable in this build.")
-            note.setObjectName("mutedLabel")
-            note.setAlignment(Qt.AlignCenter)
-            self.body.addWidget(note, 1)
-        else:
-            note = QLabel("No trailer was returned by TMDB for this title.")
-            note.setObjectName("mutedLabel")
-            note.setAlignment(Qt.AlignCenter)
-            self.body.addWidget(note, 1)
+        self.body.addStretch(1)
 
         if self.preferred_controller_widget is not None:
             self.controlsReady.emit(self.preferred_controller_widget)
 
     def controller_focusables(self) -> list[QWidget]:
-        if self._trailer_fullscreen:
-            return []
+        trailer_dialog = self._active_trailer_dialog()
+        if trailer_dialog is not None:
+            return trailer_dialog.controller_focusables()
         if self._episode_picker_open:
             widgets: list[QWidget] = [
                 button
@@ -3635,8 +4062,9 @@ class DetailDialog(QDialog):
         return widgets
 
     def controller_current_target(self, current: Optional[QWidget] = None) -> Optional[QWidget]:
-        if self._trailer_fullscreen:
-            return None
+        trailer_dialog = self._active_trailer_dialog()
+        if trailer_dialog is not None:
+            return trailer_dialog.controller_current_target(current)
         focusables = self.controller_focusables()
         if current in focusables:
             return current
@@ -3658,8 +4086,9 @@ class DetailDialog(QDialog):
         current: Optional[QWidget] = None,
     ) -> Optional[QWidget]:
         """Return the next details control without relying on WebEngine focus."""
-        if self._trailer_fullscreen:
-            return None
+        trailer_dialog = self._active_trailer_dialog()
+        if trailer_dialog is not None:
+            return trailer_dialog.controller_move_target(direction, current)
         if self._episode_picker_open:
             focusables = self.controller_focusables()
             current = self.controller_current_target(current)
@@ -3845,6 +4274,9 @@ class MainWindow(QMainWindow):
         self.active_profile_id: Optional[str] = None
         self.home_sections: list[tuple[str, list[dict[str, Any]]]] = []
         self.home_payload: Optional[dict[str, Any]] = None
+        self._home_content_layout: Optional[QVBoxLayout] = None
+        self._continue_row: Optional[MediaRow] = None
+        self._continue_insert_index = 0
         self.profile_manage_mode = False
         self._controller_selected: Optional[QWidget] = None
         self._controller_keyboard: Optional[OnScreenKeyboard] = None
@@ -4230,6 +4662,8 @@ class MainWindow(QMainWindow):
         if not self.client or self._home_loading:
             return
         self._home_loading = True
+        self._home_content_layout = None
+        self._continue_row = None
         self._clear_layout(self.home_layout)
         loading = QLabel("Loading your home screen…")
         loading.setObjectName("loadingLabel")
@@ -4260,6 +4694,8 @@ class MainWindow(QMainWindow):
     def _render_home(self, payload: dict[str, Any]) -> None:
         self._home_loading = False
         self.home_payload = payload
+        self._home_content_layout = None
+        self._continue_row = None
         self._clear_layout(self.home_layout)
         scroll = SmoothScrollArea()
         scroll.setWidgetResizable(True)
@@ -4270,6 +4706,7 @@ class MainWindow(QMainWindow):
         content = QWidget()
         content.setObjectName("page")
         content_layout = QVBoxLayout(content)
+        self._home_content_layout = content_layout
         content_layout.setContentsMargins(24, 14, 24, 36)
         content_layout.setSpacing(28)
 
@@ -4278,21 +4715,22 @@ class MainWindow(QMainWindow):
             hero_candidates = [x for x in trending if x.get("backdrop_path")]
             content_layout.addWidget(HeroBanner((hero_candidates or trending)[0], self.thread_pool, self.open_details))
 
+        self._continue_insert_index = content_layout.count()
+
         # Keep each in-progress title visible exactly once. A short personal
         # list should not be padded with infinite-row clones of the same movie.
         continue_items = self.watch_state.continue_watching(self.active_profile_id)
         if continue_items:
-            content_layout.addWidget(
-                MediaRow(
-                    "Continue Watching",
-                    continue_items,
-                    self.thread_pool,
-                    self.open_details,
-                    state_lookup=self._watch_entry,
-                    show_progress=True,
-                    infinite=False,
-                )
+            self._continue_row = MediaRow(
+                "Continue Watching",
+                continue_items,
+                self.thread_pool,
+                self.open_details,
+                state_lookup=self._watch_entry,
+                show_progress=True,
+                infinite=False,
             )
+            content_layout.addWidget(self._continue_row)
 
         self.home_sections = payload.get("sections", [])
         for title, items in self.home_sections:
@@ -4318,8 +4756,43 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.home_page)
 
     def _refresh_home_from_state(self) -> None:
-        if self.home_payload is not None and self.stack.currentWidget() == self.home_page:
+        if self.home_payload is None or self.stack.currentWidget() != self.home_page:
+            return
+        layout = self._home_content_layout
+        if layout is None:
             self._render_home(self.home_payload)
+            return
+
+        # Rebuild only the small profile-specific row and update badges in
+        # place. Reconstructing all five infinite discovery carousels after a
+        # single watch-state change briefly doubled hundreds of card widgets.
+        old_continue = self._continue_row
+        self._continue_row = None
+        if old_continue is not None:
+            layout.removeWidget(old_continue)
+            old_continue.hide()
+            old_continue.deleteLater()
+
+        continue_items = self.watch_state.continue_watching(self.active_profile_id)
+        if continue_items:
+            row = MediaRow(
+                "Continue Watching",
+                continue_items,
+                self.thread_pool,
+                self.open_details,
+                state_lookup=self._watch_entry,
+                show_progress=True,
+                infinite=False,
+            )
+            self._continue_row = row
+            layout.insertWidget(self._continue_insert_index, row)
+
+        for card in self.home_page.findChildren(MediaCard):
+            if old_continue is not None and self._find_ancestor(card, MediaRow) is old_continue:
+                continue
+            card.refresh_watch_state()
+        self._invalidate_controller_focusables()
+        _notify_image_view_changed()
 
     def _show_home_error(self, error: str) -> None:
         self._home_loading = False
@@ -4836,9 +5309,7 @@ class MainWindow(QMainWindow):
     def _controller_back(self) -> None:
         detail = self._active_detail_dialog()
         if detail is not None:
-            if detail.exit_trailer_fullscreen():
-                return
-            if detail.close_episode_picker():
+            if detail.controller_back():
                 return
             self._clear_controller_selection()
             detail.reject()
