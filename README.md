@@ -16,9 +16,6 @@ The app currently uses [TMDB](https://www.themoviedb.org/) for movie and TV meta
 - On-screen keyboard for controller searches
 - Low-memory tuning for the original Raspberry Pi Zero W
 
-## Recommended branch
-
-The most optimized Raspberry Pi version is on the `efficiency-overhaul` branch. The installation commands below install that branch.
 
 ## Hardware requirements
 
