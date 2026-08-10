@@ -7,7 +7,6 @@ import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlencode
 
 import requests
 from PySide6.QtCore import (
@@ -16,8 +15,10 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QPropertyAnimation,
+    QRect,
     QRunnable,
     QSize,
+    Slot,
     Qt,
     QThreadPool,
     QTimer,
@@ -45,11 +46,14 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from PySide6.QtWebEngineCore import QWebEngineHttpRequest
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except Exception:
     QWebEngineView = None
-    QWebEngineHttpRequest = None
+
+try:
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+except Exception:
+    QWebEngineSettings = None
 
 try:
     import pygame
@@ -58,7 +62,7 @@ except Exception:
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "2.6-merged-controller-carousel"
+APP_VERSION = "2.9-tv-season-episode-picker"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -70,13 +74,83 @@ YOUTUBE_APP_ID = "com.layeredkingdom.pistick"
 YOUTUBE_REFERER = f"https://{YOUTUBE_APP_ID}/"
 
 
-# Keep background QRunnables alive until their run() methods finish.
-# Without this, PySide can garbage-collect the Python signal owner while a
-# download is still running, causing "Signal source has been deleted".
+def build_youtube_embed_html(video_key: str) -> str:
+    """Create a controllable YouTube player with an identified WebView origin."""
+    origin = YOUTUBE_REFERER.rstrip("/")
+    safe_key = json.dumps(str(video_key))
+    safe_origin = json.dumps(origin)
+    safe_referrer = json.dumps(YOUTUBE_REFERER)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <style>
+    html, body {{ width:100%; height:100%; margin:0; background:#0b0b0d; overflow:hidden; }}
+    #player, iframe {{ width:100%; height:100%; border:0; display:block; }}
+  </style>
+</head>
+<body>
+  <div id="player"></div>
+  <script>
+    let player = null;
+    let playRequested = false;
+
+    function onYouTubeIframeAPIReady() {{
+      player = new YT.Player('player', {{
+        videoId: {safe_key},
+        host: 'https://www.youtube.com',
+        playerVars: {{
+          rel: 0,
+          playsinline: 1,
+          enablejsapi: 1,
+          origin: {safe_origin},
+          widget_referrer: {safe_referrer}
+        }},
+        events: {{
+          onReady: function(event) {{
+            if (playRequested) event.target.playVideo();
+          }}
+        }}
+      }});
+    }}
+
+    window.pistickPlayTrailer = function() {{
+      playRequested = true;
+      if (!player || typeof player.playVideo !== 'function') return false;
+      player.playVideo();
+      return true;
+    }};
+
+    window.pistickPauseTrailer = function() {{
+      playRequested = false;
+      if (!player || typeof player.pauseVideo !== 'function') return false;
+      player.pauseVideo();
+      return true;
+    }};
+
+    const api = document.createElement('script');
+    api.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(api);
+  </script>
+</body>
+</html>"""
+
+
+# Keep background QRunnables alive until their queued GUI-thread callbacks have
+# been delivered. Releasing them inside run() can delete the signal owner before
+# Qt handles the queued result, which is especially easy to hit with search.
 _ACTIVE_WORKERS: set[QRunnable] = set()
+_WORKER_REAPER: Optional["_WorkerReaper"] = None
 
 
 def _start_worker(pool: QThreadPool, worker: QRunnable) -> None:
+    global _WORKER_REAPER
+    if _WORKER_REAPER is None:
+        _WORKER_REAPER = _WorkerReaper()
+    worker.setAutoDelete(False)
+    worker.signals.finished.connect(_WORKER_REAPER.release)
     _ACTIVE_WORKERS.add(worker)
     pool.start(worker)
 
@@ -93,8 +167,10 @@ def watch_title(media: dict[str, Any]) -> None:
     Replace this function with your Jellyfin API / playback code later.
 
     PiStick records that the current profile started this title before calling
-    this function. When you wire in Jellyfin, you can also update real playback
-    progress through WatchStateStore.set_progress().
+    this function. TV episode payloads include ``media_type="episode"``,
+    ``series_id``, ``season_number`` and ``episode_number``. When Jellyfin is
+    connected, report episode progress through
+    WatchStateStore.set_episode_progress().
     """
     pass
 
@@ -223,6 +299,8 @@ class WatchStateStore:
             "backdrop_path",
             "overview",
             "vote_average",
+            "number_of_seasons",
+            "seasons",
         )
         return {key: media.get(key) for key in keys if media.get(key) is not None}
 
@@ -233,6 +311,207 @@ class WatchStateStore:
 
     def entry(self, profile_id: Optional[str], media: dict[str, Any]) -> Optional[dict[str, Any]]:
         return self._profile_history(profile_id).get(self.media_key(media))
+
+    @staticmethod
+    def episode_key(season_number: int, episode_number: int) -> str:
+        return f"{int(season_number)}:{int(episode_number)}"
+
+    @staticmethod
+    def available_seasons(media: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return aired/known seasons, with regular seasons before specials."""
+        seasons = [
+            dict(season)
+            for season in media.get("seasons", [])
+            if isinstance(season, dict)
+            and int(season.get("episode_count", 0) or 0) > 0
+        ]
+        regular = sorted(
+            (season for season in seasons if int(season.get("season_number", 0) or 0) > 0),
+            key=lambda season: int(season.get("season_number", 0) or 0),
+        )
+        specials = sorted(
+            (season for season in seasons if int(season.get("season_number", 0) or 0) == 0),
+            key=lambda season: str(season.get("name", "")),
+        )
+        return regular + specials
+
+    @classmethod
+    def next_episode_position(
+        cls,
+        media: dict[str, Any],
+        season_number: int,
+        episode_number: int,
+    ) -> Optional[tuple[int, int]]:
+        seasons = cls.available_seasons(media)
+        season_numbers = [int(season.get("season_number", 0) or 0) for season in seasons]
+        counts = {
+            int(season.get("season_number", 0) or 0): int(season.get("episode_count", 0) or 0)
+            for season in seasons
+        }
+        current_count = counts.get(int(season_number), 0)
+        if current_count and int(episode_number) < current_count:
+            return int(season_number), int(episode_number) + 1
+
+        try:
+            index = season_numbers.index(int(season_number))
+        except ValueError:
+            return None
+        for next_season in season_numbers[index + 1 :]:
+            if next_season > 0 and counts.get(next_season, 0) > 0:
+                return next_season, 1
+        return None
+
+    def episode_entries(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry = self.entry(profile_id, media) or {}
+        episodes = entry.get("episodes", {})
+        return episodes if isinstance(episodes, dict) else {}
+
+    def episode_entry(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        season_number: int,
+        episode_number: int,
+    ) -> Optional[dict[str, Any]]:
+        return self.episode_entries(profile_id, media).get(
+            self.episode_key(season_number, episode_number)
+        )
+
+    def latest_episode_entry(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        episodes = list(self.episode_entries(profile_id, media).values())
+        episodes = [episode for episode in episodes if isinstance(episode, dict)]
+        if not episodes:
+            return None
+        return max(episodes, key=lambda episode: float(episode.get("updated_at", 0.0) or 0.0))
+
+    def resume_episode(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+    ) -> tuple[int, int]:
+        """Pick the latest unfinished episode, or the episode after a finished one."""
+        latest = self.latest_episode_entry(profile_id, media)
+        if latest is None:
+            seasons = self.available_seasons(media)
+            regular = [
+                int(season.get("season_number", 0) or 0)
+                for season in seasons
+                if int(season.get("season_number", 0) or 0) > 0
+            ]
+            return (regular[0] if regular else 1), 1
+
+        season_number = int(latest.get("season_number", 1) or 1)
+        episode_number = int(latest.get("episode_number", 1) or 1)
+        if latest.get("status") == "finished":
+            next_position = self.next_episode_position(media, season_number, episode_number)
+            if next_position is not None:
+                return next_position
+        return season_number, episode_number
+
+    @staticmethod
+    def episode_snapshot(episode: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "id",
+            "name",
+            "overview",
+            "air_date",
+            "still_path",
+            "runtime",
+            "season_number",
+            "episode_number",
+        )
+        return {key: episode.get(key) for key in keys if episode.get(key) is not None}
+
+    def _write_episode_progress(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+        progress: float,
+    ) -> None:
+        if not profile_id:
+            return
+        season_number = int(episode.get("season_number", 1) or 1)
+        episode_number = int(episode.get("episode_number", 1) or 1)
+        progress = max(0.0, min(1.0, float(progress)))
+        now = time.time()
+        history = self._profile_history(profile_id)
+        key = self.media_key(media)
+        show_entry = dict(history.get(key, {}))
+        episodes = dict(show_entry.get("episodes", {}))
+        episode_data = {
+            "status": "finished" if progress >= 0.98 else "in_progress",
+            "progress": 1.0 if progress >= 0.98 else progress,
+            "updated_at": now,
+            "season_number": season_number,
+            "episode_number": episode_number,
+            "episode": self.episode_snapshot(episode),
+        }
+        episodes[self.episode_key(season_number, episode_number)] = episode_data
+
+        next_position = self.next_episode_position(media, season_number, episode_number)
+        show_finished = episode_data["status"] == "finished" and next_position is None
+        history[key] = {
+            "status": "finished" if show_finished else "in_progress",
+            "progress": (
+                1.0
+                if show_finished
+                else 0.03
+                if episode_data["status"] == "finished"
+                else max(0.03, min(0.97, episode_data["progress"]))
+            ),
+            "updated_at": now,
+            "media": self.snapshot(media) or show_entry.get("media", {}),
+            "episodes": episodes,
+            "last_episode": {
+                "season_number": season_number,
+                "episode_number": episode_number,
+            },
+        }
+        self.save()
+
+    def mark_episode_started(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+    ) -> None:
+        previous = self.episode_entry(
+            profile_id,
+            media,
+            int(episode.get("season_number", 1) or 1),
+            int(episode.get("episode_number", 1) or 1),
+        ) or {}
+        progress = float(previous.get("progress", 0.0) or 0.0)
+        if previous.get("status") == "finished":
+            progress = 0.03
+        self._write_episode_progress(profile_id, media, episode, max(0.03, progress))
+
+    def mark_episode_finished(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+    ) -> None:
+        self._write_episode_progress(profile_id, media, episode, 1.0)
+
+    def set_episode_progress(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+        progress: float,
+    ) -> None:
+        """Call this from Jellyfin with progress for one TV episode."""
+        self._write_episode_progress(profile_id, media, episode, progress)
 
     def mark_started(self, profile_id: Optional[str], media: dict[str, Any]) -> None:
         if not profile_id:
@@ -298,7 +577,16 @@ class WatchStateStore:
             if entry.get("status") == "in_progress" and entry.get("media")
         ]
         entries.sort(key=lambda x: float(x.get("updated_at", 0.0)), reverse=True)
-        return [dict(entry.get("media", {})) for entry in entries]
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            media = dict(entry.get("media", {}))
+            key = self.media_key(media)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(media)
+        return items
 
 
 class TMDBClient:
@@ -365,10 +653,35 @@ class TMDBClient:
         data = self.get(f"/{media_type}/{media_id}", append_to_response="videos,credits")
         return self.normalize(data, media_type)
 
+    def season_details(self, series_id: int, season_number: int) -> dict[str, Any]:
+        """Load the episodes for one TV season from TMDB."""
+        data = self.get(f"/tv/{int(series_id)}/season/{int(season_number)}")
+        data["season_number"] = int(data.get("season_number", season_number) or season_number)
+        episodes = []
+        for raw_episode in data.get("episodes", []):
+            if not isinstance(raw_episode, dict):
+                continue
+            episode = dict(raw_episode)
+            episode["season_number"] = int(
+                episode.get("season_number", data["season_number"]) or data["season_number"]
+            )
+            episode["episode_number"] = int(episode.get("episode_number", 0) or 0)
+            if episode["episode_number"] > 0:
+                episodes.append(episode)
+        data["episodes"] = episodes
+        return data
+
 
 class WorkerSignals(QObject):
     success = Signal(object)
     error = Signal(str)
+    finished = Signal(object)
+
+
+class _WorkerReaper(QObject):
+    @Slot(object)
+    def release(self, worker: QRunnable) -> None:
+        _release_worker(worker)
 
 
 class FunctionWorker(QRunnable):
@@ -386,12 +699,16 @@ class FunctionWorker(QRunnable):
             except RuntimeError:
                 pass
         finally:
-            _release_worker(self)
+            try:
+                self.signals.finished.emit(self)
+            except RuntimeError:
+                _release_worker(self)
 
 
 class ImageSignals(QObject):
     loaded = Signal(bytes)
     failed = Signal()
+    finished = Signal(object)
 
 
 class ImageWorker(QRunnable):
@@ -414,10 +731,15 @@ class ImageWorker(QRunnable):
             except RuntimeError:
                 pass
         finally:
-            _release_worker(self)
+            try:
+                self.signals.finished.emit(self)
+            except RuntimeError:
+                _release_worker(self)
 
 
 class RemoteImage(QLabel):
+    imageReady = Signal(object)
+
     def __init__(
         self,
         thread_pool: QThreadPool,
@@ -444,8 +766,25 @@ class RemoteImage(QLabel):
             return
         worker = ImageWorker(url)
         worker.signals.loaded.connect(self._set_image)
-        worker.signals.failed.connect(lambda: self.setText("No image"))
+        worker.signals.failed.connect(self._set_failed)
         _start_worker(self.thread_pool, worker)
+
+    def copy_from(self, source: "RemoteImage") -> None:
+        """Share a loaded poster with a carousel clone without downloading it again."""
+        source.imageReady.connect(self._set_shared_pixmap)
+        pixmap = source.pixmap()
+        if pixmap is not None and not pixmap.isNull():
+            self._set_shared_pixmap(pixmap)
+
+    def _set_failed(self) -> None:
+        self.setText("No image")
+
+    def _set_shared_pixmap(self, pixmap: QPixmap) -> None:
+        if pixmap is None or pixmap.isNull():
+            self.setText("No image")
+            return
+        self.setPixmap(pixmap)
+        self.setText("")
 
     def _set_image(self, data: bytes) -> None:
         image = QImage.fromData(data)
@@ -460,6 +799,58 @@ class RemoteImage(QLabel):
             pixmap = pixmap.copy(x, y, self.target_size.width(), self.target_size.height())
         self.setPixmap(pixmap)
         self.setText("")
+        self.imageReady.emit(pixmap)
+
+
+if QWebEngineView is not None:
+    class TrailerWebView(QWebEngineView):
+        """Web player that observes clicks without stealing controller focus."""
+
+        clicked = Signal()
+
+        def __init__(self, parent: Optional[QWidget] = None):
+            super().__init__(parent)
+            if QWebEngineSettings is not None:
+                web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
+                playback_attribute = getattr(
+                    web_attribute,
+                    "PlaybackRequiresUserGesture",
+                    None,
+                )
+                if playback_attribute is not None:
+                    self.settings().setAttribute(playback_attribute, False)
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+
+        def _contains_widget(self, widget: QObject) -> bool:
+            current = widget if isinstance(widget, QWidget) else None
+            while current is not None:
+                if current is self:
+                    return True
+                current = current.parentWidget()
+            return False
+
+        def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+            if (
+                event.type() == QEvent.MouseButtonRelease
+                and event.button() == Qt.LeftButton
+                and self._contains_widget(watched)
+            ):
+                self.clicked.emit()
+            return False
+
+        def play_trailer(self) -> None:
+            self.page().runJavaScript(
+                "window.pistickPlayTrailer && window.pistickPlayTrailer();"
+            )
+
+        def pause_trailer(self) -> None:
+            self.page().runJavaScript(
+                "window.pistickPauseTrailer && window.pistickPauseTrailer();"
+            )
+else:
+    TrailerWebView = None
 
 
 class SmoothScrollArea(QScrollArea):
@@ -559,6 +950,11 @@ class HorizontalMediaScrollArea(SmoothScrollArea):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.verticalScrollBar().setSingleStep(0)
         self.verticalScrollBar().setPageStep(0)
+        self.horizontal_rebase_callback: Optional[Callable[[], None]] = None
+        self._drag_active = False
+        self._dragging = False
+        self._drag_start_x = 0
+        self._drag_start_value = 0
 
     def _parent_vertical_scroll_area(self) -> Optional[SmoothScrollArea]:
         parent = self.parentWidget()
@@ -615,12 +1011,10 @@ class HorizontalMediaScrollArea(SmoothScrollArea):
         horizontal_delta = delta_x or (delta_y if shift else 0)
         if horizontal_delta:
             bar = self.horizontalScrollBar()
+            if callable(self.horizontal_rebase_callback):
+                self.horizontal_rebase_callback()
             multiplier = 3.0 if precise_x else 1.55
             target = bar.value() - int(horizontal_delta * multiplier)
-            bounds_provider = getattr(self, "horizontal_bounds_provider", None)
-            if callable(bounds_provider):
-                logical_min, logical_max = bounds_provider()
-                target = max(logical_min, min(logical_max, target))
             self._animate(bar, self._h_animation, target, 240)
             event.accept()
             return True
@@ -631,6 +1025,46 @@ class HorizontalMediaScrollArea(SmoothScrollArea):
         if self.handle_filtered_wheel(event):
             return
         event.ignore()
+
+    @staticmethod
+    def _global_x(event) -> int:
+        if hasattr(event, "globalPosition"):
+            return int(event.globalPosition().x())
+        return int(event.globalPos().x())
+
+    def begin_mouse_drag(self, event) -> None:
+        self._drag_active = True
+        self._dragging = False
+        self._drag_start_x = self._global_x(event)
+        if callable(self.horizontal_rebase_callback):
+            self.horizontal_rebase_callback()
+        self._drag_start_value = self.horizontalScrollBar().value()
+
+    def update_mouse_drag(self, event) -> bool:
+        if not self._drag_active or not (event.buttons() & Qt.LeftButton):
+            return False
+        distance = self._global_x(event) - self._drag_start_x
+        if not self._dragging and abs(distance) < 7:
+            return False
+        self._dragging = True
+        self._h_animation.stop()
+        bar = self.horizontalScrollBar()
+        bar.setValue(self._clamp(bar, self._drag_start_value - distance))
+
+        # Rebase while dragging so a long swipe never reaches a physical edge.
+        before = bar.value()
+        if callable(self.horizontal_rebase_callback):
+            self.horizontal_rebase_callback()
+        self._drag_start_value += bar.value() - before
+        return True
+
+    def end_mouse_drag(self) -> bool:
+        consumed = self._drag_active and self._dragging
+        self._drag_active = False
+        self._dragging = False
+        if callable(self.horizontal_rebase_callback):
+            self.horizontal_rebase_callback()
+        return consumed
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -681,6 +1115,7 @@ class MediaCard(ClickableFrame):
         width: int = 166,
         state_lookup: Optional[Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = None,
         show_progress: bool = False,
+        image_source: Optional[RemoteImage] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -705,7 +1140,9 @@ class MediaCard(ClickableFrame):
         self.poster = RemoteImage(thread_pool, width, poster_height, radius=8, parent=poster_holder)
         self.poster.move(0, 0)
         poster_path = media.get("poster_path")
-        if poster_path:
+        if image_source is not None:
+            self.poster.copy_from(image_source)
+        elif poster_path:
             self.poster.load(f"{TMDB_IMAGE_BASE}/w342{poster_path}")
 
         entry = state_lookup(media) if state_lookup else None
@@ -751,6 +1188,12 @@ class MediaCard(ClickableFrame):
         self.clicked.emit()
 
     def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Left, Qt.Key_Right):
+            row = getattr(self, "controller_row", None)
+            direction = "left" if event.key() == Qt.Key_Left else "right"
+            if isinstance(row, MediaRow) and row.keyboard_move(self, direction):
+                event.accept()
+                return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
             self.activate()
             event.accept()
@@ -767,7 +1210,7 @@ class MediaCard(ClickableFrame):
 
 
 class MediaRow(QWidget):
-    """Movie/show row with controller-only seamless circular wrapping."""
+    """A mouse, keyboard, trackpad, and controller-friendly infinite row."""
 
     def __init__(
         self,
@@ -777,10 +1220,30 @@ class MediaRow(QWidget):
         open_details: Callable[[dict[str, Any]], None],
         state_lookup: Optional[Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = None,
         show_progress: bool = False,
+        infinite: bool = True,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
-        self.items = list(items[:20])
+        unique_items: list[dict[str, Any]] = []
+        seen_items: set[tuple[str, str]] = set()
+        for item in items:
+            media_id = item.get("id")
+            if media_id is None:
+                identity = (
+                    "fallback",
+                    f"{item.get('title') or item.get('name', '')}|{item.get('poster_path', '')}",
+                )
+            else:
+                identity = (str(item.get("media_type") or "movie"), str(media_id))
+            if identity in seen_items:
+                continue
+            seen_items.add(identity)
+            unique_items.append(item)
+            if len(unique_items) >= 20:
+                break
+
+        self.items = unique_items
+        self.infinite = bool(infinite and len(self.items) > 1)
         self.cards: list[MediaCard] = []
         self.left_clone: Optional[MediaCard] = None
         self.right_clone: Optional[MediaCard] = None
@@ -807,13 +1270,18 @@ class MediaRow(QWidget):
         self.row_layout.setContentsMargins(0, 0, 18, 0)
         self.row_layout.setSpacing(12)
 
-        def make_card(item: dict[str, Any], clone: bool = False) -> MediaCard:
+        def make_card(
+            item: dict[str, Any],
+            clone: bool = False,
+            image_source: Optional[RemoteImage] = None,
+        ) -> MediaCard:
             card = MediaCard(
                 item,
                 thread_pool,
                 open_details,
                 state_lookup=state_lookup,
                 show_progress=show_progress,
+                image_source=image_source,
             )
             card.controller_row = self
             card.setProperty("controllerClone", clone)
@@ -821,38 +1289,46 @@ class MediaRow(QWidget):
                 card.setFocusPolicy(Qt.NoFocus)
             return card
 
-        # Large invisible buffers give the row room to invisibly rebase after a
-        # wrap while preserving the selected card's exact screen position.
-        # This avoids the visible "rewind" that happens if there is no spare
-        # scroll space on the opposite edge.
-        self.left_buffer = QWidget()
-        self.left_buffer.setFixedWidth(4096)
-        self.left_buffer.setFocusPolicy(Qt.NoFocus)
-        self.row_layout.addWidget(self.left_buffer)
+        # Render the same logical period on both sides of the focusable cards.
+        # The scrollbar can then be rebased by exactly one period after a wheel,
+        # drag, or key animation; identical posters occupy the same pixels, so
+        # the rebase is invisible and the viewport never reaches an empty gap.
+        if self.items:
+            self.cards = [make_card(item) for item in self.items]
+            if self.infinite:
+                item_count = len(self.items)
+                repeat_count = max(3, (30 + item_count - 1) // item_count)
+                if repeat_count % 2 == 0:
+                    repeat_count += 1
+                center_repeat = repeat_count // 2
+                display_cards: list[MediaCard] = []
 
-        # One duplicate on each edge is enough for the visible wrap animation.
-        if len(self.items) > 1:
-            self.left_clone = make_card(self.items[-1], clone=True)
-            self.row_layout.addWidget(self.left_clone)
+                for repeat_index in range(repeat_count):
+                    for item_index, item in enumerate(self.items):
+                        if repeat_index == center_repeat:
+                            card = self.cards[item_index]
+                        else:
+                            card = make_card(
+                                item,
+                                clone=True,
+                                image_source=self.cards[item_index].poster,
+                            )
+                        display_cards.append(card)
+                        self.row_layout.addWidget(card)
 
-        for item in self.items:
-            card = make_card(item)
-            self.cards.append(card)
-            self.row_layout.addWidget(card)
+                center_start = center_repeat * item_count
+                self.left_clone = display_cards[center_start - 1]
+                self.right_clone = display_cards[center_start + item_count]
+            else:
+                for card in self.cards:
+                    self.row_layout.addWidget(card)
 
-        if len(self.items) > 1:
-            self.right_clone = make_card(self.items[0], clone=True)
-            self.row_layout.addWidget(self.right_clone)
-
-        self.right_buffer = QWidget()
-        self.right_buffer.setFixedWidth(4096)
-        self.right_buffer.setFocusPolicy(Qt.NoFocus)
-        self.row_layout.addWidget(self.right_buffer)
         self.content.adjustSize()
         width = max(self.row_layout.sizeHint().width(), self.content.sizeHint().width())
         self.content.setFixedSize(width, self.scroll_height - 2)
         self.scroll.setWidget(self.content)
-        self.scroll.horizontal_bounds_provider = self._normal_scroll_bounds
+        self.scroll.horizontal_rebase_callback = self._rebase_scroll_position
+        self.scroll._h_animation.finished.connect(self._rebase_scroll_position)
         outer.addWidget(self.scroll)
 
         # Start on the first real card, with the left-side duplicate clipped away.
@@ -871,21 +1347,33 @@ class MediaRow(QWidget):
         bar = self.scroll.horizontalScrollBar()
         bar.setValue(max(bar.minimum(), min(bar.maximum(), self.cards[0].x())))
 
-    def _normal_scroll_bounds(self) -> tuple[int, int]:
-        """Mouse/trackpad horizontal scrolling stays inside the real row."""
-        if not self.cards:
-            return (0, 0)
-        viewport_w = max(1, self.scroll.viewport().width())
-        minimum = self.cards[0].x()
-        maximum = max(
-            minimum,
-            self.cards[-1].x() + self.cards[-1].width() - viewport_w,
-        )
-        return minimum, maximum
+    def _period_width(self) -> int:
+        if self.cards and self.right_clone is not None:
+            measured = self.right_clone.x() - self.cards[0].x()
+            if measured > 0:
+                return measured
+        return self._card_step() * max(1, len(self.cards))
+
+    def _rebase_scroll_position(self) -> None:
+        """Move to an identical copy of the row before a physical edge appears."""
+        if not self.infinite or not self.cards or self._wrapping:
+            return
+        bar = self.scroll.horizontalScrollBar()
+        anchor = self.cards[0].x()
+        period = self._period_width()
+        if period <= 0:
+            return
+        value = bar.value()
+        if anchor <= value < anchor + period:
+            return
+        rebased = anchor + ((value - anchor) % period)
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), int(rebased))))
 
     def _card_step(self) -> int:
         if len(self.cards) >= 2:
             return max(1, self.cards[1].x() - self.cards[0].x())
+        if self.cards and self.right_clone is not None:
+            return max(1, self.right_clone.x() - self.cards[0].x())
         if self.cards:
             return max(1, self.cards[0].width() + self.row_layout.spacing())
         return 1
@@ -900,6 +1388,7 @@ class MediaRow(QWidget):
     ) -> None:
         if self._wrapping:
             return
+        self._rebase_scroll_position()
         self._wrapping = True
 
         bar = self.scroll.horizontalScrollBar()
@@ -910,13 +1399,15 @@ class MediaRow(QWidget):
         else:
             target = max(bar.minimum(), start_value - step)
 
-        # Move the controller outline onto the edge duplicate during the short
-        # animation so it looks like the row genuinely continues forever.
-        try:
-            current.set_controller_selected(False)
-            clone.set_controller_selected(True)
-        except RuntimeError:
-            pass
+        # Move a controller outline onto the edge copy for the short animation.
+        # Physical-keyboard focus uses the same movement without that property.
+        show_controller_outline = bool(current.property("controllerSelected"))
+        if show_controller_outline:
+            try:
+                current.set_controller_selected(False)
+                clone.set_controller_selected(True)
+            except RuntimeError:
+                pass
 
         animation = QPropertyAnimation(bar, b"value", self)
         self._wrap_animation = animation
@@ -926,10 +1417,11 @@ class MediaRow(QWidget):
         animation.setEndValue(target)
 
         def finish() -> None:
-            try:
-                clone.set_controller_selected(False)
-            except RuntimeError:
-                pass
+            if show_controller_outline:
+                try:
+                    clone.set_controller_selected(False)
+                except RuntimeError:
+                    pass
 
             # Preserve the duplicate's exact screen position while switching to
             # its real twin. This is the invisible rebase that avoids a rewind.
@@ -980,6 +1472,16 @@ class MediaRow(QWidget):
         elif self.left_clone is not None:
             self._animate_wrap(current, self.left_clone, self.cards[-1], "left", select_callback)
         return True
+
+    def keyboard_move(self, current: MediaCard, direction: str) -> bool:
+        """Use Left/Right on a focused card with the same circular movement."""
+
+        def select(card: MediaCard, ensure_visible: bool) -> None:
+            card.setFocus(Qt.TabFocusReason)
+            if ensure_visible:
+                self.scroll.smooth_ensure_widget_visible(card, 48, 48)
+
+        return self.controller_move(current, direction, select)
 
 
 class ProfileCard(ClickableFrame):
@@ -1078,6 +1580,7 @@ class ControllerManager(QObject):
     navigate = Signal(str)
     activate = Signal()
     back = Signal()
+    pause = Signal()
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -1176,6 +1679,8 @@ class ControllerManager(QObject):
             self.activate.emit()
         if self._button_edge(1):  # B / Circle
             self.back.emit()
+        if self._button_edge(2):  # X / Square
+            self.pause.emit()
 
         current = self._direction_values()
         for direction, pressed in current.items():
@@ -1378,6 +1883,36 @@ class DetailDialog(QDialog):
         self.profile_id = profile_id
         self.controller_actions: list[QPushButton] = []
         self.preferred_controller_widget: Optional[QWidget] = None
+        self.watch_show_button: Optional[QPushButton] = None
+        self.episode_panel: Optional[QFrame] = None
+        self.episode_panel_close_button: Optional[QPushButton] = None
+        self.episode_list_layout: Optional[QVBoxLayout] = None
+        self.episode_scroll: Optional[QScrollArea] = None
+        self.season_buttons: list[QPushButton] = []
+        self.episode_buttons: list[QPushButton] = []
+        self._season_cache: dict[int, dict[str, Any]] = {}
+        self._season_request_generation = 0
+        self._active_season: Optional[int] = None
+        self._resume_episode_position: tuple[int, int] = (1, 1)
+        self._episode_picker_open = False
+        self._episode_picker_animating = False
+        self._episode_panel_animation: Optional[QPropertyAnimation] = None
+        self._episode_after_close: Optional[Callable[[], None]] = None
+        self.trailer_web: Optional[QWidget] = None
+        self.trailer_placeholder: Optional[QWidget] = None
+        self.trailer_overlay: Optional[QFrame] = None
+        self.trailer_overlay_hint: Optional[QLabel] = None
+        self._trailer_animation: Optional[QPropertyAnimation] = None
+        self._trailer_fullscreen = False
+        self._trailer_animating = False
+        self._trailer_original_global_rect: Optional[QRect] = None
+        self._trailer_window_geometry: Optional[QRect] = None
+        self._trailer_was_fullscreen = False
+        self._trailer_was_maximized = False
+        self._trailer_fullscreen_timer = QTimer(self)
+        self._trailer_fullscreen_timer.setSingleShot(True)
+        self._trailer_fullscreen_timer.setInterval(2000)
+        self._trailer_fullscreen_timer.timeout.connect(self.enter_trailer_fullscreen)
         self.setWindowTitle(initial_media.get("title", APP_NAME))
         self.resize(1080, 760)
         self.setMinimumSize(860, 620)
@@ -1411,7 +1946,7 @@ class DetailDialog(QDialog):
         loading.setAlignment(Qt.AlignCenter)
         self.body.addWidget(loading, 1)
 
-        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.reject)
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._escape_requested)
         self._load_details()
 
     def _load_details(self) -> None:
@@ -1439,10 +1974,686 @@ class DetailDialog(QDialog):
             if item.layout():
                 DetailDialog._clear_nested_layout(item.layout())
 
+    def _discard_episode_picker(self) -> None:
+        self._season_request_generation += 1
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+            self._episode_panel_animation = None
+        if self.episode_panel is not None:
+            self.episode_panel.hide()
+            self.episode_panel.deleteLater()
+        self.episode_panel = None
+        self.episode_panel_close_button = None
+        self.episode_list_layout = None
+        self.episode_scroll = None
+        self.season_buttons = []
+        self.episode_buttons = []
+        self.watch_show_button = None
+        self._active_season = None
+        self._episode_picker_open = False
+        self._episode_picker_animating = False
+        self._episode_after_close = None
+
+    def _episode_panel_target_geometry(self) -> QRect:
+        margin = 28
+        width = max(320, min(880, self.width() - margin * 2))
+        height = max(300, min(520, self.height() - 112))
+        button = self.watch_show_button
+        if button is not None:
+            button_top_left = self.mapFromGlobal(button.mapToGlobal(QPoint(0, 0)))
+            desired_x = button_top_left.x()
+            desired_y = button_top_left.y() + button.height() + 12
+        else:
+            desired_x = (self.width() - width) // 2
+            desired_y = 84
+        x = max(margin, min(desired_x, self.width() - width - margin))
+        y = max(72, min(desired_y, self.height() - height - margin))
+        return QRect(x, y, width, height)
+
+    def _watch_button_geometry(self) -> QRect:
+        button = self.watch_show_button
+        if button is None:
+            center = self.rect().center()
+            return QRect(center.x(), center.y(), 1, 1)
+        top_left = self.mapFromGlobal(button.mapToGlobal(QPoint(0, 0)))
+        return QRect(top_left, button.size())
+
+    def _build_episode_picker(self, media: dict[str, Any]) -> None:
+        panel = QFrame(self)
+        panel.setObjectName("episodePicker")
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel.hide()
+
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(24, 20, 24, 22)
+        outer.setSpacing(13)
+
+        header = QHBoxLayout()
+        title = QLabel("Episodes")
+        title.setObjectName("episodePickerTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        close = QPushButton("✕")
+        close.setObjectName("episodePickerClose")
+        close.setProperty("controllerSelected", False)
+        close.setFocusPolicy(Qt.StrongFocus)
+        close.setFixedSize(38, 38)
+        close.clicked.connect(self.close_episode_picker)
+        header.addWidget(close)
+        outer.addLayout(header)
+
+        season_hint = QLabel("Choose a season")
+        season_hint.setObjectName("episodePickerHint")
+        outer.addWidget(season_hint)
+
+        season_scroll = QScrollArea()
+        season_scroll.setObjectName("seasonScroll")
+        season_scroll.setWidgetResizable(True)
+        season_scroll.setFrameShape(QFrame.NoFrame)
+        season_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        season_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        season_scroll.setFixedHeight(58)
+        season_host = QWidget()
+        season_host.setObjectName("transparentWidget")
+        season_layout = QHBoxLayout(season_host)
+        season_layout.setContentsMargins(0, 2, 0, 4)
+        season_layout.setSpacing(9)
+
+        seasons = self.watch_state.available_seasons(media)
+        for season in seasons:
+            number = int(season.get("season_number", 0) or 0)
+            label = str(season.get("name") or ("Specials" if number == 0 else f"Season {number}"))
+            button = QPushButton(label)
+            button.setObjectName("seasonButton")
+            button.setProperty("seasonNumber", number)
+            button.setProperty("activeSeason", False)
+            button.setProperty("controllerSelected", False)
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.setMinimumWidth(112)
+            button.clicked.connect(lambda _checked=False, n=number: self._select_season(n))
+            season_layout.addWidget(button)
+            self.season_buttons.append(button)
+        season_layout.addStretch(1)
+        season_host.setMinimumWidth(max(1, len(self.season_buttons)) * 121)
+        season_scroll.setWidget(season_host)
+        outer.addWidget(season_scroll)
+
+        episode_hint = QLabel("Pick an episode")
+        episode_hint.setObjectName("episodePickerHint")
+        outer.addWidget(episode_hint)
+
+        episode_scroll = QScrollArea()
+        episode_scroll.setObjectName("episodeScroll")
+        episode_scroll.setWidgetResizable(True)
+        episode_scroll.setFrameShape(QFrame.NoFrame)
+        episode_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        episode_host = QWidget()
+        episode_host.setObjectName("transparentWidget")
+        episode_layout = QVBoxLayout(episode_host)
+        episode_layout.setContentsMargins(0, 0, 8, 4)
+        episode_layout.setSpacing(9)
+        episode_scroll.setWidget(episode_host)
+        outer.addWidget(episode_scroll, 1)
+
+        self.episode_panel = panel
+        self.episode_panel_close_button = close
+        self.episode_list_layout = episode_layout
+        self.episode_scroll = episode_scroll
+
+        if not seasons:
+            self._show_episode_message("No seasons were returned for this show.", "mutedLabel")
+
+    def _show_episode_message(self, text: str, object_name: str = "loadingLabel") -> None:
+        layout = self.episode_list_layout
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.episode_buttons = []
+        label = QLabel(text)
+        label.setObjectName(object_name)
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        layout.addStretch(1)
+        layout.addWidget(label)
+        layout.addStretch(1)
+
+    def is_episode_picker_open(self) -> bool:
+        return self._episode_picker_open
+
+    def toggle_episode_picker(self) -> None:
+        if self._episode_picker_open:
+            self.close_episode_picker()
+        else:
+            self.open_episode_picker()
+
+    def open_episode_picker(self) -> None:
+        panel = self.episode_panel
+        if panel is None or self.media.get("media_type") != "tv":
+            return
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+        self._episode_picker_open = True
+        self._episode_picker_animating = True
+        self._resume_episode_position = self.watch_state.resume_episode(self.profile_id, self.media)
+        season_number = self._resume_episode_position[0]
+        available_numbers = [
+            int(button.property("seasonNumber")) for button in self.season_buttons
+        ]
+        if season_number not in available_numbers and available_numbers:
+            season_number = available_numbers[0]
+            self._resume_episode_position = (season_number, 1)
+
+        panel.setGeometry(self._watch_button_geometry())
+        panel.show()
+        panel.raise_()
+        self._select_season(season_number, self._resume_episode_position[1])
+
+        animation = QPropertyAnimation(panel, b"geometry", self)
+        self._episode_panel_animation = animation
+        animation.setDuration(360)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.setStartValue(panel.geometry())
+        animation.setEndValue(self._episode_panel_target_geometry())
+
+        def finish() -> None:
+            self._episode_picker_animating = False
+            self._episode_panel_animation = None
+            if self.episode_panel is not None:
+                self.episode_panel.setGeometry(self._episode_panel_target_geometry())
+                self.episode_panel.raise_()
+            target = self._find_episode_button(*self._resume_episode_position)
+            if target is None:
+                target = self._active_season_button()
+            if target is not None:
+                self.controlsReady.emit(target)
+
+        animation.finished.connect(finish)
+        animation.start()
+
+        active = self._active_season_button()
+        if active is not None:
+            self.controlsReady.emit(active)
+
+    def close_episode_picker(self) -> bool:
+        panel = self.episode_panel
+        if panel is None or not self._episode_picker_open:
+            return False
+        self._season_request_generation += 1
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+        self._episode_picker_animating = True
+        animation = QPropertyAnimation(panel, b"geometry", self)
+        self._episode_panel_animation = animation
+        animation.setDuration(300)
+        animation.setEasingCurve(QEasingCurve.InOutCubic)
+        animation.setStartValue(panel.geometry())
+        animation.setEndValue(self._watch_button_geometry())
+
+        def finish() -> None:
+            if self.episode_panel is not None:
+                self.episode_panel.hide()
+            self._episode_picker_open = False
+            self._episode_picker_animating = False
+            self._episode_panel_animation = None
+            after_close = self._episode_after_close
+            self._episode_after_close = None
+            if after_close is not None:
+                after_close()
+            elif self.watch_show_button is not None:
+                self.controlsReady.emit(self.watch_show_button)
+
+        animation.finished.connect(finish)
+        animation.start()
+        return True
+
+    def _active_season_button(self) -> Optional[QPushButton]:
+        return next(
+            (
+                button
+                for button in self.season_buttons
+                if int(button.property("seasonNumber")) == self._active_season
+            ),
+            None,
+        )
+
+    def _select_season(self, season_number: int, episode_number: Optional[int] = None) -> None:
+        if not self._episode_picker_open:
+            return
+        self._active_season = int(season_number)
+        for button in self.season_buttons:
+            button.setProperty(
+                "activeSeason",
+                int(button.property("seasonNumber")) == self._active_season,
+            )
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
+        target_episode = int(episode_number or 1)
+        if self._active_season == self._resume_episode_position[0]:
+            target_episode = int(episode_number or self._resume_episode_position[1])
+        self._show_episode_message("Loading episodes…")
+
+        cached = self._season_cache.get(self._active_season)
+        if cached is not None:
+            self._render_season(cached, target_episode)
+            return
+
+        self._season_request_generation += 1
+        generation = self._season_request_generation
+        series_id = int(self.media.get("id", 0) or 0)
+        selected_season = self._active_season
+        worker = FunctionWorker(
+            lambda: self.client.season_details(series_id, selected_season)
+        )
+        worker.signals.success.connect(
+            lambda data, s=selected_season, e=target_episode, g=generation: self._season_loaded(
+                s, e, g, data
+            )
+        )
+        worker.signals.error.connect(
+            lambda error, s=selected_season, g=generation: self._season_load_failed(s, g, error)
+        )
+        _start_worker(self.thread_pool, worker)
+
+    def _season_loaded(
+        self,
+        season_number: int,
+        episode_number: int,
+        generation: int,
+        data: dict[str, Any],
+    ) -> None:
+        self._season_cache[int(season_number)] = data
+        if (
+            generation != self._season_request_generation
+            or not self._episode_picker_open
+            or self._active_season != int(season_number)
+        ):
+            return
+        self._render_season(data, episode_number)
+
+    def _season_load_failed(self, season_number: int, generation: int, error: str) -> None:
+        if (
+            generation != self._season_request_generation
+            or not self._episode_picker_open
+            or self._active_season != int(season_number)
+        ):
+            return
+        self._show_episode_message(f"Could not load this season.\n\n{error}", "errorLabel")
+
+    def _render_season(self, season: dict[str, Any], target_episode: int) -> None:
+        layout = self.episode_list_layout
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.episode_buttons = []
+
+        episodes = [episode for episode in season.get("episodes", []) if isinstance(episode, dict)]
+        for episode in episodes:
+            season_number = int(episode.get("season_number", self._active_season or 1) or 1)
+            episode_number = int(episode.get("episode_number", 1) or 1)
+            state = self.watch_state.episode_entry(
+                self.profile_id,
+                self.media,
+                season_number,
+                episode_number,
+            ) or {}
+            is_resume = (season_number, episode_number) == self._resume_episode_position
+            button = QPushButton(self._episode_button_text(episode, state, is_resume))
+            button.setObjectName("episodeButton")
+            button.setProperty("seasonNumber", season_number)
+            button.setProperty("episodeNumber", episode_number)
+            button.setProperty("episodeStatus", state.get("status", "unwatched"))
+            button.setProperty("resumeTarget", is_resume)
+            button.setProperty("controllerSelected", False)
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumHeight(86)
+            button.setToolTip(episode.get("overview") or episode.get("name") or "")
+            button.clicked.connect(
+                lambda _checked=False, selected=dict(episode): self._watch_episode_clicked(selected)
+            )
+            layout.addWidget(button)
+            self.episode_buttons.append(button)
+        layout.addStretch(1)
+
+        if not self.episode_buttons:
+            self._show_episode_message("No episodes were returned for this season.", "mutedLabel")
+            return
+
+        target = self._find_episode_button(self._active_season or 1, target_episode)
+        if target is None:
+            target = self.episode_buttons[0]
+
+        def reveal() -> None:
+            if self.episode_scroll is not None and target is not None:
+                self.episode_scroll.ensureWidgetVisible(target, 12, 24)
+            if target is not None:
+                self.controlsReady.emit(target)
+
+        QTimer.singleShot(0, reveal)
+
+    @staticmethod
+    def _episode_button_text(
+        episode: dict[str, Any],
+        state: dict[str, Any],
+        is_resume: bool,
+    ) -> str:
+        number = int(episode.get("episode_number", 1) or 1)
+        name = episode.get("name") or f"Episode {number}"
+        runtime = episode.get("runtime")
+        status = state.get("status")
+        icon = "✓" if status == "finished" else "▶"
+        if is_resume:
+            if status == "in_progress":
+                action = "RESUME"
+            elif status == "finished":
+                action = "REPLAY"
+            else:
+                action = "UP NEXT"
+        else:
+            action = "WATCHED" if status == "finished" else ""
+        meta = f"{int(runtime)} min" if runtime else (episode.get("air_date") or "")
+        overview = " ".join(str(episode.get("overview") or "No description available.").split())
+        if len(overview) > 105:
+            overview = overview[:102].rstrip() + "…"
+        action_text = f"   •   {action}" if action else ""
+        meta_text = f"{meta}   •   " if meta else ""
+        return f"{icon}   {number}. {name}{action_text}\n      {meta_text}{overview}"
+
+    def _find_episode_button(
+        self,
+        season_number: int,
+        episode_number: int,
+    ) -> Optional[QPushButton]:
+        return next(
+            (
+                button
+                for button in self.episode_buttons
+                if int(button.property("seasonNumber")) == int(season_number)
+                and int(button.property("episodeNumber")) == int(episode_number)
+            ),
+            None,
+        )
+
+    def _episode_for_position(self, season_number: int, episode_number: int) -> dict[str, Any]:
+        season = self._season_cache.get(int(season_number), {})
+        for episode in season.get("episodes", []):
+            if int(episode.get("episode_number", 0) or 0) == int(episode_number):
+                return dict(episode)
+        return {
+            "season_number": int(season_number),
+            "episode_number": int(episode_number),
+            "name": f"Episode {int(episode_number)}",
+        }
+
+    def _episode_playback_payload(self, episode: dict[str, Any]) -> dict[str, Any]:
+        season_number = int(episode.get("season_number", 1) or 1)
+        episode_number = int(episode.get("episode_number", 1) or 1)
+        show_title = self.media.get("title") or self.media.get("name") or "TV Show"
+        payload = dict(episode)
+        payload.update(
+            {
+                "media_type": "episode",
+                "series_id": self.media.get("id"),
+                "show_title": show_title,
+                "title": (
+                    f"{show_title} — S{season_number}:E{episode_number} — "
+                    f"{episode.get('name') or f'Episode {episode_number}'}"
+                ),
+                "season_number": season_number,
+                "episode_number": episode_number,
+                "show": self.watch_state.snapshot(self.media),
+            }
+        )
+        return payload
+
+    def _watch_episode_clicked(self, episode: dict[str, Any]) -> None:
+        self.watch_state.mark_episode_started(self.profile_id, self.media, episode)
+        self.stateChanged.emit()
+        watch_title(self._episode_playback_payload(episode))
+        media = dict(self.media)
+        self._episode_after_close = lambda: self._render(media)
+        self.close_episode_picker()
+
+    def _discard_trailer_state(self) -> None:
+        self._trailer_fullscreen_timer.stop()
+        if self._trailer_animation is not None:
+            self._trailer_animation.stop()
+            self._trailer_animation = None
+        if self._trailer_fullscreen:
+            self._restore_detail_window()
+        if self.trailer_overlay is not None:
+            self.trailer_overlay.deleteLater()
+        self.trailer_web = None
+        self.trailer_placeholder = None
+        self.trailer_overlay = None
+        self.trailer_overlay_hint = None
+        self._trailer_fullscreen = False
+        self._trailer_animating = False
+        self._trailer_original_global_rect = None
+
+    def _schedule_trailer_fullscreen(self) -> None:
+        if self._trailer_fullscreen or self._trailer_animating or self.trailer_web is None:
+            return
+        # Let the first click start/interact with the YouTube player, then grow
+        # it into fullscreen two seconds later as requested.
+        self._trailer_fullscreen_timer.start()
+
+    def enter_trailer_fullscreen(self) -> None:
+        web = self.trailer_web
+        placeholder = self.trailer_placeholder
+        if (
+            web is None
+            or placeholder is None
+            or self._trailer_fullscreen
+            or not web.isVisible()
+        ):
+            return
+
+        self._trailer_fullscreen_timer.stop()
+        self._trailer_original_global_rect = QRect(
+            web.mapToGlobal(QPoint(0, 0)),
+            web.size(),
+        )
+        self._trailer_window_geometry = self.geometry()
+        self._trailer_was_fullscreen = self.isFullScreen()
+        self._trailer_was_maximized = self.isMaximized()
+
+        placeholder_layout = placeholder.layout()
+        if placeholder_layout is not None:
+            placeholder_layout.removeWidget(web)
+
+        overlay = QFrame(self)
+        overlay.setObjectName("trailerFullscreenOverlay")
+        overlay.setStyleSheet("background:#000000; border:0;")
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(0)
+        web.setParent(overlay)
+        overlay_layout.addWidget(web)
+
+        hint = QLabel("Controller: X pause  •  B back     Keyboard: Esc back", overlay)
+        hint.setObjectName("trailerFullscreenHint")
+        hint.setStyleSheet(
+            "background:rgba(0,0,0,185); color:#ffffff; border-radius:8px; "
+            "padding:8px 12px; font-size:13px; font-weight:700;"
+        )
+        hint.adjustSize()
+
+        self.trailer_overlay = overlay
+        self.trailer_overlay_hint = hint
+        self._trailer_fullscreen = True
+        self._trailer_animating = True
+        overlay.show()
+        overlay.raise_()
+        hint.raise_()
+
+        # Use the real display fullscreen. The overlay starts at the trailer's
+        # old global rectangle, then expands so there is no teleport.
+        self.showFullScreen()
+        QTimer.singleShot(0, self._animate_trailer_open)
+
+    def _animate_trailer_open(self) -> None:
+        overlay = self.trailer_overlay
+        original = self._trailer_original_global_rect
+        if overlay is None or original is None or not self._trailer_fullscreen:
+            return
+        start = QRect(self.mapFromGlobal(original.topLeft()), original.size())
+        overlay.setGeometry(start)
+        self._position_trailer_hint()
+
+        animation = QPropertyAnimation(overlay, b"geometry", self)
+        self._trailer_animation = animation
+        animation.setDuration(420)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.setStartValue(start)
+        animation.setEndValue(self.rect())
+        animation.valueChanged.connect(lambda _value: self._position_trailer_hint())
+
+        def finish() -> None:
+            if self.trailer_overlay is not None:
+                self.trailer_overlay.setGeometry(self.rect())
+            self._trailer_animating = False
+            self._trailer_animation = None
+            self._position_trailer_hint()
+
+        animation.finished.connect(finish)
+        animation.start()
+
+    def _position_trailer_hint(self) -> None:
+        overlay = self.trailer_overlay
+        hint = self.trailer_overlay_hint
+        if overlay is None or hint is None:
+            return
+        hint.adjustSize()
+        hint.move(max(18, overlay.width() - hint.width() - 24), 20)
+        hint.raise_()
+
+    def is_trailer_fullscreen(self) -> bool:
+        return self._trailer_fullscreen
+
+    def pause_fullscreen_trailer(self) -> None:
+        if (
+            self._trailer_fullscreen
+            and self.trailer_web is not None
+            and hasattr(self.trailer_web, "pause_trailer")
+        ):
+            self.trailer_web.pause_trailer()
+
+    def _watch_trailer_clicked(self) -> None:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "play_trailer"):
+            return
+        self.close_episode_picker()
+        web.play_trailer()
+        # Match clicking the embedded player: playback begins inline, then the
+        # existing two-second fullscreen animation takes over.
+        self._schedule_trailer_fullscreen()
+
+    def exit_trailer_fullscreen(self) -> bool:
+        if not self._trailer_fullscreen or self.trailer_overlay is None:
+            return False
+        self._trailer_fullscreen_timer.stop()
+        if self._trailer_animation is not None:
+            self._trailer_animation.stop()
+
+        overlay = self.trailer_overlay
+        original = self._trailer_original_global_rect
+        if original is None:
+            target = QRect(self.rect().center(), QSize(1, 1))
+        else:
+            target = QRect(self.mapFromGlobal(original.topLeft()), original.size())
+
+        self._trailer_animating = True
+        animation = QPropertyAnimation(overlay, b"geometry", self)
+        self._trailer_animation = animation
+        animation.setDuration(380)
+        animation.setEasingCurve(QEasingCurve.InOutCubic)
+        animation.setStartValue(overlay.geometry())
+        animation.setEndValue(target)
+        animation.valueChanged.connect(lambda _value: self._position_trailer_hint())
+        animation.finished.connect(self._finish_trailer_exit)
+        animation.start()
+        return True
+
+    def _finish_trailer_exit(self) -> None:
+        web = self.trailer_web
+        placeholder = self.trailer_placeholder
+        overlay = self.trailer_overlay
+        if web is not None and placeholder is not None:
+            overlay_layout = overlay.layout() if overlay is not None else None
+            if overlay_layout is not None:
+                overlay_layout.removeWidget(web)
+            web.setParent(placeholder)
+            placeholder_layout = placeholder.layout()
+            if placeholder_layout is not None:
+                placeholder_layout.addWidget(web)
+            web.show()
+
+        if overlay is not None:
+            overlay.hide()
+            overlay.deleteLater()
+        self.trailer_overlay = None
+        self.trailer_overlay_hint = None
+        self._trailer_animation = None
+        self._trailer_animating = False
+        self._trailer_fullscreen = False
+        self._restore_detail_window()
+
+        if self.preferred_controller_widget is not None:
+            self.controlsReady.emit(self.preferred_controller_widget)
+
+    def _restore_detail_window(self) -> None:
+        if self._trailer_was_fullscreen:
+            self.showFullScreen()
+        elif self._trailer_was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+            if self._trailer_window_geometry is not None:
+                self.setGeometry(self._trailer_window_geometry)
+
+    def _escape_requested(self) -> None:
+        if self.exit_trailer_fullscreen():
+            return
+        if self.close_episode_picker():
+            return
+        self.reject()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._trailer_fullscreen and not self._trailer_animating and self.trailer_overlay is not None:
+            self.trailer_overlay.setGeometry(self.rect())
+            self._position_trailer_hint()
+        if (
+            self._episode_picker_open
+            and not self._episode_picker_animating
+            and self.episode_panel is not None
+        ):
+            self.episode_panel.setGeometry(self._episode_panel_target_geometry())
+            self.episode_panel.raise_()
+
+    def closeEvent(self, event) -> None:
+        self._trailer_fullscreen_timer.stop()
+        if self._trailer_animation is not None:
+            self._trailer_animation.stop()
+        if self._episode_panel_animation is not None:
+            self._episode_panel_animation.stop()
+        super().closeEvent(event)
+
     def _render(self, media: dict[str, Any]) -> None:
         self.media = media
         self.controller_actions = []
         self.preferred_controller_widget = None
+        self._discard_trailer_state()
+        self._discard_episode_picker()
         self._clear_body()
 
         hero = QFrame()
@@ -1471,8 +2682,24 @@ class DetailDialog(QDialog):
             watched_label.setObjectName("detailWatchedBadge")
             info.addWidget(watched_label, 0, Qt.AlignLeft)
         elif entry and entry.get("status") == "in_progress":
-            progress_pct = max(1, int(float(entry.get("progress", 0.0)) * 100))
-            progress_label = QLabel(f"Continue watching  •  {progress_pct}%")
+            latest_episode = self.watch_state.latest_episode_entry(self.profile_id, media)
+            if media.get("media_type") == "tv" and latest_episode is not None:
+                resume_season, resume_episode = self.watch_state.resume_episode(self.profile_id, media)
+                if latest_episode.get("status") == "finished":
+                    progress_text = f"Up next  •  S{resume_season}:E{resume_episode}"
+                else:
+                    progress_pct = max(
+                        1,
+                        int(float(latest_episode.get("progress", 0.0) or 0.0) * 100),
+                    )
+                    progress_text = (
+                        f"Continue watching  •  S{resume_season}:E{resume_episode}  •  "
+                        f"{progress_pct}%"
+                    )
+            else:
+                progress_pct = max(1, int(float(entry.get("progress", 0.0)) * 100))
+                progress_text = f"Continue watching  •  {progress_pct}%"
+            progress_label = QLabel(progress_text)
             progress_label.setObjectName("continueLabel")
             info.addWidget(progress_label, 0, Qt.AlignLeft)
 
@@ -1520,18 +2747,26 @@ class DetailDialog(QDialog):
         watch_button.setProperty("controllerSelected", False)
         watch_button.setCursor(Qt.PointingHandCursor)
         watch_button.setFocusPolicy(Qt.StrongFocus)
-        watch_button.clicked.connect(lambda: self._watch_clicked(media))
+        if media.get("media_type") == "tv":
+            self.watch_show_button = watch_button
+            watch_button.clicked.connect(self.toggle_episode_picker)
+        else:
+            watch_button.clicked.connect(lambda: self._watch_clicked(media))
         buttons.addWidget(watch_button)
         self.controller_actions.append(watch_button)
         self.preferred_controller_widget = watch_button
 
         entry = self.watch_state.entry(self.profile_id, media)
         if entry and entry.get("status") == "in_progress":
-            finished = QPushButton("✓  Mark as Finished")
+            if media.get("media_type") == "tv":
+                finished = QPushButton("✓  Mark Episode Finished")
+                finished.clicked.connect(lambda: self._mark_current_episode_finished(media))
+            else:
+                finished = QPushButton("✓  Mark as Finished")
+                finished.clicked.connect(lambda: self._mark_finished(media))
             finished.setObjectName("secondaryButton")
             finished.setProperty("controllerSelected", False)
             finished.setFocusPolicy(Qt.StrongFocus)
-            finished.clicked.connect(lambda: self._mark_finished(media))
             buttons.addWidget(finished)
             self.controller_actions.append(finished)
         elif entry and entry.get("status") == "finished":
@@ -1544,47 +2779,53 @@ class DetailDialog(QDialog):
             self.controller_actions.append(unwatched)
 
         trailer = self._pick_trailer(media)
-        if trailer:
-            external_button = QPushButton("↗  Open trailer")
-            external_button.setObjectName("secondaryButton")
-            external_button.setProperty("controllerSelected", False)
-            external_button.setFocusPolicy(Qt.StrongFocus)
-            external_button.clicked.connect(lambda: webbrowser.open(f"https://www.youtube.com/watch?v={trailer['key']}"))
-            buttons.addWidget(external_button)
-            self.controller_actions.append(external_button)
+        if trailer and TrailerWebView is not None:
+            trailer_button = QPushButton("▶  Watch Trailer")
+            trailer_button.setObjectName("secondaryButton")
+            trailer_button.setProperty("controllerSelected", False)
+            trailer_button.setFocusPolicy(Qt.StrongFocus)
+            trailer_button.clicked.connect(self._watch_trailer_clicked)
+            buttons.addWidget(trailer_button)
+            self.controller_actions.append(trailer_button)
         buttons.addStretch(1)
         info.addLayout(buttons)
         info.addStretch(1)
         hero_layout.addLayout(info, 1)
         self.body.addWidget(hero)
 
+        if media.get("media_type") == "tv":
+            self._build_episode_picker(media)
+
         trailer_heading = QLabel("Trailer")
         trailer_heading.setObjectName("rowHeading")
         self.body.addWidget(trailer_heading)
 
-        if trailer and QWebEngineView is not None and QWebEngineHttpRequest is not None:
-            web = QWebEngineView()
+        if trailer and TrailerWebView is not None:
+            placeholder = QFrame()
+            placeholder.setObjectName("trailerPlaceholder")
+            placeholder.setMinimumHeight(360)
+            placeholder_layout = QVBoxLayout(placeholder)
+            placeholder_layout.setContentsMargins(0, 0, 0, 0)
+            placeholder_layout.setSpacing(0)
+
+            web = TrailerWebView()
             web.setMinimumHeight(360)
             web.setFocusPolicy(Qt.NoFocus)
+            web.clicked.connect(self._schedule_trailer_fullscreen)
 
-            # Load the YouTube embed directly and identify PiStick with an HTTPS
-            # Referer. YouTube now requires this for desktop/WebView embeds.
-            origin = YOUTUBE_REFERER.rstrip("/")
-            query = urlencode(
-                {
-                    "rel": "0",
-                    "playsinline": "1",
-                    "origin": origin,
-                    "widget_referrer": YOUTUBE_REFERER,
-                }
+            # YouTube error 153 occurs when the player request has no client
+            # identity. The HTTPS base URL makes Chromium send PiStick's app ID
+            # as the iframe Referer instead of treating it as an anonymous load.
+            web.setHtml(
+                build_youtube_embed_html(trailer["key"]),
+                QUrl(f"{YOUTUBE_REFERER}trailer.html"),
             )
-            embed_url = f"https://www.youtube.com/embed/{trailer['key']}?{query}"
-            request = QWebEngineHttpRequest(QUrl(embed_url))
-            request.setHeader(b"Referer", YOUTUBE_REFERER.encode("utf-8"))
-            web.load(request)
-            self.body.addWidget(web, 1)
+            placeholder_layout.addWidget(web)
+            self.trailer_web = web
+            self.trailer_placeholder = placeholder
+            self.body.addWidget(placeholder, 1)
         elif trailer:
-            note = QLabel("Embedded trailer playback is unavailable. Use “Open trailer” above.")
+            note = QLabel("Embedded trailer playback is unavailable in this build.")
             note.setObjectName("mutedLabel")
             note.setAlignment(Qt.AlignCenter)
             self.body.addWidget(note, 1)
@@ -1598,15 +2839,118 @@ class DetailDialog(QDialog):
             self.controlsReady.emit(self.preferred_controller_widget)
 
     def controller_focusables(self) -> list[QWidget]:
-        widgets: list[QWidget] = []
-        if getattr(self, "close_button", None) is not None and self.close_button.isVisible():
-            widgets.append(self.close_button)
-        widgets.extend(
+        if self._trailer_fullscreen:
+            return []
+        if self._episode_picker_open:
+            widgets: list[QWidget] = [
+                button
+                for button in self.season_buttons + self.episode_buttons
+                if button is not None and button.isVisible() and button.isEnabled()
+            ]
+            if (
+                self.episode_panel_close_button is not None
+                and self.episode_panel_close_button.isVisible()
+            ):
+                widgets.append(self.episode_panel_close_button)
+            return widgets
+        widgets = [
             button
             for button in self.controller_actions
             if button is not None and button.isVisible() and button.isEnabled()
-        )
+        ]
+        if getattr(self, "close_button", None) is not None and self.close_button.isVisible():
+            widgets.append(self.close_button)
         return widgets
+
+    def controller_current_target(self, current: Optional[QWidget] = None) -> Optional[QWidget]:
+        if self._trailer_fullscreen:
+            return None
+        focusables = self.controller_focusables()
+        if current in focusables:
+            return current
+        if self._episode_picker_open:
+            target = self._find_episode_button(*self._resume_episode_position)
+            if target in focusables:
+                return target
+            active_season = self._active_season_button()
+            if active_season in focusables:
+                return active_season
+            return focusables[0] if focusables else None
+        if self.preferred_controller_widget in focusables:
+            return self.preferred_controller_widget
+        return focusables[0] if focusables else None
+
+    def controller_move_target(
+        self,
+        direction: str,
+        current: Optional[QWidget] = None,
+    ) -> Optional[QWidget]:
+        """Return the next details control without relying on WebEngine focus."""
+        if self._trailer_fullscreen:
+            return None
+        if self._episode_picker_open:
+            focusables = self.controller_focusables()
+            current = self.controller_current_target(current)
+            panel_close = self.episode_panel_close_button
+            seasons = [button for button in self.season_buttons if button in focusables]
+            episodes = [button for button in self.episode_buttons if button in focusables]
+
+            if current is panel_close:
+                if direction == "down":
+                    active = self._active_season_button()
+                    return active if active in seasons else (seasons[0] if seasons else current)
+                return current
+
+            if current in seasons:
+                index = seasons.index(current)
+                if direction == "left":
+                    return seasons[(index - 1) % len(seasons)]
+                if direction == "right":
+                    return seasons[(index + 1) % len(seasons)]
+                if direction == "up" and panel_close is not None:
+                    return panel_close
+                if direction == "down" and episodes:
+                    target = self._find_episode_button(*self._resume_episode_position)
+                    return target if target in episodes else episodes[0]
+                return current
+
+            if current in episodes:
+                index = episodes.index(current)
+                if direction == "up":
+                    if index > 0:
+                        return episodes[index - 1]
+                    active = self._active_season_button()
+                    return active if active in seasons else current
+                if direction == "down":
+                    return episodes[min(index + 1, len(episodes) - 1)]
+                return current
+
+            return self.controller_current_target()
+
+        actions = [
+            button
+            for button in self.controller_actions
+            if button is not None and button.isVisible() and button.isEnabled()
+        ]
+        close_button = getattr(self, "close_button", None)
+        current = self.controller_current_target(current)
+
+        if current is close_button:
+            if actions and direction in {"down", "left", "right"}:
+                return actions[0]
+            return close_button
+
+        if current in actions:
+            index = actions.index(current)
+            if direction == "left":
+                return actions[(index - 1) % len(actions)]
+            if direction == "right":
+                return actions[(index + 1) % len(actions)]
+            if direction == "up" and close_button is not None:
+                return close_button
+            return current
+
+        return self.controller_current_target()
 
     @staticmethod
     def _pick_trailer(media: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1617,6 +2961,9 @@ class DetailDialog(QDialog):
         return (official or trailers or youtube)[0] if youtube else None
 
     def _watch_clicked(self, media: dict[str, Any]) -> None:
+        if media.get("media_type") == "tv":
+            self.toggle_episode_picker()
+            return
         self.watch_state.mark_started(self.profile_id, media)
         self.stateChanged.emit()
         # Intentionally blank until you add Jellyfin logic to watch_title().
@@ -1628,12 +2975,21 @@ class DetailDialog(QDialog):
         self.stateChanged.emit()
         self._render(media)
 
+    def _mark_current_episode_finished(self, media: dict[str, Any]) -> None:
+        season_number, episode_number = self.watch_state.resume_episode(self.profile_id, media)
+        episode = self._episode_for_position(season_number, episode_number)
+        self.watch_state.mark_episode_finished(self.profile_id, media, episode)
+        self.stateChanged.emit()
+        self._render(media)
+        QTimer.singleShot(0, self.open_episode_picker)
+
     def _mark_unwatched(self, media: dict[str, Any]) -> None:
         self.watch_state.mark_unwatched(self.profile_id, media)
         self.stateChanged.emit()
         self._render(media)
 
     def _show_error(self, error: str) -> None:
+        self._discard_trailer_state()
         self._clear_body()
         label = QLabel(f"Could not load this title.\n\n{error}")
         label.setObjectName("errorLabel")
@@ -1719,6 +3075,9 @@ class MainWindow(QMainWindow):
         self._controller_selected: Optional[QWidget] = None
         self._controller_keyboard: Optional[OnScreenKeyboard] = None
         self._profile_edit_dialog: Optional[QDialog] = None
+        self._detail_dialog: Optional[DetailDialog] = None
+        self._mouse_drag_scroll: Optional[HorizontalMediaScrollArea] = None
+        self._search_generation = 0
 
         self.setWindowTitle(APP_NAME)
         self.resize(1440, 900)
@@ -1773,6 +3132,7 @@ class MainWindow(QMainWindow):
         self.controller.navigate.connect(self._controller_navigate)
         self.controller.activate.connect(self._controller_activate)
         self.controller.back.connect(self._controller_back)
+        self.controller.pause.connect(self._controller_pause)
 
         QApplication.instance().installEventFilter(self)
 
@@ -1786,15 +3146,40 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         # Mouse/physical keyboard input turns off controller-only selection visuals.
         # ControllerManager does not generate Qt key events, so it will not trip this.
-        if event.type() in {
+        if event.spontaneous() and event.type() in {
             QEvent.MouseButtonPress,
             QEvent.MouseMove,
             QEvent.Wheel,
             QEvent.TouchBegin,
         }:
             self._clear_controller_selection()
-        elif event.type() == QEvent.KeyPress:
+        elif event.spontaneous() and event.type() == QEvent.KeyPress:
             self._clear_controller_selection()
+
+        # Left-dragging anywhere on a row is mouse-native horizontal scrolling.
+        # A movement past the threshold consumes the release so the poster does
+        # not accidentally open after a drag.
+        if event.type() == QEvent.MouseButtonPress and isinstance(watched, QWidget):
+            if event.button() == Qt.LeftButton:
+                row_scroll = self._find_ancestor(watched, HorizontalMediaScrollArea)
+                if row_scroll is not None:
+                    self._mouse_drag_scroll = row_scroll
+                    row_scroll.begin_mouse_drag(event)
+        elif event.type() == QEvent.MouseMove and self._mouse_drag_scroll is not None:
+            try:
+                if self._mouse_drag_scroll.update_mouse_drag(event):
+                    return True
+            except RuntimeError:
+                self._mouse_drag_scroll = None
+        elif event.type() == QEvent.MouseButtonRelease and self._mouse_drag_scroll is not None:
+            active_drag = self._mouse_drag_scroll
+            self._mouse_drag_scroll = None
+            try:
+                if event.button() == Qt.LeftButton and active_drag.end_mouse_drag():
+                    event.accept()
+                    return True
+            except RuntimeError:
+                pass
 
         # Intercept wheel/trackpad input before poster/title child widgets can
         # consume it. Any vertical component over a movie row scrolls the main
@@ -2106,7 +3491,13 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(24, 14, 24, 36)
         content_layout.setSpacing(28)
 
-        # Profile-specific row only appears when something was started but not finished.
+        trending = payload.get("trending") or []
+        if trending:
+            hero_candidates = [x for x in trending if x.get("backdrop_path")]
+            content_layout.addWidget(HeroBanner((hero_candidates or trending)[0], self.thread_pool, self.open_details))
+
+        # Keep each in-progress title visible exactly once. A short personal
+        # list should not be padded with infinite-row clones of the same movie.
         continue_items = self.watch_state.continue_watching(self.active_profile_id)
         if continue_items:
             content_layout.addWidget(
@@ -2117,13 +3508,9 @@ class MainWindow(QMainWindow):
                     self.open_details,
                     state_lookup=self._watch_entry,
                     show_progress=True,
+                    infinite=False,
                 )
             )
-
-        trending = payload.get("trending") or []
-        if trending:
-            hero_candidates = [x for x in trending if x.get("backdrop_path")]
-            content_layout.addWidget(HeroBanner((hero_candidates or trending)[0], self.thread_pool, self.open_details))
 
         self.home_sections = payload.get("sections", [])
         for title, items in self.home_sections:
@@ -2179,15 +3566,19 @@ class MainWindow(QMainWindow):
     def _on_search_changed(self, text: str) -> None:
         if not text.strip():
             self.search_timer.stop()
+            self._search_generation += 1
             if self.active_profile_id:
                 self._show_home()
             return
         self.search_timer.start()
 
     def _perform_search(self) -> None:
+        self.search_timer.stop()
         query = self.search_box.text().strip()
         if not query or not self.client:
             return
+        self._search_generation += 1
+        generation = self._search_generation
         self._clear_layout(self.search_layout)
         heading = QLabel(f'Searching for “{query}”…')
         heading.setObjectName("searchHeading")
@@ -2195,10 +3586,40 @@ class MainWindow(QMainWindow):
         self.search_layout.addStretch(1)
         self.stack.setCurrentWidget(self.search_page)
 
-        worker = FunctionWorker(lambda: self.client.search(query))
-        worker.signals.success.connect(lambda items, q=query: self._render_search(q, items))
+        def fetch_search() -> dict[str, Any]:
+            try:
+                return {
+                    "generation": generation,
+                    "query": query,
+                    "items": self.client.search(query),
+                    "error": None,
+                }
+            except Exception as exc:
+                return {
+                    "generation": generation,
+                    "query": query,
+                    "items": [],
+                    "error": str(exc),
+                }
+
+        worker = FunctionWorker(fetch_search)
+        # A bound QObject method guarantees that all widget creation happens on
+        # the GUI thread. A bare lambda here can run in the worker thread.
+        worker.signals.success.connect(self._render_search_payload)
         worker.signals.error.connect(self._render_search_error)
         _start_worker(self.thread_pool, worker)
+
+    def _render_search_payload(self, payload: dict[str, Any]) -> None:
+        if int(payload.get("generation", -1)) != self._search_generation:
+            return
+        query = str(payload.get("query", ""))
+        if self.search_box.text().strip() != query:
+            return
+        error = payload.get("error")
+        if error:
+            self._render_search_error(str(error))
+            return
+        self._render_search(query, list(payload.get("items") or []))
 
     def _render_search(self, query: str, items: list[dict[str, Any]]) -> None:
         if self.search_box.text().strip() != query:
@@ -2243,6 +3664,8 @@ class MainWindow(QMainWindow):
         self.search_layout.addWidget(label, 1)
 
     def _quick_search_type(self, media_type: str) -> None:
+        self.search_timer.stop()
+        self._search_generation += 1
         self.search_box.blockSignals(True)
         self.search_box.clear()
         self.search_box.blockSignals(False)
@@ -2295,6 +3718,11 @@ class MainWindow(QMainWindow):
     def open_details(self, media: dict[str, Any]) -> None:
         if not self.client:
             return
+        active_detail = self._active_detail_dialog()
+        if active_detail is not None:
+            active_detail.raise_()
+            active_detail.activateWindow()
+            return
         dialog = DetailDialog(
             self.client,
             media,
@@ -2303,24 +3731,42 @@ class MainWindow(QMainWindow):
             self.active_profile_id,
             self,
         )
+        self._detail_dialog = dialog
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.stateChanged.connect(self._refresh_home_from_state)
         dialog.controlsReady.connect(
             lambda preferred, d=dialog: self._detail_controls_ready(d, preferred)
         )
+        dialog.finished.connect(lambda _result, d=dialog: self._detail_finished(d))
         self._clear_controller_selection()
-        dialog.exec()
+        dialog.open()
+        if self.controller.connected:
+            QTimer.singleShot(
+                0,
+                lambda d=dialog: self._focus_detail_control(d, d.close_button),
+            )
+
+    def _detail_finished(self, dialog: DetailDialog) -> None:
         self._clear_controller_selection()
+        if self._detail_dialog is dialog:
+            self._detail_dialog = None
         self._refresh_home_from_state()
 
     def _detail_controls_ready(self, dialog: DetailDialog, preferred: QWidget) -> None:
+        QTimer.singleShot(
+            0,
+            lambda d=dialog, widget=preferred: self._focus_detail_control(d, widget),
+        )
+
+    def _focus_detail_control(self, dialog: DetailDialog, preferred: Optional[QWidget]) -> None:
         if not self.controller.connected:
             return
-        if QApplication.activeModalWidget() is not dialog:
+        if self._active_detail_dialog() is not dialog:
             return
-        if preferred is None or not preferred.isVisible():
+        target = dialog.controller_current_target(preferred)
+        if target is None:
             return
-        preferred.setFocus(Qt.OtherFocusReason)
-        self._set_controller_selected(preferred)
+        self._focus_controller_widget(target)
 
     def _show_home(self) -> None:
         if not self.active_profile_id:
@@ -2387,10 +3833,31 @@ class MainWindow(QMainWindow):
         self.controller_status.setVisible(connected and self.header.isVisible())
         if connected:
             self.controller_status.setToolTip(name or "Controller connected")
+            detail = self._active_detail_dialog()
+            if detail is not None:
+                QTimer.singleShot(
+                    0,
+                    lambda d=detail: self._focus_detail_control(d, d.controller_current_target()),
+                )
         else:
             self._clear_controller_selection()
 
+    def _active_detail_dialog(self) -> Optional[DetailDialog]:
+        if self._detail_dialog is not None:
+            try:
+                return self._detail_dialog
+            except RuntimeError:
+                self._detail_dialog = None
+        modal = QApplication.activeModalWidget()
+        if isinstance(modal, DetailDialog):
+            return modal
+        active = QApplication.activeWindow()
+        return active if isinstance(active, DetailDialog) and active.isModal() else None
+
     def _controller_root(self) -> QWidget:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            return detail
         modal = QApplication.activeModalWidget()
         if isinstance(modal, QWidget):
             return modal
@@ -2432,6 +3899,17 @@ class MainWindow(QMainWindow):
             self._ensure_focus_visible(candidates[0])
 
     def _controller_navigate(self, direction: str) -> None:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            current = self._controller_selected
+            if current not in detail.controller_focusables():
+                focus = QApplication.focusWidget()
+                current = focus if focus in detail.controller_focusables() else None
+            target = detail.controller_move_target(direction, current)
+            if target is not None:
+                self._focus_controller_widget(target)
+            return
+
         root = self._controller_root()
         candidates = self._controller_focusables(root)
         if not candidates:
@@ -2491,6 +3969,13 @@ class MainWindow(QMainWindow):
         if ensure_visible:
             self._ensure_focus_visible(card)
 
+    def _focus_controller_widget(self, widget: QWidget) -> None:
+        if widget is None or not widget.isVisible() or not widget.isEnabled():
+            return
+        widget.setFocus(Qt.OtherFocusReason)
+        self._set_controller_selected(widget)
+        self._ensure_focus_visible(widget)
+
     def _ensure_focus_visible(self, widget: QWidget) -> None:
         parent = widget.parentWidget()
         while parent is not None:
@@ -2501,6 +3986,18 @@ class MainWindow(QMainWindow):
             parent = parent.parentWidget()
 
     def _controller_activate(self) -> None:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            current = self._controller_selected
+            if current not in detail.controller_focusables():
+                focus = QApplication.focusWidget()
+                current = focus if focus in detail.controller_focusables() else None
+            target = detail.controller_current_target(current)
+            if target is not None:
+                self._focus_controller_widget(target)
+                target.click()
+            return
+
         root = self._controller_root()
         focus = QApplication.focusWidget()
         if focus is None or not focus.isVisibleTo(root):
@@ -2520,12 +4017,26 @@ class MainWindow(QMainWindow):
             focus.activate()
 
     def _controller_back(self) -> None:
+        detail = self._active_detail_dialog()
+        if detail is not None:
+            if detail.exit_trailer_fullscreen():
+                return
+            if detail.close_episode_picker():
+                return
+            self._clear_controller_selection()
+            detail.reject()
+            return
         self._clear_controller_selection()
         modal = QApplication.activeModalWidget()
         if isinstance(modal, QDialog):
             modal.reject()
             return
         self._escape_action()
+
+    def _controller_pause(self) -> None:
+        detail = self._active_detail_dialog()
+        if detail is not None and detail.is_trailer_fullscreen():
+            detail.pause_fullscreen_trailer()
 
     def _open_controller_search_keyboard(self) -> None:
         if not self.controller.connected or self._controller_keyboard is not None:
@@ -2655,7 +4166,8 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
 #heroButton:hover, #watchButton:hover { background: white; }
 #heroButton[controllerSelected="true"], #watchButton[controllerSelected="true"],
 #secondaryButton[controllerSelected="true"], #iconButton[controllerSelected="true"],
-#dangerButton[controllerSelected="true"], #manageProfilesButton[controllerSelected="true"] {
+#dangerButton[controllerSelected="true"], #manageProfilesButton[controllerSelected="true"],
+#watchButton:focus, #secondaryButton:focus, #iconButton:focus, #dangerButton:focus {
     border: 3px solid #ffffff;
 }
 #rowHeading, #searchHeading { font-size: 22px; font-weight: 800; color: #ffffff; }
@@ -2666,7 +4178,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
     border-radius: 11px;
 }
 #mediaCard:hover { background: #17171a; }
-#mediaCard[controllerSelected="true"] {
+#mediaCard[controllerSelected="true"], #mediaCard:focus {
     background: #17171a;
     border: 3px solid #ffffff;
 }
@@ -2692,6 +4204,67 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
 }
 #iconButton:hover { background: #3a3a40; }
 #detailTitle { font-size: 35px; font-weight: 900; }
+#episodePicker {
+    background:#17171b;
+    border:1px solid #3b3b42;
+    border-radius:16px;
+}
+#episodePickerTitle {
+    color:#ffffff;
+    font-size:27px;
+    font-weight:900;
+}
+#episodePickerHint {
+    color:#9d9da4;
+    font-size:12px;
+    font-weight:700;
+    letter-spacing:1px;
+}
+#episodePickerClose {
+    background:#2b2b31;
+    color:#ffffff;
+    border:3px solid transparent;
+    border-radius:19px;
+    font-size:16px;
+    font-weight:800;
+}
+#episodePickerClose:hover { background:#3b3b42; }
+#seasonButton {
+    background:#29292e;
+    color:#f3f3f4;
+    border:3px solid transparent;
+    border-radius:8px;
+    padding:8px 15px;
+    font-size:14px;
+    font-weight:800;
+}
+#seasonButton:hover { background:#38383e; }
+#seasonButton[activeSeason="true"] {
+    background:#f3f3f3;
+    color:#101012;
+}
+#episodeButton {
+    background:#222227;
+    color:#f4f4f5;
+    border:3px solid transparent;
+    border-radius:10px;
+    padding:11px 14px;
+    text-align:left;
+    font-size:13px;
+    font-weight:650;
+}
+#episodeButton:hover { background:#303036; }
+#episodeButton[episodeStatus="finished"] { color:#b8b8bd; }
+#episodeButton[resumeTarget="true"] {
+    background:#2a2023;
+    border:3px solid #e50914;
+}
+#seasonButton[controllerSelected="true"],
+#episodeButton[controllerSelected="true"],
+#episodePickerClose[controllerSelected="true"],
+#seasonButton:focus, #episodeButton:focus, #episodePickerClose:focus {
+    border:3px solid #ffffff;
+}
 #detailWatchedBadge {
     background:#1e7e47;
     color:#ffffff;

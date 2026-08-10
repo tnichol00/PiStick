@@ -1,14 +1,14 @@
 {
-  "active_profile": "profile-641d4be205",
+  "active_profile": "profile-1",
   "profiles": [
     {
       "id": "profile-1",
-      "name": "TJN",
+      "name": "THOMAS",
       "avatar": "red"
     },
     {
       "id": "profile-641d4be205",
-      "name": "KN",
+      "name": "KAREN",
       "avatar": "blue"
     }
   ],
