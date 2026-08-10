@@ -1,72 +1,215 @@
+import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 import webbrowser
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
-from PySide6.QtCore import (
-    QEvent,
-    QEasingCurve,
-    QObject,
-    QPoint,
-    QPropertyAnimation,
-    QRect,
-    QRunnable,
-    QSize,
-    Slot,
-    Qt,
-    QThreadPool,
-    QTimer,
-    Signal,
-    QUrl,
+from requests.adapters import HTTPAdapter
+
+# Keep Chromium lean before QtWebEngine is imported. PiStick uses one embedded
+# player, so extra renderer processes, extension services, update checks, and a
+# large browser cache only waste RAM on a television appliance.
+_CHROMIUM_FLAGS = (
+    "--renderer-process-limit=1",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-domain-reliability",
+    "--disable-extensions",
+    "--disable-sync",
+    "--disable-translate",
+    "--no-first-run",
+    "--disk-cache-size=25165824",
+    "--media-cache-size=33554432",
 )
-from PySide6.QtGui import QFont, QImage, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (
-    QAbstractButton,
-    QApplication,
-    QDialog,
-    QFrame,
-    QGridLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QScrollArea,
-    QStackedWidget,
-    QVBoxLayout,
-    QWidget,
-)
+_existing_chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
+for _flag in _CHROMIUM_FLAGS:
+    _flag_name = _flag.split("=", 1)[0]
+    if _flag_name not in _existing_chromium_flags:
+        _existing_chromium_flags = f"{_existing_chromium_flags} {_flag}".strip()
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _existing_chromium_flags
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
+# PySide6 remains the preferred desktop binding. Raspberry Pi OS images for the
+# original ARMv6 Pi Zero commonly provide PyQt5 from apt instead, so the exact
+# same UI can run there without maintaining a second application.
+QT_BINDING = "PySide6"
 try:
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-except Exception:
-    QWebEngineView = None
+    from PySide6.QtCore import (
+        QEvent,
+        QEasingCurve,
+        QObject,
+        QPoint,
+        QPropertyAnimation,
+        QRect,
+        QRunnable,
+        QSize,
+        Slot,
+        Qt,
+        QThreadPool,
+        QTimer,
+        Signal,
+        QUrl,
+    )
+    from PySide6.QtGui import QFont, QImage, QKeySequence, QPixmap, QPixmapCache, QShortcut
+    from PySide6.QtWidgets import (
+        QAbstractButton,
+        QApplication,
+        QDialog,
+        QFrame,
+        QGridLayout,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QProgressBar,
+        QPushButton,
+        QScrollArea,
+        QStackedWidget,
+        QVBoxLayout,
+        QWidget,
+    )
+except (ImportError, OSError):
+    QT_BINDING = "PyQt5"
+    from PyQt5.QtCore import (  # type: ignore[no-redef]
+        QEvent,
+        QEasingCurve,
+        QObject,
+        QPoint,
+        QPropertyAnimation,
+        QRect,
+        QRunnable,
+        QSize,
+        QThreadPool,
+        QTimer,
+        QUrl,
+        Qt,
+        pyqtSignal as Signal,
+        pyqtSlot as Slot,
+    )
+    from PyQt5.QtGui import QFont, QImage, QKeySequence, QPixmap, QPixmapCache  # type: ignore[no-redef]
+    from PyQt5.QtWidgets import (  # type: ignore[no-redef]
+        QAbstractButton,
+        QApplication,
+        QDialog,
+        QFrame,
+        QGridLayout,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QProgressBar,
+        QPushButton,
+        QScrollArea,
+        QShortcut,
+        QStackedWidget,
+        QVBoxLayout,
+        QWidget,
+    )
 
-try:
-    from PySide6.QtWebEngineCore import QWebEngineSettings
-except Exception:
-    QWebEngineSettings = None
+pygame = None
+_PYGAME_IMPORT_ATTEMPTED = False
 
-try:
-    import pygame
-except Exception:
-    pygame = None
+
+def _controller_device_may_exist() -> bool:
+    """Avoid loading SDL on Linux until a joystick device is actually present."""
+    if os.getenv("PISTICK_EAGER_CONTROLLER", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    if not sys.platform.startswith("linux"):
+        return True
+    try:
+        input_root = Path("/dev/input")
+        return any(input_root.glob("js*")) or any(
+            input_root.glob("by-id/*-joystick*")
+        )
+    except OSError:
+        return False
+
+
+def _load_pygame_module():
+    global pygame, _PYGAME_IMPORT_ATTEMPTED
+    if pygame is not None:
+        return pygame
+    if _PYGAME_IMPORT_ATTEMPTED or not _controller_device_may_exist():
+        return None
+    _PYGAME_IMPORT_ATTEMPTED = True
+    try:
+        import importlib
+
+        pygame = importlib.import_module("pygame")
+    except Exception:
+        pygame = None
+    return pygame
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "2.9-tv-season-episode-picker"
+APP_VERSION = "3.0-efficiency-overhaul"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
 CONFIG_PATH = Path(__file__).with_name("config.json")
 STATE_PATH = Path(__file__).with_name("pistick_state.json")
+CACHE_ROOT = Path(
+    os.getenv("PISTICK_CACHE_DIR", "").strip()
+    or Path(os.getenv("XDG_CACHE_HOME", "").strip() or (Path.home() / ".cache")) / "pistick"
+)
+
+
+def _system_memory_mb() -> int:
+    """Read total RAM without adding a platform-specific dependency."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return max(1, int(line.split()[1]) // 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 4096
+
+
+@dataclass(frozen=True)
+class RuntimeTuning:
+    low_memory: bool
+    api_threads: int
+    image_threads: int
+    image_memory_cache_bytes: int
+    image_prefetch_margin: int
+    image_release_margin: int
+    web_cache_bytes: int
+
+
+def _runtime_tuning() -> RuntimeTuning:
+    override = os.getenv("PISTICK_LOW_MEMORY", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        low_memory = True
+    elif override in {"0", "false", "no", "off"}:
+        low_memory = False
+    else:
+        low_memory = (os.cpu_count() or 1) <= 2 or _system_memory_mb() <= 768
+    if low_memory:
+        return RuntimeTuning(True, 2, 2, 10 * 1024 * 1024, 420, 950, 24 * 1024 * 1024)
+    cpu_count = max(1, os.cpu_count() or 1)
+    return RuntimeTuning(
+        False,
+        min(6, max(3, cpu_count // 2)),
+        min(4, max(2, cpu_count // 2)),
+        48 * 1024 * 1024,
+        900,
+        3000,
+        96 * 1024 * 1024,
+    )
+
+
+RUNTIME = _runtime_tuning()
 
 # YouTube requires embedded desktop/WebView clients to identify themselves with
 # an HTTPS Referer. Keep this stable if PiStick is packaged later.
@@ -202,6 +345,7 @@ class WatchStateStore:
 
     def __init__(self, path: Path = STATE_PATH):
         self.path = path
+        self._last_saved_payload: Optional[str] = None
         self.data: dict[str, Any] = self._load()
 
     def _default_data(self) -> dict[str, Any]:
@@ -223,6 +367,7 @@ class WatchStateStore:
                     raw.setdefault("active_profile", None)
                     for profile in raw.get("profiles", []):
                         raw["watch_state"].setdefault(profile.get("id", ""), {})
+                    self._last_saved_payload = self._serialize(raw)
                     return raw
             except Exception:
                 pass
@@ -230,11 +375,27 @@ class WatchStateStore:
         self._save_data(data)
         return data
 
+    @staticmethod
+    def _serialize(data: dict[str, Any]) -> str:
+        # Compact JSON materially reduces SD-card writes once Jellyfin begins
+        # reporting progress, while preserving the exact state schema.
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
     def _save_data(self, data: dict[str, Any]) -> None:
+        payload = self._serialize(data)
+        if payload == self._last_saved_payload and self.path.exists():
+            return
+        temporary = self.path.with_name(f".{self.path.name}.tmp")
         try:
-            self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(payload, encoding="utf-8")
+            os.replace(temporary, self.path)
+            self._last_saved_payload = payload
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def save(self) -> None:
         self._save_data(self.data)
@@ -589,23 +750,162 @@ class WatchStateStore:
         return items
 
 
+class _JsonResponseCache:
+    """Small RAM + disk cache for TMDB responses.
+
+    TMDB lists and metadata change slowly compared with navigation speed. The
+    cache avoids re-downloading and reparsing the same JSON every time a profile
+    changes or a title is reopened, and stale data remains a safe offline
+    fallback when the network briefly drops.
+    """
+
+    def __init__(self, root: Path, max_memory_entries: int = 64):
+        self.root = root
+        self.max_memory_entries = max(8, int(max_memory_entries))
+        self._memory: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._lock = threading.RLock()
+        self._writes = 0
+
+    def get(self, key: str, allow_stale: bool = False) -> Optional[dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            memory_entry = self._memory.get(key)
+            if memory_entry is not None:
+                expires_at, data = memory_entry
+                if allow_stale or expires_at > now:
+                    self._memory.move_to_end(key)
+                    return data
+
+        path = self.root / f"{key}.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            expires_at = float(payload.get("expires_at", 0.0) or 0.0)
+            data = payload.get("data")
+            if not isinstance(data, dict) or (not allow_stale and expires_at <= now):
+                return None
+        except (OSError, ValueError, TypeError):
+            return None
+
+        with self._lock:
+            self._memory[key] = (expires_at, data)
+            self._memory.move_to_end(key)
+            self._trim_memory()
+        return data
+
+    def put(self, key: str, data: dict[str, Any], ttl_seconds: int) -> None:
+        expires_at = time.time() + max(1, int(ttl_seconds))
+        with self._lock:
+            self._memory[key] = (expires_at, data)
+            self._memory.move_to_end(key)
+            self._trim_memory()
+
+        path = self.root / f"{key}.json"
+        temporary = self.root / f".{key}-{os.getpid()}-{threading.get_ident()}.tmp"
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(
+                    {"expires_at": expires_at, "data": data},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        self._writes += 1
+        if self._writes % 64 == 0:
+            self._trim_disk()
+
+    def _trim_memory(self) -> None:
+        while len(self._memory) > self.max_memory_entries:
+            self._memory.popitem(last=False)
+
+    def _trim_disk(self) -> None:
+        try:
+            files = sorted(
+                self.root.glob("*.json"),
+                key=lambda candidate: candidate.stat().st_mtime,
+                reverse=True,
+            )
+            for old_path in files[256:]:
+                old_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class TMDBClient:
     def __init__(self, read_token: str):
         self.read_token = read_token
-        self.session = requests.Session()
-        self.session.headers.update(
+        self._thread_local = threading.local()
+        self._cache = _JsonResponseCache(CACHE_ROOT / "api")
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is not None:
+            return session
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=1)
+        session.mount("https://", adapter)
+        session.headers.update(
             {
-                "Authorization": f"Bearer {read_token}",
+                "Authorization": f"Bearer {self.read_token}",
                 "Accept": "application/json",
-                "User-Agent": f"{APP_NAME}/2.0",
+                "Accept-Encoding": "gzip, deflate",
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
             }
         )
+        self._thread_local.session = session
+        return session
+
+    @staticmethod
+    def _cache_ttl(endpoint: str) -> int:
+        if endpoint.startswith("/search/"):
+            return 5 * 60
+        if endpoint.startswith("/trending/"):
+            return 15 * 60
+        if "/season/" in endpoint:
+            return 24 * 60 * 60
+        if endpoint.endswith("/popular") or endpoint.endswith("/upcoming"):
+            return 30 * 60
+        if endpoint.endswith("/top_rated"):
+            return 6 * 60 * 60
+        return 6 * 60 * 60
 
     def get(self, endpoint: str, **params: Any) -> dict[str, Any]:
         params.setdefault("language", "en-US")
-        response = self.session.get(f"{TMDB_API_BASE}{endpoint}", params=params, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        cache_source = json.dumps(
+            [endpoint, sorted((str(key), str(value)) for key, value in params.items())],
+            separators=(",", ":"),
+        )
+        cache_key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            response = self._session().get(
+                f"{TMDB_API_BASE}{endpoint}",
+                params=params,
+                timeout=(4, 14),
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("TMDB returned an invalid response")
+        except Exception:
+            stale = self._cache.get(cache_key, allow_stale=True)
+            if stale is not None:
+                return stale
+            raise
+
+        self._cache.put(cache_key, data, self._cache_ttl(endpoint))
+        return data
 
     @staticmethod
     def normalize(item: dict[str, Any], fallback_type: Optional[str] = None) -> dict[str, Any]:
@@ -655,7 +955,7 @@ class TMDBClient:
 
     def season_details(self, series_id: int, season_number: int) -> dict[str, Any]:
         """Load the episodes for one TV season from TMDB."""
-        data = self.get(f"/tv/{int(series_id)}/season/{int(season_number)}")
+        data = dict(self.get(f"/tv/{int(series_id)}/season/{int(season_number)}"))
         data["season_number"] = int(data.get("season_number", season_number) or season_number)
         episodes = []
         for raw_episode in data.get("episodes", []):
@@ -706,28 +1006,128 @@ class FunctionWorker(QRunnable):
 
 
 class ImageSignals(QObject):
-    loaded = Signal(bytes)
-    failed = Signal()
+    loaded = Signal(object)
+    failed = Signal(str)
     finished = Signal(object)
 
 
+_IMAGE_HTTP_LOCAL = threading.local()
+_IMAGE_CACHE_WRITE_LOCK = threading.Lock()
+_IMAGE_CACHE_WRITES = 0
+
+
+def _image_http_session() -> requests.Session:
+    session = getattr(_IMAGE_HTTP_LOCAL, "session", None)
+    if session is not None:
+        return session
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=1)
+    session.mount("https://", adapter)
+    session.headers.update(
+        {
+            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        }
+    )
+    _IMAGE_HTTP_LOCAL.session = session
+    return session
+
+
+def _image_disk_path(url: str) -> Path:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return CACHE_ROOT / "images" / f"{digest}.img"
+
+
+def _load_image_bytes(url: str) -> bytes:
+    """Read a poster from the local cache or download it with a strict cap."""
+    path = _image_disk_path(url)
+    try:
+        if path.is_file() and path.stat().st_size > 0:
+            return path.read_bytes()
+    except OSError:
+        pass
+
+    chunks: list[bytes] = []
+    total = 0
+    with _image_http_session().get(url, timeout=(4, 14), stream=True) as response:
+        response.raise_for_status()
+        for chunk in response.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > 12 * 1024 * 1024:
+                raise ValueError("Image response exceeded PiStick's safety limit")
+            chunks.append(chunk)
+    data = b"".join(chunks)
+    if not data:
+        raise ValueError("Image response was empty")
+
+    temporary = path.with_name(f".{path.stem}-{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(data)
+        os.replace(temporary, path)
+        _trim_image_disk_cache_periodically(path.parent)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return data
+
+
+def _trim_image_disk_cache_periodically(root: Path) -> None:
+    global _IMAGE_CACHE_WRITES
+    with _IMAGE_CACHE_WRITE_LOCK:
+        _IMAGE_CACHE_WRITES += 1
+        if _IMAGE_CACHE_WRITES % 128:
+            return
+        try:
+            files = sorted(
+                root.glob("*.img"),
+                key=lambda candidate: candidate.stat().st_mtime,
+                reverse=True,
+            )
+            retained_bytes = 0
+            for index, cache_file in enumerate(files):
+                size = cache_file.stat().st_size
+                retained_bytes += size
+                if index >= 511 or retained_bytes > 128 * 1024 * 1024:
+                    cache_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class ImageWorker(QRunnable):
-    def __init__(self, url: str):
+    def __init__(self, key: str, url: str, width: int, height: int, crop: bool):
         super().__init__()
+        self.key = key
         self.url = url
+        self.width = int(width)
+        self.height = int(height)
+        self.crop = bool(crop)
         self.signals = ImageSignals()
 
     def run(self) -> None:
         try:
-            response = requests.get(self.url, timeout=15)
-            response.raise_for_status()
+            image = QImage.fromData(_load_image_bytes(self.url))
+            if image.isNull():
+                raise ValueError("Unsupported image data")
+            target_size = QSize(self.width, self.height)
+            mode = Qt.KeepAspectRatioByExpanding if self.crop else Qt.KeepAspectRatio
+            image = image.scaled(target_size, mode, Qt.SmoothTransformation)
+            if self.crop:
+                x = max(0, (image.width() - self.width) // 2)
+                y = max(0, (image.height() - self.height) // 2)
+                image = image.copy(x, y, self.width, self.height)
             try:
-                self.signals.loaded.emit(response.content)
+                self.signals.loaded.emit((self.key, image))
             except RuntimeError:
                 pass
         except Exception:
             try:
-                self.signals.failed.emit()
+                self.signals.failed.emit(self.key)
             except RuntimeError:
                 pass
         finally:
@@ -735,6 +1135,243 @@ class ImageWorker(QRunnable):
                 self.signals.finished.emit(self)
             except RuntimeError:
                 _release_worker(self)
+
+
+@dataclass
+class _PendingImage:
+    key: str
+    url: str
+    width: int
+    height: int
+    crop: bool
+    subscribers: list[weakref.ReferenceType]
+
+
+class ImagePipeline(QObject):
+    """Viewport-aware, coalescing image loader with bounded decoded memory."""
+
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(RUNTIME.image_threads)
+        self.pool.setExpiryTimeout(3000)
+        self._requests: dict[str, _PendingImage] = {}
+        self._pending: OrderedDict[str, _PendingImage] = OrderedDict()
+        self._inflight: set[str] = set()
+        self._cache: OrderedDict[str, tuple[QPixmap, int]] = OrderedDict()
+        self._cache_cost = 0
+        self._registered: list[weakref.ReferenceType] = []
+        self._dispatch_timer = QTimer(self)
+        self._dispatch_timer.setSingleShot(True)
+        self._dispatch_timer.timeout.connect(self._scan_and_dispatch)
+
+    @staticmethod
+    def cache_key(url: str, width: int, height: int, crop: bool) -> str:
+        return f"{url}|{int(width)}x{int(height)}|{int(bool(crop))}"
+
+    def request(self, target: "RemoteImage", url: str) -> None:
+        key = self.cache_key(
+            url,
+            target.target_size.width(),
+            target.target_size.height(),
+            target.crop,
+        )
+        target._image_url = url
+        target._image_cache_key = key
+        target._image_failed = False
+        if not target._pipeline_registered:
+            target._pipeline_registered = True
+            self._registered.append(weakref.ref(target))
+
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            target._set_shared_pixmap(cached[0])
+            return
+
+        request = self._requests.get(key)
+        if request is None:
+            request = _PendingImage(
+                key,
+                url,
+                target.target_size.width(),
+                target.target_size.height(),
+                target.crop,
+                [],
+            )
+            self._requests[key] = request
+            self._pending[key] = request
+        self._add_subscriber(request, target)
+        self.kick()
+
+    @staticmethod
+    def _add_subscriber(request: _PendingImage, target: "RemoteImage") -> None:
+        for target_ref in request.subscribers:
+            if target_ref() is target:
+                return
+        request.subscribers.append(weakref.ref(target))
+
+    def kick(self, delay: int = 0) -> None:
+        if not self._dispatch_timer.isActive():
+            self._dispatch_timer.start(max(0, int(delay)))
+
+    def viewport_changed(self) -> None:
+        # Scroll animations can emit dozens of value changes. One coalesced scan
+        # per frame-sized interval keeps image work off that hot path.
+        if not self._dispatch_timer.isActive():
+            self._dispatch_timer.start(55)
+
+    @staticmethod
+    def _near_viewport(widget: "RemoteImage", margin: int) -> bool:
+        try:
+            window = widget.window()
+            if window is None or not widget.isVisibleTo(window):
+                return False
+            ancestor = widget.parentWidget()
+            while ancestor is not None:
+                if isinstance(ancestor, QScrollArea):
+                    viewport = ancestor.viewport()
+                    top_left = widget.mapTo(viewport, QPoint(0, 0))
+                    image_rect = QRect(top_left, widget.size())
+                    visible_rect = viewport.rect().adjusted(-margin, -margin, margin, margin)
+                    if not visible_rect.intersects(image_rect):
+                        return False
+                ancestor = ancestor.parentWidget()
+            return True
+        except RuntimeError:
+            return False
+
+    def _scan_and_dispatch(self) -> None:
+        live_registered: list[weakref.ReferenceType] = []
+        for target_ref in self._registered:
+            target = target_ref()
+            if target is None:
+                continue
+            live_registered.append(target_ref)
+            try:
+                if (
+                    RUNTIME.low_memory
+                    and target._has_image
+                    and not self._near_viewport(target, RUNTIME.image_release_margin)
+                ):
+                    target._release_pixmap()
+                elif (
+                    target._image_url
+                    and not target._has_image
+                    and not target._image_failed
+                    and self._near_viewport(target, RUNTIME.image_prefetch_margin)
+                ):
+                    self.request(target, target._image_url)
+            except RuntimeError:
+                continue
+        self._registered = live_registered
+
+        for key, request in list(self._pending.items()):
+            request.subscribers = [
+                target_ref
+                for target_ref in request.subscribers
+                if target_ref() is not None
+            ]
+            if not request.subscribers:
+                self._pending.pop(key, None)
+                self._requests.pop(key, None)
+
+        while len(self._inflight) < RUNTIME.image_threads:
+            selected_key: Optional[str] = None
+            for key, request in self._pending.items():
+                if any(
+                    target is not None
+                    and self._near_viewport(target, RUNTIME.image_prefetch_margin)
+                    for target in (target_ref() for target_ref in request.subscribers)
+                ):
+                    selected_key = key
+                    break
+            if selected_key is None:
+                break
+
+            request = self._pending.pop(selected_key)
+            self._inflight.add(selected_key)
+            worker = ImageWorker(
+                request.key,
+                request.url,
+                request.width,
+                request.height,
+                request.crop,
+            )
+            worker.signals.loaded.connect(self._image_loaded)
+            worker.signals.failed.connect(self._image_failed)
+            _start_worker(self.pool, worker)
+
+    @Slot(object)
+    def _image_loaded(self, payload: object) -> None:
+        try:
+            key, image = payload
+        except (TypeError, ValueError):
+            return
+        if not isinstance(image, QImage) or image.isNull():
+            self._image_failed(str(key))
+            return
+        pixmap = QPixmap.fromImage(image)
+        self._remember(str(key), pixmap)
+        request = self._requests.get(str(key))
+        if request is not None:
+            for target_ref in request.subscribers:
+                target = target_ref()
+                if target is None:
+                    continue
+                try:
+                    if target._image_cache_key == key:
+                        target._set_shared_pixmap(pixmap)
+                except RuntimeError:
+                    pass
+        self._finish_request(str(key))
+
+    @Slot(str)
+    def _image_failed(self, key: str) -> None:
+        request = self._requests.get(key)
+        if request is not None:
+            for target_ref in request.subscribers:
+                target = target_ref()
+                if target is None:
+                    continue
+                try:
+                    if target._image_cache_key == key:
+                        target._set_failed()
+                except RuntimeError:
+                    pass
+        self._finish_request(key)
+
+    def _finish_request(self, key: str) -> None:
+        self._inflight.discard(key)
+        self._pending.pop(key, None)
+        self._requests.pop(key, None)
+        self.kick()
+
+    def _remember(self, key: str, pixmap: QPixmap) -> None:
+        old = self._cache.pop(key, None)
+        if old is not None:
+            self._cache_cost -= old[1]
+        cost = max(1, pixmap.width() * pixmap.height() * 4)
+        self._cache[key] = (pixmap, cost)
+        self._cache_cost += cost
+        while self._cache and self._cache_cost > RUNTIME.image_memory_cache_bytes:
+            _old_key, (_old_pixmap, old_cost) = self._cache.popitem(last=False)
+            self._cache_cost -= old_cost
+
+
+_IMAGE_PIPELINE: Optional[ImagePipeline] = None
+
+
+def _image_pipeline() -> ImagePipeline:
+    global _IMAGE_PIPELINE
+    if _IMAGE_PIPELINE is None:
+        _IMAGE_PIPELINE = ImagePipeline(QApplication.instance())
+    return _IMAGE_PIPELINE
+
+
+def _notify_image_view_changed() -> None:
+    if _IMAGE_PIPELINE is not None:
+        _IMAGE_PIPELINE.viewport_changed()
 
 
 class RemoteImage(QLabel):
@@ -753,30 +1390,35 @@ class RemoteImage(QLabel):
         self.thread_pool = thread_pool
         self.target_size = QSize(width, height)
         self.crop = crop
+        self._image_url = ""
+        self._image_cache_key = ""
+        self._has_image = False
+        self._image_failed = False
+        self._pipeline_registered = False
         self.setFixedSize(width, height)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet(
-            f"background:#242424; border-radius:{radius}px; color:#777; font-size:12px;"
-        )
+        self.setObjectName(f"remoteImage{radius if radius in (8, 10, 14) else 8}")
         self.setText("Loading…")
 
     def load(self, url: str) -> None:
         if not url:
             self.setText("No image")
             return
-        worker = ImageWorker(url)
-        worker.signals.loaded.connect(self._set_image)
-        worker.signals.failed.connect(self._set_failed)
-        _start_worker(self.thread_pool, worker)
+        _image_pipeline().request(self, url)
 
     def copy_from(self, source: "RemoteImage") -> None:
         """Share a loaded poster with a carousel clone without downloading it again."""
+        if source._image_url:
+            self.load(source._image_url)
+            return
         source.imageReady.connect(self._set_shared_pixmap)
         pixmap = source.pixmap()
         if pixmap is not None and not pixmap.isNull():
             self._set_shared_pixmap(pixmap)
 
     def _set_failed(self) -> None:
+        self._image_failed = True
+        self._has_image = False
         self.setText("No image")
 
     def _set_shared_pixmap(self, pixmap: QPixmap) -> None:
@@ -785,43 +1427,89 @@ class RemoteImage(QLabel):
             return
         self.setPixmap(pixmap)
         self.setText("")
-
-    def _set_image(self, data: bytes) -> None:
-        image = QImage.fromData(data)
-        if image.isNull():
-            self.setText("No image")
-            return
-        mode = Qt.KeepAspectRatioByExpanding if self.crop else Qt.KeepAspectRatio
-        pixmap = QPixmap.fromImage(image).scaled(self.target_size, mode, Qt.SmoothTransformation)
-        if self.crop:
-            x = max(0, (pixmap.width() - self.target_size.width()) // 2)
-            y = max(0, (pixmap.height() - self.target_size.height()) // 2)
-            pixmap = pixmap.copy(x, y, self.target_size.width(), self.target_size.height())
-        self.setPixmap(pixmap)
-        self.setText("")
+        self._image_failed = False
+        self._has_image = True
         self.imageReady.emit(pixmap)
 
+    def _release_pixmap(self) -> None:
+        if not self._has_image:
+            return
+        self.setPixmap(QPixmap())
+        self.setText("Loading…")
+        self._has_image = False
 
-if QWebEngineView is not None:
-    class TrailerWebView(QWebEngineView):
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        _image_pipeline().viewport_changed()
+
+
+TrailerWebView = None
+_WEBENGINE_ATTEMPTED = False
+
+
+def get_trailer_web_view_class():
+    """Import Chromium only when a details screen actually has a trailer."""
+    global TrailerWebView, _WEBENGINE_ATTEMPTED
+    if TrailerWebView is not None:
+        return TrailerWebView
+    if _WEBENGINE_ATTEMPTED:
+        return None
+    _WEBENGINE_ATTEMPTED = True
+    try:
+        if QT_BINDING == "PySide6":
+            from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+        else:
+            from PyQt5.QtWebEngineWidgets import (  # type: ignore[no-redef]
+                QWebEngineProfile,
+                QWebEngineSettings,
+                QWebEngineView,
+            )
+    except (ImportError, OSError):
+        return None
+
+    class _TrailerWebView(QWebEngineView):
         """Web player that observes clicks without stealing controller focus."""
 
         clicked = Signal()
+        _profile_configured = False
 
         def __init__(self, parent: Optional[QWidget] = None):
+            type(self)._configure_profile(QWebEngineProfile)
             super().__init__(parent)
-            if QWebEngineSettings is not None:
-                web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
-                playback_attribute = getattr(
-                    web_attribute,
-                    "PlaybackRequiresUserGesture",
-                    None,
-                )
-                if playback_attribute is not None:
-                    self.settings().setAttribute(playback_attribute, False)
+            web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
+            for name, enabled in (
+                ("PlaybackRequiresUserGesture", False),
+                ("JavascriptCanOpenWindows", False),
+                ("PluginsEnabled", False),
+                ("AutoLoadIconsForPage", False),
+            ):
+                attribute = getattr(web_attribute, name, None)
+                if attribute is not None:
+                    self.settings().setAttribute(attribute, enabled)
+            self._filter_installed = False
             app = QApplication.instance()
             if app is not None:
                 app.installEventFilter(self)
+                self._filter_installed = True
+
+        @classmethod
+        def _configure_profile(cls, profile_type) -> None:
+            if cls._profile_configured:
+                return
+            cls._profile_configured = True
+            try:
+                profile = profile_type.defaultProfile()
+                cache_path = CACHE_ROOT / "webengine"
+                cache_path.mkdir(parents=True, exist_ok=True)
+                profile.setCachePath(str(cache_path))
+                profile.setHttpCacheMaximumSize(RUNTIME.web_cache_bytes)
+                cache_enum_type = getattr(profile_type, "HttpCacheType", profile_type)
+                disk_cache = getattr(cache_enum_type, "DiskHttpCache", None)
+                if disk_cache is not None:
+                    profile.setHttpCacheType(disk_cache)
+            except (OSError, RuntimeError):
+                pass
 
         def _contains_widget(self, widget: QObject) -> bool:
             current = widget if isinstance(widget, QWidget) else None
@@ -849,8 +1537,22 @@ if QWebEngineView is not None:
             self.page().runJavaScript(
                 "window.pistickPauseTrailer && window.pistickPauseTrailer();"
             )
-else:
-    TrailerWebView = None
+
+        def dispose(self) -> None:
+            if self._filter_installed:
+                app = QApplication.instance()
+                if app is not None:
+                    app.removeEventFilter(self)
+                self._filter_installed = False
+            try:
+                self.stop()
+                self.page().setAudioMuted(True)
+            except RuntimeError:
+                pass
+
+    _TrailerWebView.__name__ = "TrailerWebView"
+    TrailerWebView = _TrailerWebView
+    return TrailerWebView
 
 
 class SmoothScrollArea(QScrollArea):
@@ -863,6 +1565,8 @@ class SmoothScrollArea(QScrollArea):
         for animation in (self._v_animation, self._h_animation):
             animation.setDuration(230)
             animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.verticalScrollBar().valueChanged.connect(_notify_image_view_changed)
+        self.horizontalScrollBar().valueChanged.connect(_notify_image_view_changed)
 
     @staticmethod
     def _clamp(bar, value: int) -> int:
@@ -1143,7 +1847,10 @@ class MediaCard(ClickableFrame):
         if image_source is not None:
             self.poster.copy_from(image_source)
         elif poster_path:
-            self.poster.load(f"{TMDB_IMAGE_BASE}/w342{poster_path}")
+            # TMDB's 185 px source is already larger than the 166/172 px card.
+            # Downloading w342 wastes bandwidth, decode time, and peak RAM with
+            # no visible benefit at this rendered size.
+            self.poster.load(f"{TMDB_IMAGE_BASE}/w185{poster_path}")
 
         entry = state_lookup(media) if state_lookup else None
         if entry and entry.get("status") == "finished":
@@ -1289,43 +1996,69 @@ class MediaRow(QWidget):
                 card.setFocusPolicy(Qt.NoFocus)
             return card
 
-        # Render the same logical period on both sides of the focusable cards.
-        # The scrollbar can then be rebased by exactly one period after a wheel,
-        # drag, or key animation; identical posters occupy the same pixels, so
-        # the rebase is invisible and the viewport never reaches an empty gap.
+        # Render a cyclic edge band on both sides of the focusable cards. The
+        # scrollbar can then be rebased by exactly one logical period after a
+        # wheel, drag, or key animation; identical posters occupy the same
+        # pixels, so the rebase stays invisible and no empty edge is exposed.
         if self.items:
             self.cards = [make_card(item) for item in self.items]
             if self.infinite:
                 item_count = len(self.items)
-                repeat_count = max(3, (30 + item_count - 1) // item_count)
-                if repeat_count % 2 == 0:
-                    repeat_count += 1
-                center_repeat = repeat_count // 2
-                display_cards: list[MediaCard] = []
+                card_step = self.cards[0].width() + self.row_layout.spacing()
+                screen = QApplication.primaryScreen()
+                viewport_budget = (
+                    screen.availableGeometry().width() if screen is not None else 1440
+                )
+                # Only one viewport of edge copies is required to hide a
+                # physical end while the scrollbar is invisibly rebased. The
+                # old implementation kept three complete 20-card periods (60
+                # full card trees), even though most could never be seen.
+                edge_count = max(2, (viewport_budget + card_step - 1) // card_step)
 
-                for repeat_index in range(repeat_count):
-                    for item_index, item in enumerate(self.items):
-                        if repeat_index == center_repeat:
-                            card = self.cards[item_index]
-                        else:
-                            card = make_card(
-                                item,
-                                clone=True,
-                                image_source=self.cards[item_index].poster,
-                            )
-                        display_cards.append(card)
-                        self.row_layout.addWidget(card)
+                left_cards: list[MediaCard] = []
+                for offset in range(edge_count, 0, -1):
+                    item_index = (-offset) % item_count
+                    card = make_card(
+                        self.items[item_index],
+                        clone=True,
+                        image_source=self.cards[item_index].poster,
+                    )
+                    left_cards.append(card)
+                    self.row_layout.addWidget(card)
 
-                center_start = center_repeat * item_count
-                self.left_clone = display_cards[center_start - 1]
-                self.right_clone = display_cards[center_start + item_count]
+                for card in self.cards:
+                    self.row_layout.addWidget(card)
+
+                right_cards: list[MediaCard] = []
+                for offset in range(edge_count):
+                    item_index = offset % item_count
+                    card = make_card(
+                        self.items[item_index],
+                        clone=True,
+                        image_source=self.cards[item_index].poster,
+                    )
+                    right_cards.append(card)
+                    self.row_layout.addWidget(card)
+
+                self.left_clone = left_cards[-1]
+                self.right_clone = right_cards[0]
             else:
                 for card in self.cards:
                     self.row_layout.addWidget(card)
 
-        self.content.adjustSize()
-        width = max(self.row_layout.sizeHint().width(), self.content.sizeHint().width())
+        card_count = self.row_layout.count()
+        margins = self.row_layout.contentsMargins()
+        if self.cards and card_count:
+            width = (
+                margins.left()
+                + margins.right()
+                + card_count * self.cards[0].width()
+                + max(0, card_count - 1) * self.row_layout.spacing()
+            )
+        else:
+            width = 1
         self.content.setFixedSize(width, self.scroll_height - 2)
+        self.row_layout.activate()
         self.scroll.setWidget(self.content)
         self.scroll.horizontal_rebase_callback = self._rebase_scroll_position
         self.scroll._h_animation.finished.connect(self._rebase_scroll_position)
@@ -1343,7 +2076,7 @@ class MediaRow(QWidget):
     def _position_on_first_real(self) -> None:
         if not self.cards:
             return
-        self.content.adjustSize()
+        self.row_layout.activate()
         bar = self.scroll.horizontalScrollBar()
         bar.setValue(max(bar.minimum(), min(bar.maximum(), self.cards[0].x())))
 
@@ -1593,18 +2326,37 @@ class ControllerManager(QObject):
         self.repeat_delay = 0.31
         self.repeat_rate = 0.115
         self.deadzone = 0.55
+        self._pygame_ready = False
 
-        if pygame is not None:
-            try:
-                pygame.init()
-                pygame.joystick.init()
-            except Exception:
-                pass
+        self._initialize_pygame()
 
         self.timer = QTimer(self)
-        self.timer.setInterval(35)
+        self.timer.setInterval(260)
         self.timer.timeout.connect(self._poll)
         self.timer.start()
+
+    def _initialize_pygame(self) -> bool:
+        module = _load_pygame_module()
+        if module is None:
+            return False
+        if self._pygame_ready:
+            return True
+        try:
+            # PiStick only needs SDL's event and joystick subsystems. A full
+            # pygame.init() also starts audio, font, and other modules that
+            # reserve memory and can block on absent Pi hardware.
+            if hasattr(module, "display"):
+                module.display.init()
+            module.joystick.init()
+            self._pygame_ready = True
+        except Exception:
+            self._pygame_ready = False
+        return self._pygame_ready
+
+    def _set_poll_interval(self, connected: bool) -> None:
+        interval = 35 if connected else 260
+        if self.timer.interval() != interval:
+            self.timer.setInterval(interval)
 
     def _scan(self) -> None:
         if pygame is None:
@@ -1618,17 +2370,20 @@ class ControllerManager(QObject):
                 self.joystick = joystick
                 self.connected = True
                 self.last_button_state.clear()
+                self._set_poll_interval(True)
                 self.connectionChanged.emit(True, joystick.get_name() or "Controller")
             elif count == 0 and self.connected:
                 self.joystick = None
                 self.connected = False
                 self.last_button_state.clear()
+                self._set_poll_interval(False)
                 self.connectionChanged.emit(False, "")
         except Exception:
             if self.connected:
                 self.joystick = None
                 self.connected = False
                 self.last_button_state.clear()
+                self._set_poll_interval(False)
                 self.connectionChanged.emit(False, "")
 
     def _button_edge(self, button: int) -> bool:
@@ -1662,9 +2417,13 @@ class ControllerManager(QObject):
         return values
 
     def _poll(self) -> None:
-        if pygame is None:
-            return
         now = time.monotonic()
+        if not self._pygame_ready:
+            if now - self.last_scan > 1.0:
+                self.last_scan = now
+                if self._initialize_pygame():
+                    self._scan()
+            return
         if now - self.last_scan > 1.0:
             self.last_scan = now
             self._scan()
@@ -1709,7 +2468,7 @@ class OnScreenKeyboard(QDialog):
         self.setModal(True)
         self.setMinimumSize(900, 520)
         self.resize(980, 560)
-        self.setStyleSheet(APP_STYLESHEET)
+        _ensure_app_stylesheet()
         self.setObjectName("keyboardDialog")
         self.first_key: Optional[QPushButton] = None
 
@@ -1809,7 +2568,7 @@ class TextInputDialog(QDialog):
         self.setWindowTitle(title_text)
         self.setModal(True)
         self.setFixedSize(470, 220)
-        self.setStyleSheet(APP_STYLESHEET)
+        _ensure_app_stylesheet()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 24)
@@ -1858,7 +2617,8 @@ class TextInputDialog(QDialog):
         initial_text: str = "",
     ) -> tuple[str, bool]:
         dialog = cls(title_text, label_text, initial_text, parent)
-        accepted = dialog.exec() == QDialog.Accepted
+        run_dialog = getattr(dialog, "exec", None) or getattr(dialog, "exec_")
+        accepted = run_dialog() == QDialog.Accepted
         return dialog.edit.text().strip(), accepted
 
 
@@ -1917,7 +2677,7 @@ class DetailDialog(QDialog):
         self.resize(1080, 760)
         self.setMinimumSize(860, 620)
         self.setModal(True)
-        self.setStyleSheet(APP_STYLESHEET)
+        _ensure_app_stylesheet()
 
         self.main = QVBoxLayout(self)
         self.main.setContentsMargins(0, 0, 0, 0)
@@ -2429,6 +3189,12 @@ class DetailDialog(QDialog):
             self._trailer_animation = None
         if self._trailer_fullscreen:
             self._restore_detail_window()
+        web = self.trailer_web
+        if web is not None and hasattr(web, "dispose"):
+            try:
+                web.dispose()
+            except RuntimeError:
+                pass
         if self.trailer_overlay is not None:
             self.trailer_overlay.deleteLater()
         self.trailer_web = None
@@ -2646,6 +3412,11 @@ class DetailDialog(QDialog):
             self._trailer_animation.stop()
         if self._episode_panel_animation is not None:
             self._episode_panel_animation.stop()
+        if self.trailer_web is not None and hasattr(self.trailer_web, "dispose"):
+            try:
+                self.trailer_web.dispose()
+            except RuntimeError:
+                pass
         super().closeEvent(event)
 
     def _render(self, media: dict[str, Any]) -> None:
@@ -2664,7 +3435,7 @@ class DetailDialog(QDialog):
 
         poster = RemoteImage(self.thread_pool, 230, 345, radius=10)
         if media.get("poster_path"):
-            poster.load(f"{TMDB_IMAGE_BASE}/w500{media['poster_path']}")
+            poster.load(f"{TMDB_IMAGE_BASE}/w342{media['poster_path']}")
         hero_layout.addWidget(poster, 0, Qt.AlignTop)
 
         info = QVBoxLayout()
@@ -2779,7 +3550,8 @@ class DetailDialog(QDialog):
             self.controller_actions.append(unwatched)
 
         trailer = self._pick_trailer(media)
-        if trailer and TrailerWebView is not None:
+        trailer_view_class = get_trailer_web_view_class() if trailer else None
+        if trailer and trailer_view_class is not None:
             trailer_button = QPushButton("▶  Watch Trailer")
             trailer_button.setObjectName("secondaryButton")
             trailer_button.setProperty("controllerSelected", False)
@@ -2800,7 +3572,7 @@ class DetailDialog(QDialog):
         trailer_heading.setObjectName("rowHeading")
         self.body.addWidget(trailer_heading)
 
-        if trailer and TrailerWebView is not None:
+        if trailer and trailer_view_class is not None:
             placeholder = QFrame()
             placeholder.setObjectName("trailerPlaceholder")
             placeholder.setMinimumHeight(360)
@@ -2808,7 +3580,7 @@ class DetailDialog(QDialog):
             placeholder_layout.setContentsMargins(0, 0, 0, 0)
             placeholder_layout.setSpacing(0)
 
-            web = TrailerWebView()
+            web = trailer_view_class()
             web.setMinimumHeight(360)
             web.setFocusPolicy(Qt.NoFocus)
             web.clicked.connect(self._schedule_trailer_fullscreen)
@@ -3065,8 +3837,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.client: Optional[TMDBClient] = TMDBClient(config.tmdb_read_token) if config.tmdb_read_token else None
-        self.thread_pool = QThreadPool.globalInstance()
-        self.thread_pool.setMaxThreadCount(12)
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(RUNTIME.api_threads)
+        self.thread_pool.setExpiryTimeout(3000)
+        QPixmapCache.setCacheLimit(max(4096, RUNTIME.image_memory_cache_bytes // 1024))
         self.watch_state = WatchStateStore()
         self.active_profile_id: Optional[str] = None
         self.home_sections: list[tuple[str, list[dict[str, Any]]]] = []
@@ -3076,13 +3850,19 @@ class MainWindow(QMainWindow):
         self._controller_keyboard: Optional[OnScreenKeyboard] = None
         self._profile_edit_dialog: Optional[QDialog] = None
         self._detail_dialog: Optional[DetailDialog] = None
+        self._detail_state_dirty = False
         self._mouse_drag_scroll: Optional[HorizontalMediaScrollArea] = None
         self._search_generation = 0
+        self._search_inflight_query = ""
+        self._home_loading = False
+        self._focusable_cache_root: Optional[QWidget] = None
+        self._focusable_cache: list[QWidget] = []
+        self._focusable_cache_dirty = True
 
         self.setWindowTitle(APP_NAME)
         self.resize(1440, 900)
         self.setMinimumSize(980, 650)
-        self.setStyleSheet(APP_STYLESHEET)
+        _ensure_app_stylesheet()
 
         root = QWidget()
         root.setObjectName("appRoot")
@@ -3347,7 +4127,7 @@ class MainWindow(QMainWindow):
         dialog.setModal(True)
         dialog.setWindowTitle("Edit Profile")
         dialog.setFixedSize(430, 300)
-        dialog.setStyleSheet(APP_STYLESHEET)
+        _ensure_app_stylesheet()
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(34, 30, 34, 30)
@@ -3447,8 +4227,9 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.home_page)
 
     def _load_home(self) -> None:
-        if not self.client:
+        if not self.client or self._home_loading:
             return
+        self._home_loading = True
         self._clear_layout(self.home_layout)
         loading = QLabel("Loading your home screen…")
         loading.setObjectName("loadingLabel")
@@ -3477,6 +4258,7 @@ class MainWindow(QMainWindow):
         return self.watch_state.entry(self.active_profile_id, media)
 
     def _render_home(self, payload: dict[str, Any]) -> None:
+        self._home_loading = False
         self.home_payload = payload
         self._clear_layout(self.home_layout)
         scroll = SmoothScrollArea()
@@ -3540,6 +4322,7 @@ class MainWindow(QMainWindow):
             self._render_home(self.home_payload)
 
     def _show_home_error(self, error: str) -> None:
+        self._home_loading = False
         self._clear_layout(self.home_layout)
         panel = QVBoxLayout()
         title = QLabel("Couldn’t load TMDB")
@@ -3567,6 +4350,7 @@ class MainWindow(QMainWindow):
         if not text.strip():
             self.search_timer.stop()
             self._search_generation += 1
+            self._search_inflight_query = ""
             if self.active_profile_id:
                 self._show_home()
             return
@@ -3577,8 +4361,11 @@ class MainWindow(QMainWindow):
         query = self.search_box.text().strip()
         if not query or not self.client:
             return
+        if query == self._search_inflight_query:
+            return
         self._search_generation += 1
         generation = self._search_generation
+        self._search_inflight_query = query
         self._clear_layout(self.search_layout)
         heading = QLabel(f'Searching for “{query}”…')
         heading.setObjectName("searchHeading")
@@ -3610,11 +4397,16 @@ class MainWindow(QMainWindow):
         _start_worker(self.thread_pool, worker)
 
     def _render_search_payload(self, payload: dict[str, Any]) -> None:
-        if int(payload.get("generation", -1)) != self._search_generation:
-            return
         query = str(payload.get("query", ""))
-        if self.search_box.text().strip() != query:
+        if int(payload.get("generation", -1)) != self._search_generation:
+            if self._search_inflight_query == query:
+                self._search_inflight_query = ""
             return
+        if self.search_box.text().strip() != query:
+            if self._search_inflight_query == query:
+                self._search_inflight_query = ""
+            return
+        self._search_inflight_query = ""
         error = payload.get("error")
         if error:
             self._render_search_error(str(error))
@@ -3656,6 +4448,7 @@ class MainWindow(QMainWindow):
         self.search_layout.addWidget(scroll, 1)
 
     def _render_search_error(self, error: str) -> None:
+        self._search_inflight_query = ""
         self._clear_layout(self.search_layout)
         label = QLabel(f"Search failed.\n\n{error}")
         label.setObjectName("errorLabel")
@@ -3666,6 +4459,7 @@ class MainWindow(QMainWindow):
     def _quick_search_type(self, media_type: str) -> None:
         self.search_timer.stop()
         self._search_generation += 1
+        self._search_inflight_query = ""
         self.search_box.blockSignals(True)
         self.search_box.clear()
         self.search_box.blockSignals(False)
@@ -3732,8 +4526,9 @@ class MainWindow(QMainWindow):
             self,
         )
         self._detail_dialog = dialog
+        self._detail_state_dirty = False
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        dialog.stateChanged.connect(self._refresh_home_from_state)
+        dialog.stateChanged.connect(self._detail_state_changed)
         dialog.controlsReady.connect(
             lambda preferred, d=dialog: self._detail_controls_ready(d, preferred)
         )
@@ -3750,7 +4545,15 @@ class MainWindow(QMainWindow):
         self._clear_controller_selection()
         if self._detail_dialog is dialog:
             self._detail_dialog = None
-        self._refresh_home_from_state()
+        if self._detail_state_dirty:
+            self._detail_state_dirty = False
+            self._refresh_home_from_state()
+
+    def _detail_state_changed(self) -> None:
+        # The details window is modal, so rebuilding hundreds of hidden home
+        # widgets after every click cannot be seen. Coalesce all changes into a
+        # single refresh when the dialog closes.
+        self._detail_state_dirty = True
 
     def _detail_controls_ready(self, dialog: DetailDialog, preferred: QWidget) -> None:
         QTimer.singleShot(
@@ -3866,22 +4669,36 @@ class MainWindow(QMainWindow):
             return active
         return self
 
-    @staticmethod
-    def _controller_focusables(root: QWidget) -> list[QWidget]:
+    def _controller_focusables(self, root: QWidget) -> list[QWidget]:
         if isinstance(root, DetailDialog):
             return root.controller_focusables()
 
+        if self._focusable_cache_dirty or self._focusable_cache_root is not root:
+            self._focusable_cache_root = root
+            self._focusable_cache = [
+                widget
+                for widget in root.findChildren(QWidget)
+                if isinstance(widget, (QAbstractButton, QLineEdit, MediaCard, ProfileCard))
+                and not (
+                    isinstance(widget, MediaCard)
+                    and bool(widget.property("controllerClone"))
+                )
+                and not (isinstance(widget, QLineEdit) and widget.isReadOnly())
+                and widget.focusPolicy() != Qt.NoFocus
+            ]
+            self._focusable_cache_dirty = False
+
         widgets: list[QWidget] = []
-        for widget in root.findChildren(QWidget):
-            if not widget.isVisibleTo(root) or not widget.isEnabled():
-                continue
-            if isinstance(widget, MediaCard) and bool(widget.property("controllerClone")):
-                continue
-            if isinstance(widget, (QAbstractButton, QLineEdit, MediaCard, ProfileCard)):
-                if isinstance(widget, QLineEdit) and widget.isReadOnly():
-                    continue
-                if widget.focusPolicy() != Qt.NoFocus:
+        stale = False
+        for widget in self._focusable_cache:
+            try:
+                if widget.isVisibleTo(root) and widget.isEnabled():
                     widgets.append(widget)
+            except RuntimeError:
+                stale = True
+                continue
+        if stale:
+            self._focusable_cache_dirty = True
         return widgets
 
     @staticmethod
@@ -4076,8 +4893,13 @@ class MainWindow(QMainWindow):
         keyboard.open()  # non-blocking: controller timer keeps polling
         QTimer.singleShot(70, lambda: self._select_first_controller_widget(keyboard))
 
-    @staticmethod
-    def _clear_layout(layout) -> None:
+    def _invalidate_controller_focusables(self) -> None:
+        self._focusable_cache_dirty = True
+        self._focusable_cache_root = None
+        self._focusable_cache = []
+
+    def _clear_layout(self, layout) -> None:
+        self._invalidate_controller_focusables()
         while layout.count():
             item = layout.takeAt(0)
             widget = item.widget()
@@ -4085,7 +4907,7 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
             child = item.layout()
             if child:
-                MainWindow._clear_layout(child)
+                self._clear_layout(child)
 
 
 APP_STYLESHEET = r"""
@@ -4143,6 +4965,14 @@ QMainWindow, QDialog, #appRoot, #page, #profilePage, #transparentWidget {
 #profileButton:hover { background:#2c2c31; }
 #profileButton[controllerSelected="true"] { border:2px solid #ffffff; }
 #mainScroll, QScrollArea { background: transparent; border: none; }
+#remoteImage8, #remoteImage10, #remoteImage14 {
+    background:#242424;
+    color:#777777;
+    font-size:12px;
+}
+#remoteImage8 { border-radius:8px; }
+#remoteImage10 { border-radius:10px; }
+#remoteImage14 { border-radius:14px; }
 QScrollBar:vertical { background: #0b0b0d; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #45454c; border-radius: 5px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
@@ -4448,15 +5278,30 @@ QMessageBox QPushButton {
 """
 
 
+def _ensure_app_stylesheet() -> None:
+    """Parse the large application stylesheet once, not once per dialog."""
+    app = QApplication.instance()
+    if app is None or bool(app.property("pistickStylesheetApplied")):
+        return
+    app.setStyleSheet(APP_STYLESHEET)
+    app.setProperty("pistickStylesheetApplied", True)
+
+
 def main() -> int:
     print(f"Starting {APP_NAME} {APP_VERSION}")
+    application_attributes = getattr(Qt, "ApplicationAttribute", Qt)
+    share_contexts = getattr(application_attributes, "AA_ShareOpenGLContexts", None)
+    if share_contexts is not None:
+        QApplication.setAttribute(share_contexts, True)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
+    _ensure_app_stylesheet()
     window = MainWindow(AppConfig.load())
     window.show()
-    return app.exec()
+    run_event_loop = getattr(app, "exec", None) or getattr(app, "exec_")
+    return run_event_loop()
 
 
 if __name__ == "__main__":
