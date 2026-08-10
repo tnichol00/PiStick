@@ -158,8 +158,16 @@ APP_VERSION = "3.1.1-on-demand-trailers"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
-CONFIG_PATH = Path(__file__).with_name("config.json")
-STATE_PATH = Path(__file__).with_name("pistick_state.json")
+
+
+def _runtime_file(env_name: str, filename: str) -> Path:
+    """Allow appliance installs to keep private data outside release folders."""
+    configured = os.getenv(env_name, "").strip()
+    return Path(configured).expanduser() if configured else Path(__file__).with_name(filename)
+
+
+CONFIG_PATH = _runtime_file("PISTICK_CONFIG_PATH", "config.json")
+STATE_PATH = _runtime_file("PISTICK_STATE_PATH", "pistick_state.json")
 CACHE_ROOT = Path(
     os.getenv("PISTICK_CACHE_DIR", "").strip()
     or Path(os.getenv("XDG_CACHE_HOME", "").strip() or (Path.home() / ".cache")) / "pistick"
