@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 from pathlib import Path
@@ -34,27 +35,27 @@ class PlaybackAPITests(unittest.TestCase):
     def test_movie_embed_url(self) -> None:
         self.assertEqual(
             getmovie(550),
-            "https://playback.example/base/embed/movie/550?autoplay=1&ds_lang=en",
+            "https://playback.example/base/embed/movie/550",
         )
 
     def test_episode_embed_url(self) -> None:
         self.assertEqual(
             getshow(1399, 1, 3),
-            "https://playback.example/base/embed/tv/1399/1/3?autoplay=1&ds_lang=en&autonext=1",
+            "https://playback.example/base/embed/tv/1399/1/3",
         )
 
-    def test_resume_timestamp_is_added(self) -> None:
+    def test_public_helpers_match_the_documented_api_signatures(self) -> None:
+        self.assertEqual(list(inspect.signature(getmovie).parameters), ["tmdb_number"])
         self.assertEqual(
-            getmovie(550, 1427),
-            "https://playback.example/base/embed/movie/550?autoplay=1&ds_lang=en&startAt=1427",
-        )
-        self.assertEqual(
-            getshow(1399, 1, 3, 812),
-            "https://playback.example/base/embed/tv/1399/1/3?autoplay=1&ds_lang=en&autonext=1&startAt=812",
+            list(inspect.signature(getshow).parameters),
+            ["tmdb_number", "season_number", "episode_number"],
         )
 
     def test_specials_season_is_supported(self) -> None:
-        self.assertIn("/1399/0/1?", getshow(1399, 0, 1))
+        self.assertEqual(
+            getshow(1399, 0, 1),
+            "https://playback.example/base/embed/tv/1399/0/1",
+        )
 
     def test_invalid_identifiers_are_rejected(self) -> None:
         for call in (

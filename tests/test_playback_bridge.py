@@ -57,6 +57,24 @@ class PlaybackBridgeTests(unittest.TestCase):
         self.assertIn("setRunsOnSubFrames(True)", self.main_source)
         self.assertIn('setName("pistick-cross-frame-media-bridge")', self.main_source)
 
+    def test_main_uses_the_documented_api_arguments(self) -> None:
+        module = ast.parse(self.main_source)
+        movie_calls = []
+        show_calls = []
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id == "getmovie":
+                movie_calls.append(node)
+            elif node.func.id == "getshow":
+                show_calls.append(node)
+        self.assertTrue(movie_calls)
+        self.assertTrue(show_calls)
+        self.assertTrue(all(len(call.args) == 1 for call in movie_calls))
+        self.assertTrue(all(len(call.args) == 3 for call in show_calls))
+        self.assertNotIn("startAt", self.main_source)
+        self.assertIn("resume_seconds=start_seconds", self.main_source)
+
     def test_webengine_profile_outlives_pages(self) -> None:
         self.assertIn("_MEDIA_WEB_PROFILE = profile", self.main_source)
         self.assertIn("replacement_page = QWebEnginePage(self)", self.main_source)
@@ -93,6 +111,7 @@ class PlaybackBridgeTests(unittest.TestCase):
             const video = {{
                 currentTime: 42,
                 duration: 100,
+                readyState: 4,
                 clientWidth: 1280,
                 clientHeight: 720,
                 paused: false,
@@ -125,6 +144,13 @@ class PlaybackBridgeTests(unittest.TestCase):
                 action: 'pause'
             }});
             if (!video.pausedByPiStick || childMessages.length !== 1) process.exit(2);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'seek',
+                positionSeconds: 65
+            }});
+            if (video.currentTime !== 65 || childMessages.length !== 2) process.exit(3);
             """
         )
 
@@ -154,6 +180,7 @@ class PlaybackBridgeTests(unittest.TestCase):
             const video = {{
                 currentTime: 18,
                 duration: 90,
+                readyState: 4,
                 clientWidth: 640,
                 clientHeight: 360,
                 paused: false,
@@ -170,6 +197,72 @@ class PlaybackBridgeTests(unittest.TestCase):
             vm.runInContext({bridge}, context);
             if (posted.length === 0) process.exit(1);
             if (posted[0].currentTime !== 18 || posted[0].duration !== 90) process.exit(2);
+            listeners.get('message')({{
+                data: {{
+                    type: 'pistick-media-command',
+                    bridgeToken: 'test-bridge-token',
+                    action: 'seek',
+                    positionSeconds: 45
+                }}
+            }});
+            if (video.currentTime !== 45) process.exit(3);
+            """
+        )
+
+    def test_resume_seek_waits_for_video_metadata(self) -> None:
+        bridge = json.dumps(self.bridge_source)
+        self.run_node(
+            f"""
+            const vm = require('vm');
+            class EventTarget {{
+                constructor() {{ this.listeners = new Map(); }}
+                addEventListener(name, callback) {{
+                    if (!this.listeners.has(name)) this.listeners.set(name, []);
+                    this.listeners.get(name).push(callback);
+                }}
+                dispatch(name, event) {{
+                    for (const callback of this.listeners.get(name) || []) callback(event);
+                }}
+            }}
+            const videoListeners = new Map();
+            const video = {{
+                currentTime: 0,
+                duration: Number.NaN,
+                readyState: 0,
+                clientWidth: 1280,
+                clientHeight: 720,
+                paused: true,
+                ended: false,
+                addEventListener(name, callback) {{
+                    if (!videoListeners.has(name)) videoListeners.set(name, []);
+                    videoListeners.get(name).push(callback);
+                }}
+            }};
+            const window = new EventTarget();
+            window.top = window;
+            window.frames = [];
+            window.setInterval = (callback) => {{ callback(); return 1; }};
+            window.clearInterval = () => {{}};
+            window.postMessage = (data) => window.dispatch('message', {{ data }});
+            const document = {{
+                readyState: 'complete',
+                querySelectorAll: (selector) => selector === 'video' ? [video] : [],
+                addEventListener() {{}}
+            }};
+            const context = {{ window, document, console, Number, Array, Math, Date }};
+            vm.createContext(context);
+            vm.runInContext({bridge}, context);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'seek',
+                positionSeconds: 75
+            }});
+            if (video.currentTime !== 0) process.exit(1);
+            video.duration = 120;
+            video.readyState = 1;
+            for (const callback of videoListeners.get('loadedmetadata') || []) callback();
+            if (video.currentTime !== 75) process.exit(2);
             """
         )
 

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import sys
 import threading
@@ -1746,6 +1747,45 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         return selected;
     };
 
+    const applyPendingSeek = (video) => {
+        const target = Number(window.__pistickPendingSeekSeconds);
+        if (!video || !Number.isFinite(target) || target <= 0) return false;
+        const duration = Number(video.duration);
+        if (video.readyState === 0 || !Number.isFinite(duration) || duration <= 0) {
+            if (!video.__pistickSeekMetadataBound) {
+                video.__pistickSeekMetadataBound = true;
+                video.addEventListener(
+                    'loadedmetadata',
+                    () => applyPendingSeek(video),
+                    { once: true }
+                );
+            }
+            return false;
+        }
+        try {
+            video.currentTime = Math.min(target, Math.max(0, duration - 1));
+            window.__pistickPendingSeekSeconds = null;
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const requestSeek = (value) => {
+        const target = Number(value);
+        if (!Number.isFinite(target) || target <= 0) return;
+        window.__pistickPendingSeekSeconds = target;
+        if (typeof window.pistickSeekTo === 'function') {
+            try {
+                window.pistickSeekTo(target);
+                window.__pistickPendingSeekSeconds = null;
+            } catch (_error) {
+                // Fall through to an ordinary HTML5 video when available.
+            }
+        }
+        applyPendingSeek(localVideo());
+    };
+
     const validProgress = (data) => {
         if (!data || data.type !== progressType) return null;
         if (data.bridgeToken && data.bridgeToken !== bridgeToken) return null;
@@ -1808,10 +1848,12 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
             const result = video.play();
             if (result && typeof result.catch === 'function') result.catch(() => {});
         }
+        if (data.action === 'seek') requestSeek(data.positionSeconds);
         relayToChildren(data);
     });
 
     const bindVideoEvents = () => {
+        applyPendingSeek(localVideo());
         for (const video of document.querySelectorAll('video')) {
             if (video.__pistickProgressEventsBound) continue;
             video.__pistickProgressEventsBound = true;
@@ -2011,6 +2053,31 @@ def get_trailer_web_view_class():
                     return true;
                 })();
                 """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def seek_media(self, position_seconds: float) -> None:
+            try:
+                position = float(position_seconds)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(position) or position <= 0:
+                return
+            bridge_token = json.dumps(self._bridge_token)
+            seek_position = json.dumps(position)
+            self.page().runJavaScript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'seek',
+                        positionSeconds: __PISTICK_SEEK_POSITION__
+                    }, '*');
+                    return true;
+                })();
+                """
+                .replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+                .replace("__PISTICK_SEEK_POSITION__", seek_position)
             )
 
         def request_playback_state(self, callback: Callable[[object], None]) -> None:
@@ -3510,6 +3577,8 @@ class PlaybackDialog(TrailerDialog):
         title: str,
         embed_url: str,
         parent: Optional[QWidget] = None,
+        *,
+        resume_seconds: float = 0.0,
     ):
         super().__init__(
             title,
@@ -3522,7 +3591,37 @@ class PlaybackDialog(TrailerDialog):
         self._progress_timer.timeout.connect(self._poll_progress)
         self._progress_request_pending = False
         self._closing_player = False
+        try:
+            requested_resume = float(resume_seconds)
+        except (TypeError, ValueError):
+            requested_resume = 0.0
+        self._resume_seconds = (
+            requested_resume
+            if math.isfinite(requested_resume) and requested_resume > 0
+            else 0.0
+        )
+        self._resume_attempts = 0
+        self._resume_timer = QTimer(self)
+        self._resume_timer.setInterval(1000)
+        self._resume_timer.timeout.connect(self._try_resume)
+        if self._resume_seconds > 0:
+            self._resume_timer.start()
+            QTimer.singleShot(250, self._try_resume)
         self._progress_timer.start()
+
+    def _try_resume(self) -> None:
+        if self._closing_player or self._resume_seconds <= 0:
+            self._resume_timer.stop()
+            return
+        web = self.trailer_web
+        if web is not None and hasattr(web, "seek_media"):
+            try:
+                web.seek_media(self._resume_seconds)
+            except RuntimeError:
+                pass
+        self._resume_attempts += 1
+        if self._resume_attempts >= 30:
+            self._resume_timer.stop()
 
     def _poll_progress(self) -> None:
         web = self.trailer_web
@@ -3551,10 +3650,14 @@ class PlaybackDialog(TrailerDialog):
         except (TypeError, ValueError):
             return
         if position >= 0 and duration > 0:
+            if self._resume_seconds > 0 and position >= max(0.0, self._resume_seconds - 3.0):
+                self._resume_seconds = 0.0
+                self._resume_timer.stop()
             self.progressReported.emit(position, duration)
 
     def closeEvent(self, event) -> None:
         self._closing_player = True
+        self._resume_timer.stop()
         self._progress_timer.stop()
         super().closeEvent(event)
 
@@ -4114,7 +4217,6 @@ class DetailDialog(QDialog):
                 int(self.media.get("id", 0) or 0),
                 int(payload["season_number"]),
                 int(payload["episode_number"]),
-                start_seconds,
             )
         except (PlaybackAPIError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Playback unavailable", str(exc))
@@ -4137,7 +4239,12 @@ class DetailDialog(QDialog):
 
         def start_playback() -> None:
             self._render(media)
-            self._open_playback_dialog(str(payload["title"]), embed_url, save_progress)
+            self._open_playback_dialog(
+                str(payload["title"]),
+                embed_url,
+                save_progress,
+                resume_seconds=start_seconds,
+            )
 
         self._episode_after_close = start_playback
         if not self.close_episode_picker():
@@ -4174,6 +4281,8 @@ class DetailDialog(QDialog):
         title: str,
         embed_url: str,
         progress_callback: Callable[[float, float], None],
+        *,
+        resume_seconds: float = 0.0,
     ) -> None:
         active = self._active_player_dialog()
         if active is not None:
@@ -4182,7 +4291,12 @@ class DetailDialog(QDialog):
             return
 
         self.close_episode_picker()
-        dialog = PlaybackDialog(title, embed_url, self)
+        dialog = PlaybackDialog(
+            title,
+            embed_url,
+            self,
+            resume_seconds=resume_seconds,
+        )
         self._playback_dialog = dialog
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.controlsReady.connect(self.controlsReady.emit)
@@ -4580,7 +4694,7 @@ class DetailDialog(QDialog):
         saved = self.watch_state.entry(self.profile_id, media) or {}
         start_seconds = int(float(saved.get("position_seconds", 0.0) or 0.0))
         try:
-            embed_url = getmovie(int(media.get("id", 0) or 0), start_seconds)
+            embed_url = getmovie(int(media.get("id", 0) or 0))
         except (PlaybackAPIError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Playback unavailable", str(exc))
             return
@@ -4598,6 +4712,7 @@ class DetailDialog(QDialog):
                 position,
                 duration,
             ),
+            resume_seconds=start_seconds,
         )
 
     def _mark_finished(self, media: dict[str, Any]) -> None:

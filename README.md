@@ -41,22 +41,18 @@ from playback_api import getmovie, getshow
 
 movie_url = getmovie(550)
 episode_url = getshow(1399, 1, 3)
-resumed_movie_url = getmovie(550, 1427)
-resumed_episode_url = getshow(1399, 1, 3, 812)
 ```
 
 The service's base URL is read at runtime from the private `playback_base_url` field in `/etc/pistick/config.json`. The tracked example contains only a placeholder. With a locally configured base URL of `https://playback.example`, the calls produce:
 
 ```text
-https://playback.example/embed/movie/550?autoplay=1&ds_lang=en
-https://playback.example/embed/tv/1399/1/3?autoplay=1&ds_lang=en&autonext=1
-https://playback.example/embed/movie/550?autoplay=1&ds_lang=en&startAt=1427
-https://playback.example/embed/tv/1399/1/3?autoplay=1&ds_lang=en&autonext=1&startAt=812
+https://playback.example/embed/movie/550
+https://playback.example/embed/tv/1399/1/3
 ```
 
-The repository and published releases never contain the real playback host. PiStick loads the resulting page directly in Qt WebEngine. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
+These are the complete requests. PiStick does not append undocumented playback-provider query parameters. The repository and published releases never contain the real playback host. PiStick loads the resulting page directly in Qt WebEngine. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
 
-PiStick always requests autoplay and English subtitles using `autoplay=1` and `ds_lang=en`. TV episode URLs also include `autonext=1`. When saved progress exists, PiStick resumes through the playback provider's `startAt` query parameter. It injects a small frame-local reporter into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, and its progress is relayed to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+When saved progress exists, PiStick first opens the same documented endpoint and then sends the saved timestamp to the embedded player. It injects a small frame-local bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
 
 A custom player can also expose its playback state in one of these ways:
 
@@ -64,7 +60,9 @@ A custom player can also expose its playback state in one of these ways:
 - Use a top-level HTML5 `<video>` element; PiStick reads it automatically.
 - From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the top window.
 
-PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. They are not stored beside secrets in `config.json`.
+For a custom player that does not expose an HTML5 `<video>` element, define `window.pistickSeekTo(seconds)` so PiStick can apply the saved resume position without changing the API URL.
+
+PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. When that title is reopened, the bridge seeks to the saved timestamp after its video metadata becomes available. The values are not stored beside secrets in `config.json`.
 
 Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
 
