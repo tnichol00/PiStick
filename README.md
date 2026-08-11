@@ -48,21 +48,25 @@ resumed_episode_url = getshow(1399, 1, 3, 812)
 The service's base URL is read at runtime from the private `playback_base_url` field in `/etc/pistick/config.json`. The tracked example contains only a placeholder. With a locally configured base URL of `https://playback.example`, the calls produce:
 
 ```text
-https://playback.example/embed/movie/550
-https://playback.example/embed/tv/1399/1/3
-https://playback.example/embed/movie/550?start=1427
-https://playback.example/embed/tv/1399/1/3?start=812
+https://playback.example/embed/movie/550?autoplay=1&ds_lang=en
+https://playback.example/embed/tv/1399/1/3?autoplay=1&ds_lang=en&autonext=1
+https://playback.example/embed/movie/550?autoplay=1&ds_lang=en&startAt=1427
+https://playback.example/embed/tv/1399/1/3?autoplay=1&ds_lang=en&autonext=1&startAt=812
 ```
 
 The repository and published releases never contain the real playback host. PiStick loads the resulting page directly in Qt WebEngine. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
 
-For exact resume support, the embed page must use the `start` query parameter and expose its playback state in one of these ways:
+PiStick always requests autoplay and English subtitles using `autoplay=1` and `ds_lang=en`. TV episode URLs also include `autonext=1`. When saved progress exists, PiStick resumes through the playback provider's `startAt` query parameter. It injects a small frame-local reporter into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, and its progress is relayed to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+
+A custom player can also expose its playback state in one of these ways:
 
 - Define `window.pistickGetPlaybackState()` and return `{currentTime, duration}`.
 - Use a top-level HTML5 `<video>` element; PiStick reads it automatically.
-- From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the parent window.
+- From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the top window.
 
-PiStick polls the state every five seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. They are not stored beside secrets in `config.json`.
+PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. They are not stored beside secrets in `config.json`.
+
+Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
 
 ## Install PiStick
 
@@ -380,6 +384,16 @@ journalctl -u pistick.service -b -n 100 --no-pager
 ```
 
 No playback API key is required. The TMDB token is used only for title metadata; `playback_base_url` supplies the private host, and movie or episode paths are built from the selected TMDB number, season, and episode.
+
+### The log shows iframe or cross-origin JavaScript warnings
+
+These messages come from the embed page rather than the TMDB request:
+
+- `document.domain mutation is ignored` means the page still uses the obsolete `document.domain` workaround. Remove that assignment.
+- `Allow attribute will take precedence over 'allowfullscreen'` means an iframe contains both attributes. Use `allow="autoplay; encrypted-media; fullscreen"` and remove the separate `allowfullscreen` attribute.
+- `Blocked a frame ... Protocols, domains, and ports must match` means code is directly accessing a parent or child frame from a different origin. Use `postMessage()`; matching only the domain name is insufficient when the scheme, subdomain, or port differs.
+
+PiStick's built-in progress bridge follows this model and runs separately inside every frame. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
 
 ## Creating a release
 

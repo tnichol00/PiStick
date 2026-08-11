@@ -1711,6 +1711,130 @@ class RemoteImage(QLabel):
 
 TrailerWebView = None
 _WEBENGINE_ATTEMPTED = False
+_MEDIA_WEB_PROFILE = None
+
+
+_PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
+(() => {
+    const bridgeToken = __PISTICK_BRIDGE_TOKEN__;
+    if (window.__pistickMediaBridgeToken === bridgeToken) return;
+    window.__pistickMediaBridgeToken = bridgeToken;
+
+    const progressType = 'pistick-playback-progress';
+    const commandType = 'pistick-media-command';
+
+    const numberOrZero = (value) => {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : 0;
+    };
+
+    const localVideo = () => {
+        const videos = Array.from(document.querySelectorAll('video'));
+        let selected = null;
+        let selectedScore = -1;
+        for (const video of videos) {
+            const area = Math.max(0, numberOrZero(video.clientWidth))
+                * Math.max(0, numberOrZero(video.clientHeight));
+            const duration = Math.max(0, numberOrZero(video.duration));
+            const playingBonus = (!video.paused && !video.ended) ? 1000000000000 : 0;
+            const score = playingBonus + (area * 1000) + duration;
+            if (score > selectedScore) {
+                selected = video;
+                selectedScore = score;
+            }
+        }
+        return selected;
+    };
+
+    const validProgress = (data) => {
+        if (!data || data.type !== progressType) return null;
+        if (data.bridgeToken && data.bridgeToken !== bridgeToken) return null;
+        const currentTime = numberOrZero(data.currentTime ?? data.position);
+        const duration = numberOrZero(data.duration);
+        if (currentTime < 0 || duration <= 0) return null;
+        return { currentTime, duration, updatedAt: Date.now() };
+    };
+
+    const saveProgress = (data) => {
+        const progress = validProgress(data);
+        if (progress) window.__pistickPlaybackState = progress;
+    };
+
+    const sendProgress = () => {
+        const video = localVideo();
+        if (!video) return;
+        const currentTime = numberOrZero(video.currentTime);
+        const duration = numberOrZero(video.duration);
+        if (currentTime < 0 || duration <= 0) return;
+        const data = {
+            type: progressType,
+            bridgeToken,
+            currentTime,
+            duration
+        };
+        try {
+            if (window === window.top) saveProgress(data);
+            else window.top.postMessage(data, '*');
+        } catch (_error) {
+            // Cross-origin WindowProxy.postMessage is allowed. If a sandboxed
+            // frame blocks even that operation, the next polling pass can retry.
+        }
+    };
+
+    const relayToChildren = (message) => {
+        for (let index = 0; index < window.frames.length; index += 1) {
+            try {
+                window.frames[index].postMessage(message, '*');
+            } catch (_error) {
+                // Never inspect a child Window directly; only post to it.
+            }
+        }
+    };
+
+    // This listener is registered on the current frame's own Window. It never
+    // reads parent.addEventListener or iframe.contentWindow properties.
+    window.addEventListener('message', (event) => {
+        const data = event && event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === progressType) {
+            if (window === window.top) saveProgress(data);
+            return;
+        }
+        if (data.type !== commandType || data.bridgeToken !== bridgeToken) return;
+
+        const video = localVideo();
+        if (video && data.action === 'pause') video.pause();
+        if (video && data.action === 'play') {
+            const result = video.play();
+            if (result && typeof result.catch === 'function') result.catch(() => {});
+        }
+        relayToChildren(data);
+    });
+
+    const bindVideoEvents = () => {
+        for (const video of document.querySelectorAll('video')) {
+            if (video.__pistickProgressEventsBound) continue;
+            video.__pistickProgressEventsBound = true;
+            for (const eventName of ['timeupdate', 'durationchange', 'loadedmetadata', 'pause', 'ended']) {
+                video.addEventListener(eventName, sendProgress, { passive: true });
+            }
+        }
+        sendProgress();
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindVideoEvents, { once: true });
+    } else {
+        bindVideoEvents();
+    }
+    const progressTimer = window.setInterval(bindVideoEvents, 1000);
+    window.addEventListener(
+        'pagehide',
+        () => window.clearInterval(progressTimer),
+        { once: true }
+    );
+})();
+"""
 
 
 def get_trailer_web_view_class():
@@ -1726,6 +1850,7 @@ def get_trailer_web_view_class():
             from PySide6.QtWebEngineCore import (
                 QWebEnginePage,
                 QWebEngineProfile,
+                QWebEngineScript,
                 QWebEngineSettings,
             )
             from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -1733,6 +1858,7 @@ def get_trailer_web_view_class():
             from PyQt5.QtWebEngineWidgets import (  # type: ignore[no-redef]
                 QWebEnginePage,
                 QWebEngineProfile,
+                QWebEngineScript,
                 QWebEngineSettings,
                 QWebEngineView,
             )
@@ -1746,20 +1872,43 @@ def get_trailer_web_view_class():
 
         def __init__(self, parent: Optional[QWidget] = None):
             super().__init__(parent)
-            # A media-scoped profile/page lets Chromium's renderer and page data
-            # be torn down when the player closes. Using Qt's default profile
-            # would keep the heavy browser session alive for the rest of PiStick.
-            try:
-                self._profile = QWebEngineProfile("pistick-embedded-media", self)
-            except TypeError:
-                self._profile = QWebEngineProfile(self)
-            self._configure_profile(self._profile, QWebEngineProfile)
+            # The profile must outlive every page that uses it. A shared,
+            # application-owned profile avoids Qt releasing a dialog-scoped
+            # profile while its asynchronous WebEnginePage is still shutting
+            # down. Pages remain view-scoped and are discarded after playback.
+            global _MEDIA_WEB_PROFILE
+            if _MEDIA_WEB_PROFILE is None:
+                profile_parent = QApplication.instance()
+                try:
+                    profile = QWebEngineProfile("pistick-embedded-media", profile_parent)
+                except TypeError:
+                    profile = QWebEngineProfile(profile_parent)
+                self._configure_profile(profile, QWebEngineProfile)
+                _MEDIA_WEB_PROFILE = profile
+            self._profile = _MEDIA_WEB_PROFILE
             self._page = QWebEnginePage(self._profile, self)
             # QWebEngineView owns its automatically created page. On PySide6,
             # setPage() can destroy that page immediately, which also
             # invalidates its Python wrapper. Do not call deleteLater() on the
             # old wrapper after setPage(); Qt has already handled its lifetime.
             self.setPage(self._page)
+            self._bridge_token = uuid.uuid4().hex
+            self._bridge_script = QWebEngineScript()
+            self._bridge_script.setName("pistick-cross-frame-media-bridge")
+            injection_points = getattr(QWebEngineScript, "InjectionPoint", QWebEngineScript)
+            self._bridge_script.setInjectionPoint(
+                getattr(injection_points, "DocumentReady")
+            )
+            worlds = getattr(QWebEngineScript, "ScriptWorldId", QWebEngineScript)
+            self._bridge_script.setWorldId(getattr(worlds, "MainWorld", 0))
+            self._bridge_script.setRunsOnSubFrames(True)
+            self._bridge_script.setSourceCode(
+                _PLAYBACK_FRAME_BRIDGE_SOURCE.replace(
+                    "__PISTICK_BRIDGE_TOKEN__",
+                    json.dumps(self._bridge_token),
+                )
+            )
+            self._page.scripts().insert(self._bridge_script)
 
             web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
             for name, enabled in (
@@ -1822,69 +1971,79 @@ def get_trailer_web_view_class():
             return False
 
         def play_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
             self.page().runJavaScript(
                 """
                 (() => {
                     if (typeof window.pistickPlayTrailer === 'function') {
-                        return window.pistickPlayTrailer();
+                        window.pistickPlayTrailer();
                     }
                     const video = document.querySelector('video');
-                    if (!video) return false;
-                    const result = video.play();
-                    if (result && typeof result.catch === 'function') result.catch(() => {});
+                    if (video) {
+                        const result = video.play();
+                        if (result && typeof result.catch === 'function') result.catch(() => {});
+                    }
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'play'
+                    }, '*');
                     return true;
                 })();
-                """
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
             )
 
         def pause_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
             self.page().runJavaScript(
                 """
                 (() => {
                     if (typeof window.pistickPauseTrailer === 'function') {
-                        return window.pistickPauseTrailer();
+                        window.pistickPauseTrailer();
                     }
                     const video = document.querySelector('video');
-                    if (!video) return false;
-                    video.pause();
+                    if (video) video.pause();
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'pause'
+                    }, '*');
                     return true;
                 })();
-                """
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
             )
 
         def request_playback_state(self, callback: Callable[[object], None]) -> None:
-            """Read progress exposed by the legal embed page or its HTML5 video."""
-            self.page().runJavaScript(
-                """
-                (() => {
-                    try {
-                        if (!window.__pistickProgressBridgeInstalled) {
-                            window.__pistickProgressBridgeInstalled = true;
-                            window.addEventListener('message', (event) => {
-                                const data = event && event.data;
-                                if (!data || data.type !== 'pistick-playback-progress') return;
-                                window.__pistickPlaybackState = {
-                                    currentTime: Number(data.currentTime || data.position || 0),
-                                    duration: Number(data.duration || 0)
+            """Read progress reported by the page or any nested player frame."""
+            try:
+                self.page().runJavaScript(
+                    """
+                    (() => {
+                        try {
+                            if (typeof window.pistickGetPlaybackState === 'function') {
+                                const state = window.pistickGetPlaybackState();
+                                if (state && typeof state.then !== 'function') return state;
+                            }
+                            const video = document.querySelector('video');
+                            if (video) {
+                                return {
+                                    currentTime: Number(video.currentTime || 0),
+                                    duration: Number.isFinite(video.duration) ? Number(video.duration) : 0
                                 };
-                            });
+                            }
+                            const state = window.__pistickPlaybackState || null;
+                            if (!state) return null;
+                            if (state.updatedAt && Date.now() - state.updatedAt > 15000) return null;
+                            return state;
+                        } catch (_error) {
+                            return null;
                         }
-                        if (typeof window.pistickGetPlaybackState === 'function') {
-                            return window.pistickGetPlaybackState();
-                        }
-                        const video = document.querySelector('video');
-                        if (!video) return window.__pistickPlaybackState || null;
-                        return {
-                            currentTime: Number(video.currentTime || 0),
-                            duration: Number.isFinite(video.duration) ? Number(video.duration) : 0
-                        };
-                    } catch (_error) {
-                        return null;
-                    }
-                })();
-                """,
-                callback,
-            )
+                    })();
+                    """,
+                    callback,
+                )
+            except RuntimeError:
+                callback(None)
 
         # Compatibility aliases for the existing trailer dialog.
         play_trailer = play_media
@@ -1899,15 +2058,15 @@ def get_trailer_web_view_class():
             try:
                 self.stop()
                 self.page().setAudioMuted(True)
-                self.pause_media()
-                self.setUrl(QUrl("about:blank"))
+                # setPage() immediately deletes the current page because that
+                # page is parented to this view. The shared profile therefore
+                # never begins teardown while a page still refers to it.
+                replacement_page = QWebEnginePage(self)
+                self.setPage(replacement_page)
+                self._page = replacement_page
             except RuntimeError:
                 pass
-            # The page and profile are QObject children of this view. The
-            # dialog schedules the view itself for deletion immediately after
-            # dispose(), so Qt will destroy both children in the correct order.
-            # Deleting them independently can race QWebEngineView teardown and
-            # leave PySide holding another invalid C++ wrapper.
+            self._bridge_script = None
 
     _TrailerWebView.__name__ = "TrailerWebView"
     TrailerWebView = _TrailerWebView
@@ -3359,17 +3518,31 @@ class PlaybackDialog(TrailerDialog):
             player_label="Now Playing",
         )
         self._progress_timer = QTimer(self)
-        self._progress_timer.setInterval(5000)
+        self._progress_timer.setInterval(2000)
         self._progress_timer.timeout.connect(self._poll_progress)
+        self._progress_request_pending = False
+        self._closing_player = False
         self._progress_timer.start()
 
     def _poll_progress(self) -> None:
         web = self.trailer_web
-        if web is None or not hasattr(web, "request_playback_state"):
+        if (
+            self._closing_player
+            or self._progress_request_pending
+            or web is None
+            or not hasattr(web, "request_playback_state")
+        ):
             return
-        web.request_playback_state(self._progress_received)
+        self._progress_request_pending = True
+        try:
+            web.request_playback_state(self._progress_received)
+        except RuntimeError:
+            self._progress_request_pending = False
 
     def _progress_received(self, state: object) -> None:
+        self._progress_request_pending = False
+        if self._closing_player:
+            return
         if not isinstance(state, dict):
             return
         try:
@@ -3381,8 +3554,8 @@ class PlaybackDialog(TrailerDialog):
             self.progressReported.emit(position, duration)
 
     def closeEvent(self, event) -> None:
+        self._closing_player = True
         self._progress_timer.stop()
-        self._poll_progress()
         super().closeEvent(event)
 
 
