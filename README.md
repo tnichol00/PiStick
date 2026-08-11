@@ -15,7 +15,7 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - Season and episode selection with per-profile resume data
 - Embedded movie and episode playback from TMDB-number-based URLs
 - Client-side 1080p HLS selection with the best available fallback
-- Playback-only ad, tracker, pop-up, and redirect blocking
+- Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
 - On-demand YouTube trailer screen with controller play/pause
 - Low-memory mode for the original Raspberry Pi Zero W
 - Manual, release-only installation and updates with rollback
@@ -76,21 +76,29 @@ Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct r
 
 Ad blocking is enabled by default only for movie and episode playback. YouTube trailers keep their separate, unfiltered browser profile so a playback rule cannot break trailers.
 
-On Raspberry Pi, the Qt WebEngine profile blocks known ad and tracker hosts before requests reach Chromium, rejects pop-up windows and off-origin top-level redirects, and injects cosmetic filtering into every frame. On Windows, Edge WebView2 keeps its built-in tracking protection enabled while PiStick blocks pop-ups, late `fetch`/XHR/beacon ad requests, ad elements, and attempts to replace the API page with an off-origin redirect. PiStick does not disable browser security, proxy HTTPS traffic, or broadly block URL paths that might contain video, HLS, or subtitle data.
+PiStick combines its built-in rules with the maintained [StevenBlack unified ad/malware + adult-domain hosts list](https://github.com/StevenBlack/hosts). The upstream project documents its source-specific licenses and attribution. The list is downloaded directly over HTTPS, validated, normalized, cached locally, and refreshed in the background when it is more than seven days old. If the first download or a later refresh fails, playback continues with the last cache and built-in rules.
 
-The built-in host list is intentionally conservative. Extra domains can be added privately without changing tracked code:
+On Raspberry Pi, the Qt WebEngine profile blocks matching hosts before requests reach Chromium, rejects pop-up windows and off-origin top-level redirects, and injects cosmetic filtering into every frame. On Windows, all playback WebView2 requests—including requests from cross-origin nested frames—pass through a random-port proxy bound only to `127.0.0.1`. The proxy checks the destination hostname and then tunnels allowed HTTPS bytes unchanged; it does not decrypt, inspect, or modify the video stream. If `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` already contains a different proxy, PiStick preserves it and falls back to browser/in-page filtering.
+
+On both engines, nested playback frames are sandboxed with only the permissions needed for scripts, autoplay, encrypted media, and fullscreen playback. Pop-ups, downloads, payment requests, and attempts to navigate the top-level PiStick player are not permitted. PiStick does not disable browser security or broadly block URL paths that might contain video, HLS, or subtitle data.
+
+The configured `playback_base_url` host is automatically allowed. Extra block or allow domains can be added privately without changing tracked code:
 
 ```json
 {
   "adblock_enabled": true,
+  "adblock_online_lists": true,
   "adblock_domains": [
     "ads.example",
     "*.popups.example"
+  ],
+  "adblock_allow_domains": [
+    "video-cdn.example"
   ]
 }
 ```
 
-Add only hostnames, without `https://`, a path, or a query. The installer preserves these fields during updates and rollback. Set `adblock_enabled` to `false` if a playback provider requires a blocked host.
+Add only hostnames, without `https://`, a path, or a query. The installer preserves these fields during updates and rollback. If a legitimate provider or CDN is blocked, add it to `adblock_allow_domains`. Set `adblock_online_lists` to `false` to use only built-in/private rules, or set `adblock_enabled` to `false` to disable all playback filtering.
 
 ### Testing playback on Windows
 
@@ -480,7 +488,7 @@ GitHub's automatic source archive is enough; no separate ZIP asset is required. 
 - TMDB metadata and posters come from TMDB.
 - Trailers play through YouTube.
 - Selecting playback sends the TMDB title number—and, for TV, the season and episode numbers—to the configured playback host.
-- The playback ad blocker uses a bundled host list and optional domains stored only in the private local configuration; it does not download or report browsing data to a filtering service.
+- The playback ad blocker refreshes its public hosts list directly from `raw.githubusercontent.com` at most once every seven days. That request contains no title, playback URL, profile, or watch-history data. The normalized list is cached locally; private block/allow domains stay in the private configuration.
 - Profiles and watch history stay on the Pi.
 - The TMDB token and playback base URL are stored at `/etc/pistick/config.json` with restricted permissions.
 - The installer does not collect or store a GitHub credential.

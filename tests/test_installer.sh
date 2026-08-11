@@ -205,7 +205,9 @@ import sys
 path = Path(sys.argv[1])
 payload = json.loads(path.read_text(encoding="utf-8"))
 payload["adblock_enabled"] = True
+payload["adblock_online_lists"] = True
 payload["adblock_domains"] = ["ads.private-example.test"]
+payload["adblock_allow_domains"] = ["video.private-example.test"]
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 printf '{"profiles":[{"id":"kept"}],"watch_state":{}}\n' >"${TEST_ROOT}/var/lib/pistick/user-data.json"
@@ -217,6 +219,7 @@ run_installed_updater
 assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
 assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "ads.private-example.test"
+assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_allow_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "video.private-example.test"
 
 # A newer published pre-release is installed; a newer draft is ignored.
 release_two="$(make_release 202 v1.1.0-alpha second)"

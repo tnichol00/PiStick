@@ -18,10 +18,13 @@ from requests.adapters import HTTPAdapter
 
 from adblock import (
     AdBlockSettings,
+    add_webview_proxy_argument,
     build_playback_adblock_script,
     is_blocked_ad_url,
     load_adblock_settings,
     same_origin,
+    start_adblock_cache_refresh,
+    start_playback_adblock_proxy,
 )
 from playback_api import PlaybackAPIError, getmovie, getshow
 
@@ -164,7 +167,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.4.0-playback-controls"
+APP_VERSION = "3.5.0-strong-adblock"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -183,6 +186,7 @@ CACHE_ROOT = Path(
     os.getenv("PISTICK_CACHE_DIR", "").strip()
     or Path(os.getenv("XDG_CACHE_HOME", "").strip() or (Path.home() / ".cache")) / "pistick"
 )
+ADBLOCK_CACHE_PATH = CACHE_ROOT / "adblock" / "stevenblack-unified-porn.txt"
 
 
 def _system_memory_mb() -> int:
@@ -1761,10 +1765,37 @@ _WEBENGINE_ATTEMPTED = False
 _TRAILER_WEB_PROFILE = None
 _PLAYBACK_WEB_PROFILE = None
 _PLAYBACK_AD_INTERCEPTOR = None
+_PLAYBACK_ADBLOCK_SETTINGS = None
+_PLAYBACK_ADBLOCK_REFRESH_THREAD = None
 WindowsPlaybackWebView = None
 _WINDOWS_WEBVIEW_ATTEMPTED = False
 _WINDOWS_WEBVIEW_INITIALIZED = False
 _WINDOWS_WEBVIEW_ERROR = ""
+_WINDOWS_ADBLOCK_PROXY = None
+
+
+def _playback_adblock_settings() -> AdBlockSettings:
+    """Return one live settings object shared by scripts, interceptors, and proxy."""
+    global _PLAYBACK_ADBLOCK_SETTINGS
+    global _PLAYBACK_ADBLOCK_REFRESH_THREAD
+    if _PLAYBACK_ADBLOCK_SETTINGS is None:
+        _PLAYBACK_ADBLOCK_SETTINGS = load_adblock_settings(
+            CONFIG_PATH,
+            ADBLOCK_CACHE_PATH,
+        )
+        _PLAYBACK_ADBLOCK_REFRESH_THREAD = start_adblock_cache_refresh(
+            _PLAYBACK_ADBLOCK_SETTINGS,
+            ADBLOCK_CACHE_PATH,
+        )
+    return _PLAYBACK_ADBLOCK_SETTINGS
+
+
+def _stop_windows_adblock_proxy() -> None:
+    global _WINDOWS_ADBLOCK_PROXY
+    proxy = _WINDOWS_ADBLOCK_PROXY
+    _WINDOWS_ADBLOCK_PROXY = None
+    if proxy is not None:
+        proxy.stop()
 
 
 def _initialize_windows_playback_webview() -> bool:
@@ -1772,6 +1803,7 @@ def _initialize_windows_playback_webview() -> bool:
     global _WINDOWS_WEBVIEW_ATTEMPTED
     global _WINDOWS_WEBVIEW_INITIALIZED
     global _WINDOWS_WEBVIEW_ERROR
+    global _WINDOWS_ADBLOCK_PROXY
 
     if _WINDOWS_WEBVIEW_ATTEMPTED:
         return _WINDOWS_WEBVIEW_INITIALIZED
@@ -1781,6 +1813,30 @@ def _initialize_windows_playback_webview() -> bool:
         return False
 
     try:
+        adblock_settings = _playback_adblock_settings()
+        if adblock_settings.enabled:
+            try:
+                proxy = start_playback_adblock_proxy(adblock_settings)
+            except OSError as exc:
+                proxy = None
+                print(
+                    "[PiStick] Loopback ad-block proxy unavailable; "
+                    f"using browser filtering only ({exc.__class__.__name__})."
+                )
+            if proxy is not None:
+                arguments, installed = add_webview_proxy_argument(
+                    os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ""),
+                    proxy.port,
+                )
+                if installed:
+                    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = arguments
+                    _WINDOWS_ADBLOCK_PROXY = proxy
+                else:
+                    proxy.stop()
+                    print(
+                        "[PiStick] Existing WebView2 proxy configuration retained; "
+                        "PiStick network ad blocking is using in-page rules only."
+                    )
         # Qt WebView defaults to its "native" plug-in, but pin the explicit key
         # so an installed Qt WebEngine plug-in cannot win by load order.
         os.environ["QT_WEBVIEW_PLUGIN"] = "webview2"
@@ -1793,6 +1849,7 @@ def _initialize_windows_playback_webview() -> bool:
         QtWebView.initialize()
         _WINDOWS_WEBVIEW_INITIALIZED = True
     except (ImportError, OSError, RuntimeError) as exc:
+        _stop_windows_adblock_proxy()
         _WINDOWS_WEBVIEW_ERROR = str(exc).strip() or exc.__class__.__name__
     return _WINDOWS_WEBVIEW_INITIALIZED
 
@@ -2185,7 +2242,7 @@ def get_trailer_web_view_class():
             super().__init__(parent)
             self._block_ads = bool(block_ads)
             self._adblock_settings = (
-                load_adblock_settings(CONFIG_PATH)
+                _playback_adblock_settings()
                 if self._block_ads
                 else AdBlockSettings(enabled=False, blocked_hosts=frozenset())
             )
@@ -2537,7 +2594,7 @@ def get_windows_playback_web_view_class():
             self._disposed = False
             self._capabilities_reported = False
             self._adblock_settings = (
-                load_adblock_settings(CONFIG_PATH)
+                _playback_adblock_settings()
                 if block_ads
                 else AdBlockSettings(enabled=False, blocked_hosts=frozenset())
             )
@@ -7097,6 +7154,7 @@ def _ensure_app_stylesheet() -> None:
 
 def main() -> int:
     print(f"Starting {APP_NAME} {APP_VERSION}")
+    _playback_adblock_settings()
     # Qt WebView must select its native Windows backend before QApplication
     # creates a platform graphics context.
     _initialize_windows_playback_webview()
@@ -7108,6 +7166,7 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
+    app.aboutToQuit.connect(_stop_windows_adblock_proxy)
     _ensure_app_stylesheet()
     window = MainWindow(AppConfig.load())
     window.show()
