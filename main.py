@@ -157,7 +157,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.2.0-embedded-playback"
+APP_VERSION = "3.2.1-windows-webview2"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -1713,6 +1713,50 @@ class RemoteImage(QLabel):
 TrailerWebView = None
 _WEBENGINE_ATTEMPTED = False
 _MEDIA_WEB_PROFILE = None
+WindowsPlaybackWebView = None
+_WINDOWS_WEBVIEW_ATTEMPTED = False
+_WINDOWS_WEBVIEW_INITIALIZED = False
+_WINDOWS_WEBVIEW_ERROR = ""
+
+
+def _initialize_windows_playback_webview() -> bool:
+    """Prepare Qt WebView's Edge WebView2 backend before QApplication exists."""
+    global _WINDOWS_WEBVIEW_ATTEMPTED
+    global _WINDOWS_WEBVIEW_INITIALIZED
+    global _WINDOWS_WEBVIEW_ERROR
+
+    if _WINDOWS_WEBVIEW_ATTEMPTED:
+        return _WINDOWS_WEBVIEW_INITIALIZED
+    _WINDOWS_WEBVIEW_ATTEMPTED = True
+
+    if sys.platform != "win32" or QT_BINDING != "PySide6":
+        return False
+
+    try:
+        # Qt WebView defaults to its "native" plug-in, but pin the explicit key
+        # so an installed Qt WebEngine plug-in cannot win by load order.
+        os.environ["QT_WEBVIEW_PLUGIN"] = "webview2"
+        from PySide6.QtWebView import QWebView, QtWebView
+
+        # QWebView's public QWindow API was added in Qt/PySide 6.11. Merely
+        # importing an older QtWebView module is therefore not sufficient.
+        if not hasattr(QWebView, "runJavaScript"):
+            raise RuntimeError("PySide6.QtWebView.QWebView is unavailable")
+        QtWebView.initialize()
+        _WINDOWS_WEBVIEW_INITIALIZED = True
+    except (ImportError, OSError, RuntimeError) as exc:
+        _WINDOWS_WEBVIEW_ERROR = str(exc).strip() or exc.__class__.__name__
+    return _WINDOWS_WEBVIEW_INITIALIZED
+
+
+def _windows_playback_unavailable_message() -> str:
+    message = (
+        "Windows playback needs PySide6 6.11 or newer and the Microsoft Edge "
+        "WebView2 Runtime. Run: py -m pip install --upgrade \"PySide6>=6.11,<7\""
+    )
+    if _WINDOWS_WEBVIEW_ERROR:
+        return f"{message}\n\nDetails: {_WINDOWS_WEBVIEW_ERROR}"
+    return message
 
 
 _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
@@ -2138,6 +2182,259 @@ def get_trailer_web_view_class():
     _TrailerWebView.__name__ = "TrailerWebView"
     TrailerWebView = _TrailerWebView
     return TrailerWebView
+
+
+def get_windows_playback_web_view_class():
+    """Return a QWidget wrapper around Windows' native Edge WebView2 view."""
+    global WindowsPlaybackWebView
+    if WindowsPlaybackWebView is not None:
+        return WindowsPlaybackWebView
+    if not _WINDOWS_WEBVIEW_INITIALIZED:
+        return None
+
+    try:
+        from PySide6.QtWebView import QWebView, QWebViewLoadingInfo
+    except (ImportError, OSError):
+        return None
+
+    load_status = getattr(QWebViewLoadingInfo, "LoadStatus", None)
+    load_succeeded = getattr(load_status, "Succeeded", None)
+    load_failed = getattr(load_status, "Failed", None)
+    load_stopped = getattr(load_status, "Stopped", None)
+
+    class _WindowsPlaybackWebView(QWidget):
+        """Edge-backed player used on Windows when Qt WebEngine lacks HLS codecs."""
+
+        clicked = Signal()
+        loadFinished = Signal(bool)
+
+        def __init__(self, parent: Optional[QWidget] = None):
+            super().__init__(parent)
+            self._bridge_token = uuid.uuid4().hex
+            self._disposed = False
+            self._capabilities_reported = False
+            self._native_view = QWebView()
+            window_type = getattr(Qt, "WindowType", Qt)
+            no_focus = getattr(window_type, "WindowDoesNotAcceptFocus", None)
+            if no_focus is not None:
+                self._native_view.setFlag(no_focus, True)
+            self._native_view.loadingChanged.connect(self._loading_changed)
+            self._window_container = QWidget.createWindowContainer(
+                self._native_view,
+                self,
+            )
+            self._window_container.setFocusPolicy(Qt.NoFocus)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            layout.addWidget(self._window_container)
+
+        def _run_javascript(
+            self,
+            source: str,
+            callback: Optional[Callable[[object], None]] = None,
+        ) -> None:
+            if self._disposed:
+                if callback is not None:
+                    callback(None)
+                return
+            result_callback = callback or (lambda _result: None)
+            try:
+                self._native_view.runJavaScript(source, result_callback)
+            except (RuntimeError, TypeError):
+                result_callback(None)
+
+        def _loading_changed(self, info) -> None:
+            if self._disposed:
+                return
+            try:
+                status = info.status()
+            except (AttributeError, RuntimeError):
+                return
+            if status == load_succeeded:
+                source = _PLAYBACK_FRAME_BRIDGE_SOURCE.replace(
+                    "__PISTICK_BRIDGE_TOKEN__",
+                    json.dumps(self._bridge_token),
+                )
+                self._run_javascript(source, self._bridge_ready)
+            elif status in {load_failed, load_stopped}:
+                self.loadFinished.emit(False)
+
+        def _bridge_ready(self, _result: object) -> None:
+            if self._disposed:
+                return
+            if not self._capabilities_reported:
+                self._run_javascript(
+                    """
+                    (() => JSON.stringify({
+                        userAgent: navigator.userAgent || '',
+                        mediaSource: typeof MediaSource !== 'undefined',
+                        h264Aac: typeof MediaSource !== 'undefined'
+                            && typeof MediaSource.isTypeSupported === 'function'
+                            && MediaSource.isTypeSupported(
+                                'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'
+                            )
+                    }))();
+                    """,
+                    self._media_capabilities_received,
+                )
+            self.loadFinished.emit(True)
+
+        def _media_capabilities_received(self, result: object) -> None:
+            self._capabilities_reported = True
+            capabilities = self._decode_javascript_result(result)
+            if not isinstance(capabilities, dict):
+                return
+            user_agent = str(capabilities.get("userAgent") or "")
+            engine = "Edge WebView2" if "Edg/" in user_agent else "unknown native WebView"
+            hls_ready = bool(capabilities.get("mediaSource")) and bool(
+                capabilities.get("h264Aac")
+            )
+            print(
+                f"[PiStick] Windows playback engine: {engine}; "
+                f"H.264/AAC MSE: {'available' if hls_ready else 'unavailable'}"
+            )
+
+        def setUrl(self, url: QUrl) -> None:
+            self._native_view.setUrl(url)
+
+        def mouseReleaseEvent(self, event) -> None:
+            self.clicked.emit()
+            super().mouseReleaseEvent(event)
+
+        def play_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    const video = document.querySelector('video');
+                    if (video) {
+                        const result = video.play();
+                        if (result && typeof result.catch === 'function') result.catch(() => {});
+                    }
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'play'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def pause_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    const video = document.querySelector('video');
+                    if (video) video.pause();
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'pause'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def seek_media(self, position_seconds: float) -> None:
+            try:
+                position = float(position_seconds)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(position) or position <= 0:
+                return
+            bridge_token = json.dumps(self._bridge_token)
+            seek_position = json.dumps(position)
+            self._run_javascript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'seek',
+                        positionSeconds: __PISTICK_SEEK_POSITION__
+                    }, '*');
+                    return true;
+                })();
+                """
+                .replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+                .replace("__PISTICK_SEEK_POSITION__", seek_position)
+            )
+
+        @staticmethod
+        def _decode_javascript_result(result: object) -> object:
+            decoded = result
+            for _attempt in range(2):
+                if not isinstance(decoded, str) or not decoded.strip():
+                    break
+                try:
+                    decoded = json.loads(decoded)
+                except (TypeError, ValueError):
+                    break
+            return decoded
+
+        def request_playback_state(self, callback: Callable[[object], None]) -> None:
+            def result_received(result: object) -> None:
+                callback(self._decode_javascript_result(result))
+
+            self._run_javascript(
+                """
+                (() => {
+                    try {
+                        let state = null;
+                        if (typeof window.pistickGetPlaybackState === 'function') {
+                            const reported = window.pistickGetPlaybackState();
+                            if (reported && typeof reported.then !== 'function') state = reported;
+                        }
+                        if (!state) {
+                            const video = document.querySelector('video');
+                            if (video) {
+                                state = {
+                                    currentTime: Number(video.currentTime || 0),
+                                    duration: Number.isFinite(video.duration) ? Number(video.duration) : 0
+                                };
+                            }
+                        }
+                        if (!state) state = window.__pistickPlaybackState || null;
+                        if (state && state.updatedAt && Date.now() - state.updatedAt > 15000) {
+                            state = null;
+                        }
+                        return state ? JSON.stringify(state) : '';
+                    } catch (_error) {
+                        return '';
+                    }
+                })();
+                """,
+                result_received,
+            )
+
+        # Compatibility aliases for TrailerDialog's shared controls.
+        play_trailer = play_media
+        pause_trailer = pause_media
+
+        def dispose(self) -> None:
+            if self._disposed:
+                return
+            self._disposed = True
+            try:
+                self._native_view.stop()
+                self._native_view.setUrl(QUrl("about:blank"))
+            except RuntimeError:
+                pass
+
+    _WindowsPlaybackWebView.__name__ = "WindowsPlaybackWebView"
+    WindowsPlaybackWebView = _WindowsPlaybackWebView
+    return WindowsPlaybackWebView
+
+
+def get_playback_web_view_class():
+    """Select a codec-capable player without changing the documented API URL."""
+    if sys.platform == "win32" and QT_BINDING == "PySide6":
+        return get_windows_playback_web_view_class()
+    return get_trailer_web_view_class()
 
 
 class SmoothScrollArea(QScrollArea):
@@ -3233,7 +3530,7 @@ class TextInputDialog(QDialog):
 
 
 class TrailerDialog(QDialog):
-    """On-demand embedded player whose Chromium lifetime matches this screen."""
+    """On-demand embedded player whose browser lifetime matches this screen."""
 
     controlsReady = Signal(object)
 
@@ -3309,11 +3606,19 @@ class TrailerDialog(QDialog):
         body.addWidget(placeholder, 1)
         self.trailer_placeholder = placeholder
 
-        trailer_view_class = get_trailer_web_view_class()
+        trailer_view_class = (
+            get_playback_web_view_class()
+            if self.embed_url
+            else get_trailer_web_view_class()
+        )
         if trailer_view_class is None:
-            note = QLabel("Embedded playback is unavailable in this build.")
+            message = "Embedded playback is unavailable in this build."
+            if self.embed_url and sys.platform == "win32" and QT_BINDING == "PySide6":
+                message = _windows_playback_unavailable_message()
+            note = QLabel(message)
             note.setObjectName("mutedLabel")
             note.setAlignment(Qt.AlignCenter)
+            note.setWordWrap(True)
             placeholder_layout.addWidget(note, 1)
         else:
             web = trailer_view_class(placeholder)
@@ -6305,6 +6610,9 @@ def _ensure_app_stylesheet() -> None:
 
 def main() -> int:
     print(f"Starting {APP_NAME} {APP_VERSION}")
+    # Qt WebView must select its native Windows backend before QApplication
+    # creates a platform graphics context.
+    _initialize_windows_playback_webview()
     application_attributes = getattr(Qt, "ApplicationAttribute", Qt)
     share_contexts = getattr(application_attributes, "AA_ShareOpenGLContexts", None)
     if share_contexts is not None:

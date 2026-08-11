@@ -50,9 +50,11 @@ https://playback.example/embed/movie/550
 https://playback.example/embed/tv/1399/1/3
 ```
 
-These are the complete requests. PiStick does not append undocumented playback-provider query parameters. The repository and published releases never contain the real playback host. PiStick loads the resulting page directly in Qt WebEngine. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
+These are the complete requests. PiStick does not append undocumented playback-provider query parameters. The repository and published releases never contain the real playback host. On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
 
-When saved progress exists, PiStick first opens the same documented endpoint and then sends the saved timestamp to the embedded player. It injects a small frame-local bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+When saved progress exists, PiStick first opens the same documented endpoint and then sends the saved timestamp to the embedded player. Qt WebEngine on the Pi injects a small frame-local bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+
+The native Windows WebView2 path can directly read a top-level HTML5 `<video>` element and accepts the same `pistick-playback-progress` messages. If a Windows embed keeps its video inside a different-origin nested iframe, that frame must post progress itself; PiStick does not disable browser security or read through the origin boundary.
 
 A custom player can also expose its playback state in one of these ways:
 
@@ -65,6 +67,17 @@ For a custom player that does not expose an HTML5 `<video>` element, define `win
 PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. When that title is reopened, the bridge seeks to the saved timestamp after its video metadata becomes available. The values are not stored beside secrets in `config.json`.
 
 Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
+
+### Testing playback on Windows
+
+Windows playback requires Python 3.10 or newer, PySide6 6.11 or newer, and the Microsoft Edge WebView2 Runtime. Windows 11 normally includes WebView2. From the PiStick folder, run:
+
+```powershell
+py -m pip install --upgrade -r requirements-windows.txt
+py main.py
+```
+
+PiStick continues to use Qt WebEngine for YouTube trailers, but uses Edge WebView2 for movies and episodes. If the native player is unavailable, the playback screen shows the missing requirement instead of opening the known codec-limited Qt WebEngine fallback.
 
 ## Install PiStick
 
@@ -375,7 +388,7 @@ Then test that configured host from the Pi, replacing the placeholder below with
 curl -I https://YOUR-LEGAL-PLAYBACK-HOST.example/
 ```
 
-The player needs JavaScript and media playback support from Qt WebEngine. Check the PiStick logs for Chromium, network, or certificate errors:
+The player needs JavaScript and media playback support from the browser engine. Check the PiStick logs for Chromium, network, or certificate errors:
 
 ```bash
 journalctl -u pistick.service -b -n 100 --no-pager
@@ -391,7 +404,17 @@ These messages come from the embed page rather than the TMDB request:
 - `Allow attribute will take precedence over 'allowfullscreen'` means an iframe contains both attributes. Use `allow="autoplay; encrypted-media; fullscreen"` and remove the separate `allowfullscreen` attribute.
 - `Blocked a frame ... Protocols, domains, and ports must match` means code is directly accessing a parent or child frame from a different origin. Use `postMessage()`; matching only the domain name is insufficient when the scheme, subdomain, or port differs.
 
-PiStick's built-in progress bridge follows this model and runs separately inside every frame. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
+PiStick's Qt WebEngine progress bridge follows this model and runs separately inside every frame. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
+
+### The Windows log says `HLS not supported`
+
+Qt WebEngine cannot enable H.264/AAC after it has been built. Update the Windows test dependencies and restart PiStick so movie and episode playback uses Edge WebView2:
+
+```powershell
+py -m pip install --upgrade -r requirements-windows.txt
+```
+
+Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error, `Fresh source error`, or Tailwind production warning is emitted by the hosted page or its upstream services, not by PiStick's documented `/embed/...` URL builder.
 
 ## Creating a release
 
