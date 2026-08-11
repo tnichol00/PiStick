@@ -118,8 +118,8 @@ class PlaybackBridgeTests(unittest.TestCase):
                 paused: false,
                 ended: false,
                 addEventListener() {{}},
-                play() {{ this.played = true; return {{ catch() {{}} }}; }},
-                pause() {{ this.pausedByPiStick = true; }}
+                play() {{ this.played = true; this.paused = false; return {{ catch() {{}} }}; }},
+                pause() {{ this.pausedByPiStick = true; this.paused = true; }}
             }};
             const childMessages = [];
             const child = {{ postMessage(data) {{ childMessages.push(data); }} }};
@@ -144,14 +144,82 @@ class PlaybackBridgeTests(unittest.TestCase):
                 bridgeToken: 'test-bridge-token',
                 action: 'pause'
             }});
-            if (!video.pausedByPiStick || childMessages.length !== 1) process.exit(2);
+            if (!video.pausedByPiStick || !video.paused || childMessages.length !== 1) process.exit(2);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'toggle'
+            }});
+            if (!video.played || video.paused || childMessages.length !== 2) process.exit(3);
             window.postMessage({{
                 type: 'pistick-media-command',
                 bridgeToken: 'test-bridge-token',
                 action: 'seek',
                 positionSeconds: 65
             }});
-            if (video.currentTime !== 65 || childMessages.length !== 2) process.exit(3);
+            if (video.currentTime !== 65 || childMessages.length !== 3) process.exit(4);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'seek-relative',
+                offsetSeconds: -10
+            }});
+            if (video.currentTime !== 55 || childMessages.length !== 4) process.exit(5);
+            """
+        )
+
+    def test_bridge_forces_the_1080p_hls_level_when_available(self) -> None:
+        bridge = json.dumps(self.bridge_source)
+        self.run_node(
+            f"""
+            const vm = require('vm');
+            class EventTarget {{
+                constructor() {{ this.listeners = new Map(); }}
+                addEventListener(name, callback) {{
+                    if (!this.listeners.has(name)) this.listeners.set(name, []);
+                    this.listeners.get(name).push(callback);
+                }}
+                dispatch(name, event) {{
+                    for (const callback of this.listeners.get(name) || []) callback(event);
+                }}
+            }}
+            const hls = {{
+                levels: [
+                    {{ height: 480, bitrate: 800000 }},
+                    {{ height: 1080, bitrate: 4500000 }},
+                    {{ height: 2160, bitrate: 12000000 }}
+                ],
+                currentLevel: -1,
+                nextLevel: -1,
+                loadLevel: -1,
+                autoLevelCapping: -1,
+                capLevelToPlayerSize: true
+            }};
+            const playerState = {{
+                hls,
+                levels: hls.levels,
+                quality: 'auto',
+                settings: {{ quality: 'Auto' }}
+            }};
+            const window = new EventTarget();
+            window.top = window;
+            window.frames = [];
+            window.__player = {{ state: playerState }};
+            window.setInterval = (callback) => {{ callback(); return 1; }};
+            window.clearInterval = () => {{}};
+            window.postMessage = (data) => window.dispatch('message', {{ data }});
+            const document = {{
+                readyState: 'complete',
+                querySelectorAll: () => [],
+                addEventListener() {{}}
+            }};
+            const context = {{ window, document, console, Number, Array, Math, Date, String }};
+            vm.createContext(context);
+            vm.runInContext({bridge}, context);
+            if (hls.currentLevel !== 1 || hls.nextLevel !== 1 || hls.loadLevel !== 1) process.exit(1);
+            if (hls.autoLevelCapping !== 1 || hls.capLevelToPlayerSize !== false) process.exit(2);
+            if (playerState.quality !== 1 || playerState.settings.quality !== '1080p') process.exit(3);
+            if (!window.__pistickForcedQuality || window.__pistickForcedQuality.selectedHeight !== 1080) process.exit(4);
             """
         )
 

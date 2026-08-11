@@ -7,15 +7,16 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 ## Features
 
 - Netflix-style profiles with separate watch histories
-- Featured titles, movies, TV shows, and Continue Watching
+- Featured titles, movies, TV shows, and immediately refreshed Continue Watching
 - Keyboard, mouse, and controller navigation
 - Infinite horizontal discovery carousels
 - On-screen keyboard for controller searches
 - Movie watch-state tracking
 - Season and episode selection with per-profile resume data
 - Embedded movie and episode playback from TMDB-number-based URLs
+- Client-side 1080p HLS selection with the best available fallback
 - Playback-only ad, tracker, pop-up, and redirect blocking
-- On-demand YouTube trailer screen with fullscreen controls
+- On-demand YouTube trailer screen with controller play/pause
 - Low-memory mode for the original Raspberry Pi Zero W
 - Manual, release-only installation and updates with rollback
 
@@ -51,7 +52,7 @@ https://playback.example/embed/movie/550
 https://playback.example/embed/tv/1399/1/3
 ```
 
-These are the complete requests. PiStick does not append undocumented playback-provider query parameters. The repository and published releases never contain the real playback host. On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
+These are the complete requests. PiStick does not append undocumented playback-provider query parameters. The repository and published releases never contain the real playback host. On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player expands fullscreen after opening. In either player, controller A toggles play/pause. During movie or episode playback, controller Left/Right seeks backward/forward 10 seconds, and B closes playback directly back to the title details screen.
 
 When saved progress exists, PiStick first opens the same documented endpoint and then sends the saved timestamp to the embedded player. Qt WebEngine on the Pi injects a small frame-local bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
 
@@ -63,9 +64,11 @@ A custom player can also expose its playback state in one of these ways:
 - Use a top-level HTML5 `<video>` element; PiStick reads it automatically.
 - From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the top window.
 
-For a custom player that does not expose an HTML5 `<video>` element, define `window.pistickSeekTo(seconds)` so PiStick can apply the saved resume position without changing the API URL.
+For a custom player that does not expose an HTML5 `<video>` element, define `window.pistickSeekTo(seconds)` so PiStick can apply the saved resume position without changing the API URL. It can also define `window.pistickSeekBy(offsetSeconds)` for controller skipping and `window.pistickSetQuality(label, height)` for the preferred resolution.
 
-PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. When that title is reopened, the bridge seeks to the saved timestamp after its video metadata becomes available. The values are not stored beside secrets in `config.json`.
+PiStick requests 1080p from YouTube trailers and locks an exposed HLS player to its 1080p rendition. If a particular source has no 1080p rendition, PiStick selects the closest available rendition, preferring the highest one below 1080p. This is done inside the loaded player and does not add anything to the documented API URL.
+
+PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. When playback closes, the Home page's Continue Watching row is rebuilt immediately—even if Home is currently behind Search or the title-details dialog. When that title is reopened, the bridge seeks to the saved timestamp after its video metadata becomes available. The values are not stored beside secrets in `config.json`.
 
 Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
 
@@ -292,6 +295,13 @@ Restart PiStick after pairing:
 ```bash
 sudo systemctl restart pistick.service
 ```
+
+Controller playback controls:
+
+- A: play/pause trailers, movies, and episodes
+- Left/Right on the D-pad or left stick: seek 10 seconds backward/forward in a movie or episode
+- B during movie or episode fullscreen: close playback and return directly to title details
+- B during trailer fullscreen: return to the trailer window; press B again to close it
 
 ## Optional remote viewing
 
