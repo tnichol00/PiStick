@@ -1,129 +1,130 @@
 # PiStick
 
-PiStick is a controller-friendly, Netflix-style media interface designed to turn a Raspberry Pi connected to a TV into a lightweight streaming appliance.
+PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers.
 
-The app currently uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers. Jellyfin playback is planned; the current `watch_title()` function is a placeholder for that integration.
+PiStick is currently an alpha. Browsing, profiles, trailers, and watch-state features work, but actual movie and episode playback is still a placeholder until Jellyfin is connected.
 
-## Current features
+## Features
 
 - Netflix-style profiles with separate watch histories
 - Featured titles, movies, TV shows, and Continue Watching
 - Keyboard, mouse, and controller navigation
 - Infinite horizontal discovery carousels
-- In-app YouTube trailers with fullscreen controls
-- Movie watch-state tracking
-- Season and episode picker with per-profile episode resume
 - On-screen keyboard for controller searches
-- Low-memory tuning for the original Raspberry Pi Zero W
-- Release-only installation and updates with automatic rollback
+- Movie watch-state tracking
+- Season and episode selection with per-profile resume data
+- On-demand YouTube trailer screen with fullscreen controls
+- Low-memory mode for the original Raspberry Pi Zero W
+- Manual, release-only installation and updates with rollback
 
-## Hardware requirements
+## What you need
 
-- Raspberry Pi Zero W or newer Raspberry Pi
+- Raspberry Pi Zero W or a newer Raspberry Pi
 - 8 GB or larger microSD card
-- Stable 5 V power supply
-- Mini-HDMI cable for final TV use
-- 2.4 GHz Wi-Fi for the original Pi Zero W
+- Reliable 5 V power supply
+- Mini-HDMI cable for an original Pi Zero W when connecting it to a TV
+- 2.4 GHz Wi-Fi for an original Pi Zero W
+- A computer with a microSD-card reader for Raspberry Pi Imager
 - Optional Bluetooth controller or USB controller with a micro-USB OTG adapter
+- Free [TMDB account](https://www.themoviedb.org/signup)
 
-The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is optimized for it, but YouTube's Chromium-based trailer player remains demanding. A Pi Zero 2 W or newer model will provide a noticeably smoother experience.
+The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but the Chromium-based YouTube trailer player is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
 
-# Before distributing PiStick
+## Install PiStick
 
-The installer deliberately uses GitHub without a GitHub token so the user's only installer input is their TMDB API Read Access Token. Before the public install command can work, the repository owner must:
+PiStick is designed for a fresh **Raspberry Pi OS Lite (32-bit)** installation. It adds only the graphical components needed to run the app, not a normal desktop, taskbar, file manager, or desktop icons.
 
-1. Merge the `installer` branch into `main`.
-2. Make `tnichol00/PiStick` public.
-3. Publish at least one non-draft GitHub Release from a commit containing:
-   - `main.py`
-   - `config.example.json`
-   - `install.sh`
-   - `pistick-release.json`
-   - The external configuration/state path support in `main.py`
-
-A Git tag by itself is not enough. The tag must be attached to a published GitHub Release. Published pre-releases are eligible; draft releases are ignored.
-
-# Dedicated Raspberry Pi installation
-
-The installer is designed for a fresh **Raspberry Pi OS Lite (32-bit)** system accessed over SSH. It installs a minimal X11 layer for Qt, but it does not install a desktop, taskbar, file manager, or desktop icons.
-
-The final boot flow is:
+The finished boot flow is:
 
 ```text
-Power on -> Raspberry Pi OS Lite -> minimal X11 -> PiStick
+Power on -> Raspberry Pi OS Lite -> minimal X11 session -> PiStick fullscreen
 ```
 
-## 1. Prepare the microSD card
+### 1. Write Raspberry Pi OS to the microSD card
 
-Install [Raspberry Pi Imager](https://www.raspberrypi.com/software/) on another computer.
-
-In Imager:
-
-1. Choose your Raspberry Pi model.
-2. Select **Raspberry Pi OS Lite (32-bit)**. Do not select the 64-bit image for an original Pi Zero W.
-3. Choose the microSD card.
-4. Open OS customization and set:
+1. Install [Raspberry Pi Imager](https://www.raspberrypi.com/software/) on your computer.
+2. Insert the microSD card. Everything currently on the selected card will be erased.
+3. In Imager, choose your Raspberry Pi model.
+4. Choose **Raspberry Pi OS Lite (32-bit)**. Do not choose a 64-bit image for an original Pi Zero W.
+5. Open OS customization and set:
    - Hostname: `pistick`
    - Username: `pistick`
    - A secure password
    - Your Wi-Fi name and password
-   - Wi-Fi country
-   - Enable SSH with password authentication
-5. Write the card, insert it into the Pi, and power it on.
+   - Your Wi-Fi country
+   - SSH enabled with password authentication
+6. Write the card, insert it into the Pi, and power the Pi on.
 
-Allow several minutes for the first boot. The original Pi Zero W only supports 2.4 GHz Wi-Fi.
+Allow several minutes for the first boot. An original Pi Zero W can connect only to a 2.4 GHz Wi-Fi network. Raspberry Pi's [headless setup guide](https://www.raspberrypi.com/documentation/computers/getting-started.html#headless-remote-setup) also explains the Imager and SSH options.
 
-## 2. Connect over SSH
+### 2. Connect to the Pi over SSH
 
-From Windows PowerShell:
+On Windows, open PowerShell. On macOS or Linux, open Terminal. Run:
 
-```powershell
+```bash
 ssh pistick@pistick.local
 ```
 
-If `pistick.local` does not resolve, find the Pi's IP address in your router's connected-device list and use it instead:
+Accept the host-key prompt if this is the first connection, then enter the password chosen in Imager.
 
-```powershell
+If `pistick.local` does not resolve, find the Pi's IP address in your router's connected-device list and connect with that address instead:
+
+```bash
 ssh pistick@192.168.1.123
 ```
 
-## 3. Run the installer
+Replace `192.168.1.123` with the Pi's actual address.
 
-After the `installer` branch has been merged into `main`, run this single command on the Pi:
+### 3. Get the TMDB API Read Access Token
+
+1. Sign in to TMDB.
+2. Open [TMDB API settings](https://www.themoviedb.org/settings/api).
+3. Complete TMDB's API access form if required.
+4. Copy the long **API Read Access Token**.
+
+PiStick uses the long Read Access Token as a Bearer token. Do not use the shorter v3 API key.
+
+### 4. Run the installer
+
+Paste this complete command into the Pi's SSH terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-The installer asks for only one PiStick setting:
+The installer has one PiStick-specific prompt:
 
 ```text
 Paste your TMDB API Read Access Token:
 ```
 
-Create or sign into a [TMDB account](https://www.themoviedb.org/signup), open [TMDB API settings](https://www.themoviedb.org/settings/api), and paste the long **API Read Access Token**. The installer validates it before continuing. The shorter v3 API key is not accepted by PiStick's current Bearer-token configuration.
+Paste the token and press Enter. The prompt is hidden, so the token will not appear while it is pasted or typed.
 
-The installation can take a while on the original Pi Zero W. When it finishes, PiStick starts automatically and will launch again on every boot.
+The first installation can take a while on an original Pi Zero W because the Pi must download and install Qt WebEngine and the other system packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again; completed package work and configuration are reused.
+
+When installation succeeds, PiStick starts immediately and launches automatically after every boot.
 
 ## What the installer does
 
 The installer automatically:
 
-- Installs Python, PyQt5, QtWebEngine, pygame, Requests, X11, Matchbox, fonts, graphics libraries, and Bluetooth support.
-- Creates a minimal no-desktop X11 kiosk service.
-- Gives the PiStick service user access to display and controller devices.
-- Downloads the newest published GitHub Release, never a branch commit.
-- Compiles and validates the release before activation.
-- Stores every release in `/opt/pistick/releases/`.
-- Atomically points `/opt/pistick/current` at the active release.
-- Keeps the TMDB token, profiles, watch history, and cache outside release folders.
-- Starts PiStick automatically at boot and restarts it if the app crashes.
+- Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
+- Installs Python, Requests, pygame, PyQt5, Qt WebEngine, minimal X11, Matchbox, fonts, graphics libraries, and Bluetooth support.
+- Validates the TMDB API Read Access Token before saving it.
+- Downloads the newest published PiStick GitHub Release, never an unfinished branch commit.
+- Ignores draft releases. Published pre-releases are eligible for installation.
+- Validates the release manifest, required files, Bash syntax, and Python syntax.
+- Stores immutable release snapshots under `/opt/pistick/releases/`.
+- Points `/opt/pistick/current` at the active release.
+- Stores configuration, profiles, history, and caches outside the release directory.
+- Creates a minimal fullscreen X11 service with no desktop.
+- Starts PiStick at boot and restarts it if it crashes.
 - Installs the manual `pistick-update` command.
-- Keeps the previous working release and automatically rolls back if an update fails its startup check.
+- Preserves the previous release and rolls back if a new release fails its startup check.
 
-The installer does **not** install an update timer, cron job, or background release checker.
+The installer does **not** install a timer, cron job, automatic update checker, or `git pull` workflow.
 
-# Updating PiStick
+## Update PiStick
 
 Updates happen only when someone connects over SSH and runs:
 
@@ -131,22 +132,22 @@ Updates happen only when someone connects over SSH and runs:
 sudo pistick-update
 ```
 
-That command:
+The updater checks the published [PiStick Releases](https://github.com/tnichol00/PiStick/releases), selects the most recently published non-draft release, and does nothing if that release is already installed.
 
-1. Queries GitHub's published Releases API.
-2. Ignores drafts and normal un-released tags.
-3. Selects the newest published release, including a published pre-release.
-4. Does nothing if that release is already installed.
-5. Downloads and validates the release archive.
-6. Stops PiStick only when a new release is ready.
-7. Switches to the new release and watches for startup crashes.
-8. Rolls back to the previous release if the health check fails.
+When a new release exists, the updater:
 
-It never runs `git pull`, never tracks `main`, and never installs an unpublished commit.
+1. Downloads it without changing the running release.
+2. Validates its required files and syntax.
+3. Stops PiStick only after validation succeeds.
+4. Activates the new release and watches its startup health.
+5. Keeps the user's TMDB token, profiles, watch history, and caches.
+6. Automatically returns to the previous release if startup fails.
 
-# Persistent files
+The updater never installs a normal tag, branch commit, or draft release.
 
-Updates never replace these files:
+## Persistent files
+
+These files survive every update:
 
 | Purpose | Path |
 | --- | --- |
@@ -155,11 +156,11 @@ Updates never replace these files:
 | Installed release record | `/var/lib/pistick/installed-release.json` |
 | Posters, API data, and WebEngine cache | `/var/cache/pistick/` |
 
-The service reads those paths through `PISTICK_CONFIG_PATH`, `PISTICK_STATE_PATH`, and `PISTICK_CACHE_DIR`. Release directories remain read-only and contain application code only.
+The service passes these locations to the app through `PISTICK_CONFIG_PATH`, `PISTICK_STATE_PATH`, and `PISTICK_CACHE_DIR`.
 
-If the old manual `/home/USERNAME/PiStick` installation exists, the first installer run migrates a valid `config.json` and `pistick_state.json` automatically.
+If an older manual installation exists at `/home/USERNAME/PiStick`, the first installer run attempts to preserve a valid `config.json` and `pistick_state.json` automatically.
 
-# Service controls and logs
+## Service controls and logs
 
 Check whether PiStick is running:
 
@@ -179,22 +180,22 @@ Show logs from the current boot:
 journalctl -u pistick.service -b --no-pager
 ```
 
-Restart or stop the app:
+Restart or stop PiStick:
 
 ```bash
 sudo systemctl restart pistick.service
 sudo systemctl stop pistick.service
 ```
 
-# Controller setup
+## Controller setup
 
-USB controllers can be connected through a powered micro-USB OTG adapter. To pair a Bluetooth controller, connect over SSH and run:
+A USB controller can be connected through a micro-USB OTG adapter. To pair a Bluetooth controller, connect over SSH and run:
 
 ```bash
 bluetoothctl
 ```
 
-Then run these commands inside `bluetoothctl`:
+Then enter:
 
 ```text
 power on
@@ -203,7 +204,7 @@ default-agent
 scan on
 ```
 
-When the controller's address appears, replace `XX:XX:XX:XX:XX:XX` below:
+Put the controller into pairing mode. When its address appears, replace `XX:XX:XX:XX:XX:XX` below with that address:
 
 ```text
 pair XX:XX:XX:XX:XX:XX
@@ -218,9 +219,9 @@ Restart PiStick after pairing:
 sudo systemctl restart pistick.service
 ```
 
-# Optional remote viewing
+## Optional remote viewing
 
-SSH is the normal maintenance method. If PiStick's X11 session is running, you can temporarily install `x11vnc` and view the interface remotely:
+SSH is the normal maintenance method. To temporarily see and control PiStick without a normal desktop, install `x11vnc`:
 
 ```bash
 sudo apt update
@@ -230,48 +231,60 @@ x11vnc -storepasswd ~/.vnc/passwd
 x11vnc -display :0 -auth guess -forever -shared -rfbauth ~/.vnc/passwd
 ```
 
-Connect a VNC viewer to `pistick.local:5900`. VNC consumes extra CPU and can make animations look slower than they will over HDMI, so do not use it for final performance measurements.
+Connect a VNC viewer to `pistick.local:5900`. Keep the SSH window open while `x11vnc` is running, and press Ctrl+C when finished.
 
-# Optional swap increase
+VNC adds CPU and network overhead. It is useful for checking that the app opens, but it is not an accurate test of carousel animation or trailer performance.
 
-QtWebEngine can briefly use a large amount of memory when a trailer opens. If the operating system kills the app because it runs out of RAM, increase swap to 512 MB:
+## Memory and swap
+
+Check current RAM and swap use with:
 
 ```bash
-sudo sed -i 's/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=512/' /etc/dphys-swapfile
-sudo systemctl restart dphys-swapfile
+free -h
+swapon --show
 ```
 
-Swap can prevent some out-of-memory crashes, but it is much slower than RAM and causes additional microSD-card writes.
+Current Raspberry Pi OS releases configure swap differently from older releases, so do not blindly follow old instructions that edit `/etc/dphys-swapfile`. Increase swap only if logs show an out-of-memory failure. Swap may prevent a crash, but it is much slower than RAM and cannot make trailer playback smooth.
 
-# Troubleshooting
+## Troubleshooting
 
-## GitHub returns `404` during installation
+### The install command returns `Could not resolve host`
 
-The repository is private. Anonymous release downloads work only after `tnichol00/PiStick` is public. The installer intentionally does not ask for or store a GitHub token.
+The Pi is not reaching the internet or DNS is not ready. Check:
 
-## `No published PiStick release exists yet`
+```bash
+ping -c 3 github.com
+```
 
-Create a GitHub Release. A branch, commit, or tag without a published Release is intentionally ignored.
+Confirm that the original Pi Zero W is using a 2.4 GHz network.
 
-## The release predates the installer
+### GitHub returns HTTP `403`
 
-Publish a new release from a commit that contains `pistick-release.json` and the external data path support in `main.py`. This safety check prevents an older release from writing private data inside a replaceable release folder.
+GitHub may have temporarily rate-limited anonymous release checks. Wait and run the installer again later. PiStick does not request or store a GitHub credential.
 
-## `pistick.service` repeatedly restarts
+### `No published PiStick release exists yet`
 
-Read the error:
+The installer found no non-draft GitHub Release. A tag or branch by itself is intentionally not installable. Check the [Releases page](https://github.com/tnichol00/PiStick/releases) and try again once a release is published.
+
+### `pistick-update: command not found`
+
+Rerun the full installation command. It safely reuses the existing TMDB token and release data while restoring the updater command.
+
+### `pistick.service` repeatedly restarts or stays failed
+
+Read the latest error:
 
 ```bash
 journalctl -u pistick.service -b -n 100 --no-pager
 ```
 
-Then rerun the release updater. It will reinstall only if a newer published release exists:
+Then check the installed dependencies:
 
 ```bash
-sudo pistick-update
+python3 -c "import requests, pygame; from PyQt5.QtWebEngineWidgets import QWebEngineView; print('Dependencies OK')"
 ```
 
-## The TMDB setup screen remains visible
+### The TMDB setup screen remains visible
 
 Validate the private configuration file:
 
@@ -285,42 +298,61 @@ Then restart PiStick:
 sudo systemctl restart pistick.service
 ```
 
-## Controller is paired but not detected
+If the token was rejected or copied incorrectly, remove only the saved configuration and rerun the installer:
+
+```bash
+sudo rm /etc/pistick/config.json
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+```
+
+This does not remove profiles or watch history.
+
+### A paired controller is not detected
+
+Check whether Linux created a controller device:
 
 ```bash
 ls -l /dev/input/js* /dev/input/by-id/*joystick* 2>/dev/null
 ```
 
-If no device appears, reconnect the controller. If it appears, reboot once so all group changes are active.
+If no device appears, reconnect or pair the controller again. If a device appears but PiStick still cannot see it, reboot once so the service user receives all updated device-group permissions.
 
-## Trailer playback is slow
+### Trailer playback is slow
 
-The trailer screen uses QtWebEngine/Chromium and is the heaviest part of PiStick. It is created only when **Watch Trailer** is selected and destroyed after the trailer closes. The original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
+The trailer screen uses Qt WebEngine and Chromium, making it the heaviest part of PiStick. It is created only after **Watch Trailer** is selected and destroyed after closing. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
 
-# Creating a release
+## Creating a release
 
-PiStick releases should be created from tested `main` commits:
+PiStick installs only published GitHub Releases. Maintainers should release from a tested `main` commit:
 
-1. Merge and test the intended changes on `main`.
-2. Open the repository's **Releases** page.
-3. Select **Draft a new release**.
-4. Create a version tag such as `v0.1.0-alpha` or `v1.0.0` targeting the tested `main` commit.
-5. Add release notes.
-6. Publish the release. It may be marked as a pre-release, but it cannot remain a draft.
+1. Run the repository checks:
 
-GitHub's automatic **Source code (tar.gz)** archive contains `main.py`, `install.sh`, `config.example.json`, and the release manifest. The installer downloads that archive directly from the published release record, so the manual updater advances with the app through the same release system.
+   ```bash
+   bash -n install.sh
+   bash tests/test_installer.sh
+   python3 -m py_compile main.py
+   python3 -m json.tool config.example.json >/dev/null
+   python3 -m json.tool pistick-release.json >/dev/null
+   ```
 
-# Data and privacy
+2. Confirm the release contains:
+   - `main.py`
+   - `config.example.json`
+   - `install.sh`
+   - `pistick-release.json`
+3. In GitHub, open **Releases** and choose **Draft a new release**.
+4. Create a version tag such as `v0.1.1-alpha` or `v1.0.0` targeting the tested `main` commit.
+5. Add release notes and publish it. It may be marked as a pre-release, but it cannot remain a draft.
+
+GitHub's automatic source archive is enough; no separate ZIP asset is required. The installer downloads the archive referenced by the published release.
+
+## Data and privacy
 
 - TMDB metadata and posters come from TMDB.
 - Trailers play through YouTube.
-- Profiles and watch history are stored locally on the Pi.
-- The TMDB token is stored locally in `/etc/pistick/config.json` with restricted permissions.
+- Profiles and watch history stay on the Pi.
+- The TMDB token is stored at `/etc/pistick/config.json` with restricted permissions.
 - The installer does not collect or store a GitHub credential.
-- `config.json` and PiStick state files must never be committed.
-
-# Development status
-
-PiStick is under active development. Movie/show selection currently records local watch state and calls the placeholder `watch_title()` function. Actual movie and episode playback will be connected through Jellyfin later.
+- A real `config.json` must never be committed or included in a release.
 
 This product uses the TMDB API but is not endorsed or certified by TMDB.
