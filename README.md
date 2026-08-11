@@ -1,6 +1,6 @@
 # PiStick
 
-PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through a user-configured legal playback service.
+PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through [Videasy's documented player API](https://www.videasy.to/docs).
 
 PiStick is currently an alpha. Browsing, profiles, trailers, watch-state features, and embedded movie and episode playback are implemented. Compatible embed pages report playback time to PiStick, which saves and restores an exact per-profile resume timestamp.
 
@@ -13,7 +13,7 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - On-screen keyboard for controller searches
 - Movie watch-state tracking
 - Season and episode selection with per-profile resume data
-- Embedded movie and episode playback from TMDB-number-based URLs
+- Videasy movie and episode playback from TMDB-number-based URLs
 - Client-side 1080p HLS selection with the best available fallback
 - Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
 - On-demand YouTube trailer screen with controller play/pause
@@ -30,11 +30,10 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - A computer with a microSD-card reader for Raspberry Pi Imager
 - Optional Bluetooth controller or USB controller with a micro-USB OTG adapter
 - Free [TMDB account](https://www.themoviedb.org/signup)
-- The HTTPS base URL of a legal playback service you control or are authorized to use
 
 The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
 
-## Playback API
+## Videasy playback
 
 The playback URL helpers live in `playback_api.py` and are called by `main.py` like this:
 
@@ -45,16 +44,18 @@ movie_url = getmovie(550)
 episode_url = getshow(1399, 1, 3)
 ```
 
-The service's base URL is read at runtime from the private `playback_base_url` field in `/etc/pistick/config.json`. The tracked example contains only a placeholder. With a locally configured base URL of `https://playback.example`, the calls produce:
+The calls produce Videasy's documented movie and TV paths:
 
 ```text
-https://playback.example/embed/movie/550
-https://playback.example/embed/tv/1399/1/3
+https://player.videasy.to/movie/550
+https://player.videasy.to/tv/1399/1/3
 ```
 
-These are the complete requests. PiStick does not append undocumented playback-provider query parameters. The repository and published releases never contain the real playback host. On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player expands fullscreen after opening. In either player, controller A toggles play/pause. During movie or episode playback, controller Left/Right seeks backward/forward 10 seconds, and B closes playback directly back to the title details screen.
+Videasy's docs currently show `player.videasy.net`, which redirects to `player.videasy.to`. PiStick uses the final HTTPS origin directly so its anti-popup navigation lock does not reject that redirect. When saved progress exists, PiStick appends only Videasy's documented `progress` parameter, such as `?progress=120`.
 
-When saved progress exists, PiStick first opens the same documented endpoint and then sends the saved timestamp to the embedded player. Qt WebEngine on the Pi injects a small frame-local bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same player. The player expands fullscreen after opening. Controller A toggles play/pause, Left/Right seeks backward/forward 10 seconds, and B closes playback directly back to the title details screen.
+
+Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. PiStick accepts those documented messages and also keeps its HTML5-video bridge as a fallback. Qt WebEngine on the Pi injects the bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
 
 The native Windows WebView2 path can directly read a top-level HTML5 `<video>` element and accepts the same `pistick-playback-progress` messages. If a Windows embed keeps its video inside a different-origin nested iframe, that frame must post progress itself; PiStick does not disable browser security or read through the origin boundary.
 
@@ -76,13 +77,13 @@ Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct r
 
 Ad blocking is enabled by default only for movie and episode playback. YouTube trailers keep their separate, unfiltered browser profile so a playback rule cannot break trailers.
 
-PiStick combines its built-in rules with the maintained [oisd big blocklist](https://oisd.nl/). The list is downloaded directly over HTTPS, validated, normalized, cached locally, and refreshed in the background when it is more than 24 hours old. If the first download or a later refresh fails, playback continues with the last cache and built-in rules. The built-in rules include the current VidCore pop-under loader so the known explicit-ad source is blocked immediately, before the first online-list refresh finishes.
+PiStick combines its built-in rules with the maintained [oisd big blocklist](https://oisd.nl/). The list is downloaded directly over HTTPS, validated, normalized, cached locally, and refreshed in the background when it is more than 24 hours old. If the first download or a later refresh fails, playback continues with the last cache and built-in rules. Videasy's player and core source/subtitle API hosts are explicitly allowed so a broad public list cannot block the player itself.
 
 On Raspberry Pi, the Qt WebEngine profile blocks matching hosts before requests reach Chromium, rejects pop-up windows and off-origin top-level redirects, and injects cosmetic filtering into every frame. On Windows, all playback WebView2 requests—including requests from cross-origin nested frames—pass through a random-port proxy bound only to `127.0.0.1`. The proxy checks the destination hostname and then tunnels allowed HTTPS bytes unchanged; it does not decrypt, inspect, or modify the video stream. If `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` already contains a different proxy, PiStick preserves it and falls back to browser/in-page filtering.
 
-On both engines, nested playback frames are sandboxed with only the permissions needed for scripts, autoplay, encrypted media, and fullscreen playback. Pop-ups, downloads, payment requests, and attempts to navigate the top-level PiStick player are not permitted. PiStick also rejects known ad timers and blocks dynamic ad scripts synchronously, before their requests can race the DOM observer. It does not disable browser security or broadly block URL paths that might contain video, HLS, or subtitle data.
+On both engines, nested playback frames are sandboxed with only the permissions needed for scripts, autoplay, encrypted media, and fullscreen playback. Pop-ups, downloads, payment requests, and attempts to navigate the top-level PiStick player are not permitted. PiStick blocks dynamic scripts from known ad hosts synchronously, before their requests can race the DOM observer. It does not disable browser security or broadly block URL paths that might contain video, HLS, or subtitle data.
 
-The configured `playback_base_url` host is automatically allowed. Extra block or allow domains can be added privately without changing tracked code:
+Extra block or allow domains can be added privately without changing tracked code:
 
 ```json
 {
@@ -165,8 +166,6 @@ Replace `192.168.1.123` with the Pi's actual address.
 
 PiStick uses the long Read Access Token as a Bearer token. Do not use the shorter v3 API key.
 
-Also have the base URL for your legal playback service ready. It must begin with `https://` and must not include `/embed/movie/...`, `/embed/tv/...`, credentials, a query, or a fragment.
-
 ### 4. Run the installer
 
 Paste this complete command into the Pi's SSH terminal:
@@ -175,14 +174,13 @@ Paste this complete command into the Pi's SSH terminal:
 curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-The installer has two PiStick-specific prompts:
+The installer has one PiStick-specific prompt:
 
 ```text
 Paste your TMDB API Read Access Token:
-Paste your legal playback service base URL:
 ```
 
-Paste each value and press Enter. Both prompts are hidden, so neither value appears while it is pasted or typed. They are stored only in `/etc/pistick/config.json` on the Pi.
+Paste the token and press Enter. The prompt is hidden, so the value does not appear while it is pasted or typed. It is stored only in `/etc/pistick/config.json` on the Pi.
 
 The first installation can take a while on an original Pi Zero W because the Pi must download and install Qt WebEngine and the other system packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again; completed package work and configuration are reused.
 
@@ -415,16 +413,16 @@ The trailer screen uses Qt WebEngine and Chromium, making it the heaviest part o
 
 ### A movie or episode does not load
 
-First validate the local configuration and confirm that `playback_base_url` is present:
+First validate the local configuration and confirm the TMDB token file is valid JSON:
 
 ```bash
 sudo python3 -m json.tool /etc/pistick/config.json
 ```
 
-Then test that configured host from the Pi, replacing the placeholder below with the private value shown in the configuration:
+Then test Videasy's player from the Pi:
 
 ```bash
-curl -I https://YOUR-LEGAL-PLAYBACK-HOST.example/
+curl -I https://player.videasy.to/movie/550
 ```
 
 The player needs JavaScript and media playback support from the browser engine. Check the PiStick logs for Chromium, network, or certificate errors:
@@ -433,7 +431,7 @@ The player needs JavaScript and media playback support from the browser engine. 
 journalctl -u pistick.service -b -n 100 --no-pager
 ```
 
-No playback API key is required. The TMDB token is used only for title metadata; `playback_base_url` supplies the private host, and movie or episode paths are built from the selected TMDB number, season, and episode.
+No Videasy API key is required. The TMDB token is used only for title metadata; Videasy movie or episode paths are built from the selected TMDB number, season, and episode.
 
 ### The log shows iframe or cross-origin JavaScript warnings
 
@@ -453,7 +451,7 @@ Qt WebEngine cannot enable H.264/AAC after it has been built. Update the Windows
 py -m pip install --upgrade -r requirements-windows.txt
 ```
 
-Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error, `Fresh source error`, or Tailwind production warning is emitted by the hosted page or its upstream services, not by PiStick's documented `/embed/...` URL builder.
+Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error or source-fetch error is emitted by Videasy or one of its upstream services, not by PiStick's movie/TV URL builder.
 
 ## Creating a release
 
@@ -487,11 +485,12 @@ GitHub's automatic source archive is enough; no separate ZIP asset is required. 
 
 - TMDB metadata and posters come from TMDB.
 - Trailers play through YouTube.
-- Selecting playback sends the TMDB title number—and, for TV, the season and episode numbers—to the configured playback host.
-- The playback ad blocker refreshes its public hosts list directly from `raw.githubusercontent.com` at most once every seven days. That request contains no title, playback URL, profile, or watch-history data. The normalized list is cached locally; private block/allow domains stay in the private configuration.
+- Selecting playback sends the TMDB title number—and, for TV, the season and episode numbers—to Videasy. A saved resume timestamp is also sent through Videasy's documented `progress` query parameter.
+- The playback ad blocker refreshes its public OISD hosts list at most once every 24 hours. That request contains no title, playback URL, profile, or watch-history data. The normalized list is cached locally; private block/allow domains stay in the private configuration.
 - Profiles and watch history stay on the Pi.
-- The TMDB token and playback base URL are stored at `/etc/pistick/config.json` with restricted permissions.
+- The TMDB token is stored at `/etc/pistick/config.json` with restricted permissions.
 - The installer does not collect or store a GitHub credential.
 - The repository's `config.example.json` contains only placeholders. A real `config.json` must never be committed or included in a release.
 
 This product uses the TMDB API but is not endorsed or certified by TMDB.
+Only use PiStick and third-party playback services for content you are authorized to access.

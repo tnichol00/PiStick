@@ -326,68 +326,6 @@ print(token)
 PY
 }
 
-config_playback_base_url() {
-    local path="$1"
-    [[ -f "$path" ]] || return 1
-    python3 - "$path" <<'PY'
-import json
-import sys
-from urllib.parse import urlsplit, urlunsplit
-
-try:
-    payload = json.load(open(sys.argv[1], encoding="utf-8"))
-    configured = str(payload.get("playback_base_url") or "").strip()
-    parts = urlsplit(configured)
-    port = parts.port
-except (OSError, ValueError, TypeError, AttributeError):
-    raise SystemExit(1)
-
-if (
-    parts.scheme.lower() != "https"
-    or not parts.hostname
-    or parts.username is not None
-    or parts.password is not None
-    or parts.query
-    or parts.fragment
-):
-    raise SystemExit(1)
-
-hostname = parts.hostname.lower()
-if ":" in hostname and not hostname.startswith("["):
-    hostname = f"[{hostname}]"
-netloc = hostname if port is None else f"{hostname}:{port}"
-print(urlunsplit(("https", netloc, parts.path.rstrip("/"), "", "")))
-PY
-}
-
-normalize_playback_base_url() {
-    python3 -c '
-import sys
-from urllib.parse import urlsplit, urlunsplit
-
-configured = sys.stdin.read().strip()
-try:
-    parts = urlsplit(configured)
-    port = parts.port
-except ValueError:
-    raise SystemExit(1)
-if (
-    parts.scheme.lower() != "https"
-    or not parts.hostname
-    or parts.username is not None
-    or parts.password is not None
-    or parts.query
-    or parts.fragment
-):
-    raise SystemExit(1)
-hostname = parts.hostname.lower()
-if ":" in hostname and not hostname.startswith("["):
-    hostname = f"[{hostname}]"
-netloc = hostname if port is None else f"{hostname}:{port}"
-print(urlunsplit(("https", netloc, parts.path.rstrip("/"), "", "")))
-'
-}
-
 validate_tmdb_token() {
     local token="$1"
     if [[ "$TEST_MODE" == "1" && "${PISTICK_SKIP_TMDB_VALIDATION:-0}" == "1" ]]; then
@@ -426,26 +364,22 @@ else:
 
 write_config() {
     local token="$1"
-    local playback_base_url="$2"
     local temporary="${CONFIG_DIR}/.config.json.tmp"
-    printf '%s\n%s\n' "$token" "$playback_base_url" | python3 -c '
+    printf '%s\n' "$token" | python3 -c '
 import json
 import sys
 
-values = sys.stdin.read().splitlines()
-if len(values) != 2 or not all(values):
+token = sys.stdin.read().strip()
+if not token:
     raise SystemExit("Invalid PiStick configuration")
-token, playback_base_url = values
 try:
     payload = json.load(open(sys.argv[2], encoding="utf-8"))
     if not isinstance(payload, dict):
         payload = {}
 except (OSError, ValueError, TypeError):
     payload = {}
-payload.update({
-    "tmdb_read_token": token,
-    "playback_base_url": playback_base_url,
-})
+payload["tmdb_read_token"] = token
+payload.pop("playback_base_url", None)
 with open(sys.argv[1], "w", encoding="utf-8") as output:
     json.dump(payload, output, indent=2)
     output.write("\n")
@@ -477,9 +411,7 @@ migrate_legacy_data() {
 
 ensure_runtime_config() {
     local token=""
-    local playback_base_url=""
     token="$(config_token "$CONFIG_FILE" 2>/dev/null || true)"
-    playback_base_url="$(config_playback_base_url "$CONFIG_FILE" 2>/dev/null || true)"
 
     while [[ -z "$token" ]]; do
         if [[ "$TEST_MODE" == "1" && -n "${PISTICK_TMDB_TOKEN:-}" ]]; then
@@ -501,25 +433,9 @@ ensure_runtime_config() {
         fi
     done
 
-    while [[ -z "$playback_base_url" ]]; do
-        if [[ "$TEST_MODE" == "1" && -n "${PISTICK_PLAYBACK_BASE_URL:-}" ]]; then
-            playback_base_url="$PISTICK_PLAYBACK_BASE_URL"
-        else
-            [[ -r /dev/tty ]] || die "An interactive SSH terminal is required to enter the playback base URL."
-            printf '\nPaste your legal playback service base URL: ' >/dev/tty
-            IFS= read -r -s playback_base_url </dev/tty
-            printf '\n' >/dev/tty
-        fi
-        playback_base_url="${playback_base_url//$'\r'/}"
-        playback_base_url="$(printf '%s' "$playback_base_url" | normalize_playback_base_url 2>/dev/null || true)"
-        [[ -n "$playback_base_url" ]] || {
-            warn "Enter a complete HTTPS base URL without credentials, a query, or a fragment."
-        }
-    done
-
-    write_config "$token" "$playback_base_url"
-    unset token playback_base_url
-    log "Private TMDB and playback configuration saved at /etc/pistick/config.json"
+    write_config "$token"
+    unset token
+    log "Private TMDB configuration saved at /etc/pistick/config.json"
 }
 
 fetch_releases_json() {

@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 import shutil
 import socket
@@ -12,6 +11,7 @@ import unittest
 from adblock import (
     AdBlockSettings,
     DEFAULT_AD_HOST_SUFFIXES,
+    DEFAULT_PLAYBACK_ALLOWED_HOST_SUFFIXES,
     DEFAULT_REMOTE_BLOCKLIST_URL,
     add_webview_proxy_argument,
     build_playback_adblock_script,
@@ -56,43 +56,56 @@ class AdBlockTests(unittest.TestCase):
         self.assertFalse(
             is_blocked_ad_url("https://notdoubleclick.net/video/master.m3u8", settings)
         )
-        self.assertTrue(
-            is_blocked_ad_url(
-                "https://ferocitycandour.com/79/d1/e2/loader.js",
-                settings,
-            )
-        )
 
-    def test_maintained_list_covers_current_vidcore_ad_loader(self) -> None:
+    def test_maintained_list_uses_oisd_wildcard_domains(self) -> None:
         self.assertEqual(DEFAULT_REMOTE_BLOCKLIST_URL, "https://big.oisd.nl/domainswild")
         parsed = parse_hosts_blocklist(
-            "# oisd wildcard syntax\n*.ferocitycandour.com\n*.rotating-ad.test\n"
+            "# oisd wildcard syntax\n*.first-ad.test\n*.rotating-ad.test\n"
         )
-        self.assertIn("ferocitycandour.com", parsed)
+        self.assertIn("first-ad.test", parsed)
         self.assertIn("rotating-ad.test", parsed)
+
+    def test_videasy_player_and_core_api_hosts_are_always_allowed(self) -> None:
+        settings = load_adblock_settings(
+            self.write_config(
+                {
+                    "adblock_domains": [
+                        "player.videasy.to",
+                        "api.speedracelight.com",
+                    ]
+                }
+            )
+        )
+        self.assertIn("player.videasy.to", DEFAULT_PLAYBACK_ALLOWED_HOST_SUFFIXES)
+        self.assertIn("api.speedracelight.com", DEFAULT_PLAYBACK_ALLOWED_HOST_SUFFIXES)
+        self.assertFalse(
+            is_blocked_ad_url("https://player.videasy.to/movie/550", settings)
+        )
+        self.assertFalse(
+            is_blocked_ad_url("https://api.speedracelight.com/vsrc/source", settings)
+        )
 
     def test_video_subtitle_and_api_requests_are_not_broadly_blocked(self) -> None:
         settings = load_adblock_settings(self.write_config({}))
         for url in (
             "https://video.example/ads-in-title/master.m3u8",
             "https://subtitle.example/v2/movie/550",
-            "https://playback.example/embed/movie/550",
+            "https://player.videasy.to/movie/550",
         ):
             with self.subTest(url=url):
                 self.assertFalse(is_blocked_ad_url(url, settings))
 
-    def test_playback_and_private_allowlists_override_strong_rules(self) -> None:
+    def test_provider_and_private_allowlists_override_strong_rules(self) -> None:
         settings = load_adblock_settings(
             self.write_config(
                 {
-                    "playback_base_url": "https://playback.example",
-                    "adblock_domains": ["playback.example", "media.example"],
+                    "adblock_domains": ["player.videasy.to", "media.example"],
                     "adblock_allow_domains": ["media.example"],
                 }
             )
         )
         self.assertFalse(
-            is_blocked_ad_url("https://playback.example/embed/movie/550", settings)
+            is_blocked_ad_url("https://player.videasy.to/movie/550", settings)
         )
         self.assertFalse(
             is_blocked_ad_url("https://cdn.media.example/video/master.m3u8", settings)
@@ -218,91 +231,11 @@ class AdBlockTests(unittest.TestCase):
             "frame.setAttribute('sandbox'",
             "frame.removeAttribute('allowfullscreen')",
             "'pointerdown'",
-            "isKnownAdScheduler",
-            "protectScheduler('setInterval')",
-            "Object.defineProperty(window, '_popads'",
             "Node.prototype.appendChild",
             "blockInsertedNode(node)",
         ):
             self.assertIn(expected, source)
         self.assertNotIn("querySelectorAll('video')", source)
-
-    def test_live_vidcore_ad_timer_is_neutralized(self) -> None:
-        node = shutil.which("node")
-        if node is None:
-            self.skipTest("Node.js is unavailable")
-        blocker = build_playback_adblock_script(
-            load_adblock_settings(self.write_config({}))
-        )
-        harness = r"""
-const scheduled = [];
-global.window = global;
-global.location = { hostname: 'vidcore.org' };
-global.addEventListener = () => {};
-global.setInterval = (handler, delay) => {
-    scheduled.push({ handler, delay });
-    return scheduled.length;
-};
-global.setTimeout = global.setInterval;
-global.fetch = () => Promise.resolve();
-global.navigator = {};
-global.XMLHttpRequest = function() {};
-global.XMLHttpRequest.prototype.open = function() {};
-global.Node = function() {};
-global.Node.prototype.appendChild = function(node) {
-    scheduled.push({ inserted: node.src || '' });
-    return node;
-};
-global.Node.prototype.insertBefore = global.Node.prototype.appendChild;
-global.Node.prototype.replaceChild = function(node, previous) { return previous; };
-global.MutationObserver = class {
-    observe() {}
-    disconnect() {}
-};
-global.document = {
-    baseURI: 'https://vidcore.org/embed/movie/550',
-    readyState: 'loading',
-    addEventListener() {},
-    querySelectorAll() { return []; }
-};
-
-eval(process.env.PISTICK_BLOCKER);
-
-setInterval(() => {
-    localStorage.clear();
-    sessionStorage.clear();
-    if (typeof window._popads !== 'undefined'
-        && typeof window._popads.show === 'function') {
-        window._popads.show();
-    } else if (typeof window.googletag !== 'undefined'
-        && typeof window.googletag.pubads !== 'undefined') {
-        window.googletag.pubads().refresh();
-    } else if (typeof window.adsbygoogle !== 'undefined') {
-        window.adsbygoogle.push({});
-    } else {
-        const script = { nodeType: 1, src: 'https://ferocitycandour.com/ad.js' };
-        document.head.appendChild(script);
-    }
-}, 30000);
-
-const script = { nodeType: 1, src: 'https://ferocitycandour.com/ad.js', remove() {} };
-const parent = new Node();
-parent.appendChild(script);
-
-if (scheduled.length !== 0) {
-    throw new Error(`explicit ad work escaped blocker: ${JSON.stringify(scheduled)}`);
-}
-"""
-        env = dict(os.environ)
-        env["PISTICK_BLOCKER"] = blocker
-        result = subprocess.run(
-            [node, "-e", harness],
-            text=True,
-            capture_output=True,
-            check=False,
-            env=env,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_online_hosts_are_not_embedded_into_every_javascript_frame(self) -> None:
         settings = AdBlockSettings(

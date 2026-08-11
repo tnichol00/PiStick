@@ -60,7 +60,6 @@ EOF
     cat >"${source_dir}/PiStick-${tag}/config.example.json" <<'EOF'
 {
   "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE",
-  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example",
   "adblock_enabled": true,
   "adblock_domains": []
 }
@@ -139,7 +138,6 @@ run_installer() {
         PISTICK_TEST_ROOT="$TEST_ROOT" \
         PISTICK_RELEASES_API_URL="file://${RELEASES_JSON}" \
         PISTICK_TMDB_TOKEN="test-tmdb-read-token" \
-        PISTICK_PLAYBACK_BASE_URL="https://playback.example" \
         PISTICK_SKIP_TMDB_VALIDATION=1 \
         "$@" \
         bash "$INSTALLER"
@@ -151,7 +149,6 @@ run_installed_updater() {
         PISTICK_TEST_ROOT="$TEST_ROOT" \
         PISTICK_RELEASES_API_URL="file://${RELEASES_JSON}" \
         PISTICK_TMDB_TOKEN="test-tmdb-read-token" \
-        PISTICK_PLAYBACK_BASE_URL="https://playback.example" \
         PISTICK_SKIP_TMDB_VALIDATION=1 \
         "$@" \
         bash "${TEST_ROOT}/usr/local/bin/pistick-update"
@@ -195,7 +192,7 @@ assert_file "${TEST_ROOT}/etc/pistick/config.json"
 assert_file "${TEST_ROOT}/usr/local/bin/pistick-update"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.0.0"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmdb_read_token"])' "${TEST_ROOT}/etc/pistick/config.json")" "test-tmdb-read-token"
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["playback_base_url"])' "${TEST_ROOT}/etc/pistick/config.json")" "https://playback.example"
+python3 -c 'import json,sys; assert "playback_base_url" not in json.load(open(sys.argv[1]))' "${TEST_ROOT}/etc/pistick/config.json"
 
 python3 - "${TEST_ROOT}/etc/pistick/config.json" <<'PY'
 import json
@@ -208,18 +205,25 @@ payload["adblock_enabled"] = True
 payload["adblock_online_lists"] = True
 payload["adblock_domains"] = ["ads.private-example.test"]
 payload["adblock_allow_domains"] = ["video.private-example.test"]
+payload["playback_base_url"] = "https://legacy-provider.example"
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 printf '{"profiles":[{"id":"kept"}],"watch_state":{}}\n' >"${TEST_ROOT}/var/lib/pistick/user-data.json"
-config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
 state_hash="$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)"
 
-# A repeated manual run is idempotent.
+# An update removes the obsolete provider field while preserving private
+# ad-block settings and watch state.
 run_installed_updater
-assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
 assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "ads.private-example.test"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_allow_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "video.private-example.test"
+python3 -c 'import json,sys; assert "playback_base_url" not in json.load(open(sys.argv[1]))' "${TEST_ROOT}/etc/pistick/config.json"
+config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
+
+# A repeated manual run is idempotent after migration.
+run_installed_updater
+assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
+assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
 
 # A newer published pre-release is installed; a newer draft is ignored.
 release_two="$(make_release 202 v1.1.0-alpha second)"

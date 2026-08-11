@@ -167,7 +167,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.6.0-explicit-ad-shield"
+APP_VERSION = "3.7.0-videasy"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -1881,6 +1881,23 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         return Number.isFinite(number) ? number : 0;
     };
 
+    const decodeMessageData = (value) => {
+        let data = value;
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch (_error) { return null; }
+        }
+        if (!data || typeof data !== 'object') return null;
+        if (data.type !== 'PLAYER_EVENT' || !data.data || typeof data.data !== 'object') {
+            return data;
+        }
+        const event = data.data;
+        return {
+            type: progressType,
+            currentTime: event.timestamp ?? event.currentTime ?? 0,
+            duration: event.duration ?? 0
+        };
+    };
+
     const localVideo = () => {
         const videos = Array.from(document.querySelectorAll('video'));
         let selected = null;
@@ -2105,8 +2122,8 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
     // This listener is registered on the current frame's own Window. It never
     // reads parent.addEventListener or iframe.contentWindow properties.
     window.addEventListener('message', (event) => {
-        const data = event && event.data;
-        if (!data || typeof data !== 'object') return;
+        const data = decodeMessageData(event && event.data);
+        if (!data) return;
         if (data.type === progressType) {
             if (window === window.top) saveProgress(data);
             return;
@@ -5035,6 +5052,7 @@ class DetailDialog(QDialog):
                 int(self.media.get("id", 0) or 0),
                 int(payload["season_number"]),
                 int(payload["episode_number"]),
+                progress_seconds=start_seconds,
             )
         except (PlaybackAPIError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Playback unavailable", str(exc))
@@ -5521,7 +5539,10 @@ class DetailDialog(QDialog):
         saved = self.watch_state.entry(self.profile_id, media) or {}
         start_seconds = int(float(saved.get("position_seconds", 0.0) or 0.0))
         try:
-            embed_url = getmovie(int(media.get("id", 0) or 0))
+            embed_url = getmovie(
+                int(media.get("id", 0) or 0),
+                progress_seconds=start_seconds,
+            )
         except (PlaybackAPIError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Playback unavailable", str(exc))
             return
@@ -6013,8 +6034,8 @@ class MainWindow(QMainWindow):
             "PiStick uses TMDB for titles, posters, descriptions, search results, and trailers.\n\n"
             "1. Create a free TMDB account and request API access.\n"
             "2. Copy your API Read Access Token.\n"
-            "3. Copy config.example.json to config.json and paste your token and legal playback base URL.\n"
-            "4. Restart this app.\n\n"
+            "3. Copy config.example.json to config.json and paste your token.\n"
+            "4. Restart this app. Videasy playback needs no separate API key.\n\n"
             "You can also set the TMDB_READ_TOKEN environment variable instead."
         )
         body.setObjectName("setupBody")

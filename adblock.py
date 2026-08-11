@@ -47,10 +47,6 @@ DEFAULT_AD_HOST_SUFFIXES = frozenset(
         "doubleclick.net",
         "exoclick.com",
         "exosrv.com",
-        # VidCore currently injects this pop-under loader twice per minute.
-        # It is intentionally built in so first-run playback is protected
-        # before the maintained online list has finished downloading.
-        "ferocitycandour.com",
         "googleadservices.com",
         "googlesyndication.com",
         "googletagservices.com",
@@ -79,6 +75,17 @@ DEFAULT_AD_HOST_SUFFIXES = frozenset(
         "taboola.com",
         "trafficjunky.net",
         "zedo.com",
+    }
+)
+
+DEFAULT_PLAYBACK_ALLOWED_HOST_SUFFIXES = frozenset(
+    {
+        "api.speedracelight.com",
+        "api.videasy.net",
+        "db.speedracelight.com",
+        "player.videasy.net",
+        "player.videasy.to",
+        "subs.videasy.to",
     }
 )
 
@@ -264,10 +271,8 @@ def load_adblock_settings(
     online_list_enabled = _config_bool(payload.get("adblock_online_lists"), True)
     configured_hosts = set(DEFAULT_AD_HOST_SUFFIXES)
     configured_hosts.update(_custom_hosts(payload.get("adblock_domains")))
-    allowed_hosts = set(_custom_hosts(payload.get("adblock_allow_domains")))
-    playback_host = url_host(payload.get("playback_base_url"))
-    if playback_host:
-        allowed_hosts.add(playback_host)
+    allowed_hosts = set(DEFAULT_PLAYBACK_ALLOWED_HOST_SUFFIXES)
+    allowed_hosts.update(_custom_hosts(payload.get("adblock_allow_domains")))
 
     configured = frozenset(configured_hosts)
     cached_hosts = (
@@ -675,68 +680,6 @@ def build_playback_adblock_script(settings: AdBlockSettings) -> str:
             return false;
         }}
     }};
-
-    // Some embedded players register an ad timer in their own first-party
-    // document and rotate the external loader hostname.  Stop only callbacks
-    // that contain multiple advertising markers plus destructive storage or
-    // script-injection behavior; ordinary player/HLS timers remain untouched.
-    const isKnownAdScheduler = (handler) => {{
-        let source = '';
-        try {{
-            source = typeof handler === 'function'
-                ? Function.prototype.toString.call(handler)
-                : String(handler || '');
-        }} catch (_error) {{
-            return false;
-        }}
-        const markers = [
-            '_popads',
-            'adsbygoogle',
-            'googletag.pubads',
-            'ferocitycandour'
-        ];
-        const markerCount = markers.reduce(
-            (count, marker) => count + (source.includes(marker) ? 1 : 0),
-            0
-        );
-        const injectsAds = source.includes('createElement')
-            || source.includes('appendChild')
-            || source.includes('document.cookie');
-        const clearsStorage = source.includes('localStorage.clear')
-            || source.includes('sessionStorage.clear');
-        return markerCount >= 2 && (injectsAds || clearsStorage);
-    }};
-    const protectScheduler = (name) => {{
-        const nativeScheduler = window[name];
-        if (typeof nativeScheduler !== 'function') return;
-        const protectedScheduler = function(handler, delay, ...args) {{
-            if (isKnownAdScheduler(handler)) return 0;
-            return nativeScheduler.call(window, handler, delay, ...args);
-        }};
-        try {{
-            Object.defineProperty(window, name, {{
-                configurable: false,
-                writable: false,
-                value: protectedScheduler
-            }});
-        }} catch (_error) {{
-            window[name] = protectedScheduler;
-        }}
-    }};
-    protectScheduler('setInterval');
-    protectScheduler('setTimeout');
-
-    // A harmless object makes common pop-under bootstrap code take its
-    // already-initialized branch without loading or displaying an advert.
-    try {{
-        if (!('_popads' in window)) {{
-            Object.defineProperty(window, '_popads', {{
-                configurable: false,
-                writable: false,
-                value: Object.freeze({{ show: () => null }})
-            }});
-        }}
-    }} catch (_error) {{}}
 
     try {{
         Object.defineProperty(window, 'open', {{

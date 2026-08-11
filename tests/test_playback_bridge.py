@@ -57,7 +57,7 @@ class PlaybackBridgeTests(unittest.TestCase):
         self.assertIn("setRunsOnSubFrames(True)", self.main_source)
         self.assertIn('setName("pistick-cross-frame-media-bridge")', self.main_source)
 
-    def test_main_uses_the_documented_api_arguments(self) -> None:
+    def test_main_uses_videasy_ids_and_documented_resume_parameter(self) -> None:
         module = ast.parse(self.main_source)
         movie_calls = []
         show_calls = []
@@ -72,8 +72,15 @@ class PlaybackBridgeTests(unittest.TestCase):
         self.assertTrue(show_calls)
         self.assertTrue(all(len(call.args) == 1 for call in movie_calls))
         self.assertTrue(all(len(call.args) == 3 for call in show_calls))
+        self.assertTrue(
+            all(
+                any(keyword.arg == "progress_seconds" for keyword in call.keywords)
+                for call in movie_calls + show_calls
+            )
+        )
         self.assertNotIn("startAt", self.main_source)
         self.assertIn("resume_seconds=start_seconds", self.main_source)
+        self.assertIn("progress_seconds=start_seconds", self.main_source)
 
     def test_webengine_profile_outlives_pages(self) -> None:
         self.assertIn("_PLAYBACK_WEB_PROFILE = profile", self.main_source)
@@ -220,6 +227,51 @@ class PlaybackBridgeTests(unittest.TestCase):
             if (hls.autoLevelCapping !== 1 || hls.capLevelToPlayerSize !== false) process.exit(2);
             if (playerState.quality !== 1 || playerState.settings.quality !== '1080p') process.exit(3);
             if (!window.__pistickForcedQuality || window.__pistickForcedQuality.selectedHeight !== 1080) process.exit(4);
+            """
+        )
+
+    def test_bridge_accepts_videasy_player_event_strings(self) -> None:
+        bridge = json.dumps(self.bridge_source)
+        self.run_node(
+            f"""
+            const vm = require('vm');
+            class EventTarget {{
+                constructor() {{ this.listeners = new Map(); }}
+                addEventListener(name, callback) {{
+                    if (!this.listeners.has(name)) this.listeners.set(name, []);
+                    this.listeners.get(name).push(callback);
+                }}
+                dispatch(name, event) {{
+                    for (const callback of this.listeners.get(name) || []) callback(event);
+                }}
+            }}
+            const window = new EventTarget();
+            window.top = window;
+            window.frames = [];
+            window.setInterval = () => 1;
+            window.clearInterval = () => {{}};
+            window.postMessage = (data) => window.dispatch('message', {{ data }});
+            const document = {{
+                readyState: 'complete',
+                querySelectorAll: () => [],
+                addEventListener() {{}}
+            }};
+            const context = {{ window, document, console, Number, Array, Math, Date, JSON }};
+            vm.createContext(context);
+            vm.runInContext({bridge}, context);
+            window.postMessage(JSON.stringify({{
+                type: 'PLAYER_EVENT',
+                data: {{
+                    event: 'timeupdate',
+                    timestamp: 77,
+                    duration: 200,
+                    progress: 38.5,
+                    type: 'movie',
+                    id: '550'
+                }}
+            }}));
+            const state = window.__pistickPlaybackState;
+            if (!state || state.currentTime !== 77 || state.duration !== 200) process.exit(1);
             """
         )
 
