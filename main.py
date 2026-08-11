@@ -33,6 +33,7 @@ from playback_api import PlaybackAPIError, getmovie, getshow
 # large browser cache only waste RAM on a television appliance.
 _CHROMIUM_FLAGS = (
     "--renderer-process-limit=1",
+    "--autoplay-policy=no-user-gesture-required",
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-default-apps",
@@ -167,7 +168,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.7.0-videasy"
+APP_VERSION = "3.8.0-player-controls"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -262,7 +263,8 @@ def build_youtube_embed_html(video_key: str) -> str:
   <div id="player"></div>
   <script>
     let player = null;
-    let playRequested = false;
+    let playRequested = true;
+    let englishSubtitlesEnabled = false;
 
     function request1080p(target) {{
       if (!target) return;
@@ -278,11 +280,31 @@ def build_youtube_embed_html(video_key: str) -> str:
       }} catch (_error) {{}}
     }}
 
+    function applyTrailerSubtitles(target) {{
+      if (!target || typeof target.setOption !== 'function') return false;
+      try {{
+        target.setOption(
+          'captions',
+          'track',
+          englishSubtitlesEnabled ? {{ languageCode: 'en' }} : {{}}
+        );
+        if (englishSubtitlesEnabled) {{
+          target.setOption('captions', 'reload', true);
+        }}
+        return true;
+      }} catch (_error) {{
+        return false;
+      }}
+    }}
+
     function onYouTubeIframeAPIReady() {{
       player = new YT.Player('player', {{
         videoId: {safe_key},
         host: 'https://www.youtube.com',
         playerVars: {{
+          autoplay: 1,
+          cc_load_policy: 0,
+          cc_lang_pref: 'en',
           rel: 0,
           playsinline: 1,
           enablejsapi: 1,
@@ -293,12 +315,19 @@ def build_youtube_embed_html(video_key: str) -> str:
         events: {{
           onReady: function(event) {{
             request1080p(event.target);
+            applyTrailerSubtitles(event.target);
             if (playRequested) event.target.playVideo();
           }},
           onStateChange: function(event) {{
             const state = Number(event.data);
             playRequested = state === 1 || state === 3;
-            if (playRequested) request1080p(event.target);
+            if (playRequested) {{
+              request1080p(event.target);
+              applyTrailerSubtitles(event.target);
+            }}
+          }},
+          onApiChange: function(event) {{
+            applyTrailerSubtitles(event.target);
           }}
         }}
       }});
@@ -332,6 +361,12 @@ def build_youtube_embed_html(video_key: str) -> str:
         request1080p(player);
         player.playVideo();
       }}
+      return true;
+    }};
+
+    window.pistickToggleTrailerSubtitles = function() {{
+      englishSubtitlesEnabled = !englishSubtitlesEnabled;
+      applyTrailerSubtitles(player);
       return true;
     }};
 
@@ -1813,6 +1848,15 @@ def _initialize_windows_playback_webview() -> bool:
         return False
 
     try:
+        webview_arguments = os.environ.get(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "",
+        ).strip()
+        if "--autoplay-policy" not in webview_arguments:
+            webview_arguments = (
+                f"{webview_arguments} --autoplay-policy=no-user-gesture-required"
+            ).strip()
+            os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = webview_arguments
         adblock_settings = _playback_adblock_settings()
         if adblock_settings.enabled:
             try:
@@ -1875,6 +1919,8 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
     const preferredHeight = 1080;
     let lastForcedHls = null;
     let lastForcedLevel = -1;
+    let autoplayPending = true;
+    let englishSubtitlesEnabled = false;
 
     const numberOrZero = (value) => {
         const number = Number(value);
@@ -1914,6 +1960,85 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
             }
         }
         return selected;
+    };
+
+    const requestLocalPlay = () => {
+        const video = localVideo();
+        if (!video) return false;
+        if (!video.paused && !video.ended) {
+            autoplayPending = false;
+            return true;
+        }
+        try {
+            const result = video.play();
+            if (result && typeof result.then === 'function') {
+                result.then(() => { autoplayPending = false; }).catch(() => {});
+            } else if (!video.paused) {
+                autoplayPending = false;
+            }
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const englishTrack = (tracks) => Array.from(tracks || []).find((track) => {
+        const language = String(
+            track && (track.language || track.srclang || track.lang || '')
+        ).toLowerCase();
+        const label = String(track && (track.label || track.name || '')).toLowerCase();
+        return /^(en|eng)(?:[-_]|$)/.test(language)
+            || /(?:^|[^a-z])english(?:[^a-z]|$)/.test(label);
+    }) || null;
+
+    const exposedHls = () => {
+        const exposed = window.__player;
+        const state = exposed && exposed.state;
+        return state && state.hls ? state.hls : null;
+    };
+
+    const setEnglishSubtitles = (enabled) => {
+        englishSubtitlesEnabled = Boolean(enabled);
+        window.__pistickEnglishSubtitlesEnabled = englishSubtitlesEnabled;
+        let handled = false;
+
+        if (typeof window.pistickSetSubtitles === 'function') {
+            try {
+                const result = window.pistickSetSubtitles(
+                    englishSubtitlesEnabled,
+                    'en'
+                );
+                handled = result !== false || handled;
+            } catch (_error) {
+                // Native text tracks and HLS.js remain available below.
+            }
+        }
+
+        for (const video of document.querySelectorAll('video')) {
+            const tracks = Array.from(video.textTracks || []);
+            const selected = englishTrack(tracks);
+            for (const track of tracks) {
+                try {
+                    track.mode = englishSubtitlesEnabled && track === selected
+                        ? 'showing'
+                        : 'disabled';
+                    handled = true;
+                } catch (_error) {}
+            }
+        }
+
+        const hls = exposedHls();
+        const hlsTracks = hls && Array.isArray(hls.subtitleTracks)
+            ? hls.subtitleTracks
+            : [];
+        if (hls && hlsTracks.length) {
+            const selected = englishTrack(hlsTracks);
+            const selectedIndex = selected ? hlsTracks.indexOf(selected) : -1;
+            try { hls.subtitleTrack = englishSubtitlesEnabled ? selectedIndex : -1; } catch (_error) {}
+            try { hls.subtitleDisplay = englishSubtitlesEnabled && selectedIndex >= 0; } catch (_error) {}
+            handled = true;
+        }
+        return handled;
     };
 
     const applyPendingSeek = (video) => {
@@ -1982,11 +2107,15 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
 
     const toggleLocalPlayback = () => {
         const video = localVideo();
-        if (!video) return false;
+        if (!video) {
+            autoplayPending = !autoplayPending;
+            return true;
+        }
         if (video.paused || video.ended) {
-            const result = video.play();
-            if (result && typeof result.catch === 'function') result.catch(() => {});
+            autoplayPending = true;
+            requestLocalPlay();
         } else {
+            autoplayPending = false;
             video.pause();
         }
         return true;
@@ -2131,19 +2260,36 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         if (data.type !== commandType || data.bridgeToken !== bridgeToken) return;
 
         const video = localVideo();
-        if (video && data.action === 'pause') video.pause();
-        if (video && data.action === 'play') {
-            const result = video.play();
-            if (result && typeof result.catch === 'function') result.catch(() => {});
+        if (data.action === 'pause') {
+            autoplayPending = false;
+            if (video) video.pause();
+        }
+        if (data.action === 'play') {
+            autoplayPending = true;
+            requestLocalPlay();
         }
         if (data.action === 'toggle') toggleLocalPlayback();
         if (data.action === 'seek') requestSeek(data.positionSeconds);
         if (data.action === 'seek-relative') requestRelativeSeek(data.offsetSeconds);
-        relayToChildren(data);
+        let childMessage = data;
+        if (data.action === 'subtitles-english-toggle') {
+            const enabled = !englishSubtitlesEnabled;
+            setEnglishSubtitles(enabled);
+            childMessage = {
+                ...data,
+                action: 'subtitles-english-set',
+                enabled
+            };
+        } else if (data.action === 'subtitles-english-set') {
+            setEnglishSubtitles(Boolean(data.enabled));
+        }
+        relayToChildren(childMessage);
     });
 
     const bindVideoEvents = () => {
         forcePreferredQuality();
+        if (autoplayPending) requestLocalPlay();
+        setEnglishSubtitles(englishSubtitlesEnabled);
         applyPendingSeek(localVideo());
         for (const video of document.querySelectorAll('video')) {
             if (video.__pistickProgressEventsBound) continue;
@@ -2153,6 +2299,14 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
             }
         }
         sendProgress();
+        if (window === window.top) {
+            relayToChildren({
+                type: commandType,
+                bridgeToken,
+                action: 'subtitles-english-set',
+                enabled: englishSubtitlesEnabled
+            });
+        }
     };
 
     if (document.readyState === 'loading') {
@@ -2458,6 +2612,29 @@ def get_trailer_web_view_class():
                             type: 'pistick-media-command',
                             bridgeToken: __PISTICK_BRIDGE_TOKEN__,
                             action: 'toggle'
+                        }, '*');
+                    }
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def toggle_subtitles(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self.page().runJavaScript(
+                """
+                (() => {
+                    let handled = false;
+                    if (typeof window.pistickToggleTrailerSubtitles === 'function') {
+                        try {
+                            handled = window.pistickToggleTrailerSubtitles() !== false;
+                        } catch (_error) {}
+                    }
+                    if (!handled) {
+                        window.postMessage({
+                            type: 'pistick-media-command',
+                            bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                            action: 'subtitles-english-toggle'
                         }, '*');
                     }
                     return true;
@@ -2796,6 +2973,21 @@ def get_windows_playback_web_view_class():
                         type: 'pistick-media-command',
                         bridgeToken: __PISTICK_BRIDGE_TOKEN__,
                         action: 'toggle'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def toggle_subtitles(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'subtitles-english-toggle'
                     }, '*');
                     return true;
                 })();
@@ -3714,7 +3906,7 @@ class ControllerManager(QObject):
     navigate = Signal(str)
     activate = Signal()
     back = Signal()
-    pause = Signal()
+    subtitles = Signal()
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -3840,7 +4032,7 @@ class ControllerManager(QObject):
         if self._button_edge(1):  # B / Circle
             self.back.emit()
         if self._button_edge(2):  # X / Square
-            self.pause.emit()
+            self.subtitles.emit()
 
         current = self._direction_values()
         for direction, pressed in current.items():
@@ -4186,10 +4378,13 @@ class TrailerDialog(QDialog):
         overlay_layout.addWidget(web)
 
         controller_hint = (
-            f"Controller: A play/pause  •  ←/→ skip {PLAYBACK_SEEK_SECONDS}s  •  "
-            "B return to details"
+            f"Controller: A play/pause  •  X English subtitles  •  "
+            f"←/→ skip {PLAYBACK_SEEK_SECONDS}s  •  B return to details"
             if self.embed_url
-            else "Controller: A play/pause  •  B back     Keyboard: Esc back"
+            else (
+                "Controller: A play/pause  •  X English subtitles  •  B back"
+                "     Keyboard: Esc back"
+            )
         )
         hint = QLabel(controller_hint, overlay)
         hint.setObjectName("trailerFullscreenHint")
@@ -4263,6 +4458,16 @@ class TrailerDialog(QDialog):
             return False
         try:
             web.toggle_media()
+        except RuntimeError:
+            return False
+        return True
+
+    def toggle_subtitles(self) -> bool:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "toggle_subtitles"):
+            return False
+        try:
+            web.toggle_subtitles()
         except RuntimeError:
             return False
         return True
@@ -4353,8 +4558,7 @@ class TrailerDialog(QDialog):
         return True
 
     def _escape_requested(self) -> None:
-        if not self.exit_fullscreen():
-            self.reject()
+        self.controller_back()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -5218,6 +5422,10 @@ class DetailDialog(QDialog):
         dialog = self._active_player_dialog()
         return bool(dialog is not None and dialog.toggle_playback())
 
+    def toggle_player_subtitles(self) -> bool:
+        dialog = self._active_player_dialog()
+        return bool(dialog is not None and dialog.toggle_subtitles())
+
     def seek_playback(self, offset_seconds: float) -> bool:
         dialog = self._active_playback_dialog()
         return bool(dialog is not None and dialog.seek_relative(offset_seconds))
@@ -5365,7 +5573,7 @@ class DetailDialog(QDialog):
         entry = self.watch_state.entry(self.profile_id, media)
         if entry and entry.get("status") == "in_progress":
             if media.get("media_type") == "tv":
-                finished = QPushButton("✓  Mark Episode Finished")
+                finished = QPushButton("✓  Mark Episode as Finished")
                 finished.clicked.connect(lambda: self._mark_current_episode_finished(media))
             else:
                 finished = QPushButton("✓  Mark as Finished")
@@ -5375,6 +5583,14 @@ class DetailDialog(QDialog):
             finished.setFocusPolicy(Qt.StrongFocus)
             buttons.addWidget(finished)
             self.controller_actions.append(finished)
+            if media.get("media_type") == "tv":
+                show_finished = QPushButton("✓  Mark Show as Finished")
+                show_finished.setObjectName("secondaryButton")
+                show_finished.setProperty("controllerSelected", False)
+                show_finished.setFocusPolicy(Qt.StrongFocus)
+                show_finished.clicked.connect(lambda: self._mark_finished(media))
+                buttons.addWidget(show_finished)
+                self.controller_actions.append(show_finished)
         elif entry and entry.get("status") == "finished":
             unwatched = QPushButton("Mark as Unwatched")
             unwatched.setObjectName("secondaryButton")
@@ -5737,7 +5953,7 @@ class MainWindow(QMainWindow):
         self.controller.navigate.connect(self._controller_navigate)
         self.controller.activate.connect(self._controller_activate)
         self.controller.back.connect(self._controller_back)
-        self.controller.pause.connect(self._controller_pause)
+        self.controller.subtitles.connect(self._controller_subtitles)
 
         QApplication.instance().installEventFilter(self)
 
@@ -6736,10 +6952,10 @@ class MainWindow(QMainWindow):
             return
         self._escape_action()
 
-    def _controller_pause(self) -> None:
+    def _controller_subtitles(self) -> None:
         detail = self._active_detail_dialog()
-        if detail is not None and detail.is_player_fullscreen():
-            detail.pause_fullscreen_player()
+        if detail is not None and detail.is_player_screen_open():
+            detail.toggle_player_subtitles()
 
     def _open_controller_search_keyboard(self) -> None:
         if not self.controller.connected or self._controller_keyboard is not None:

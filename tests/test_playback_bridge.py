@@ -146,32 +146,114 @@ class PlaybackBridgeTests(unittest.TestCase):
             vm.runInContext({bridge}, context);
             const state = window.__pistickPlaybackState;
             if (!state || state.currentTime !== 42 || state.duration !== 100) process.exit(1);
+            const initialChildMessages = childMessages.length;
             window.postMessage({{
                 type: 'pistick-media-command',
                 bridgeToken: 'test-bridge-token',
                 action: 'pause'
             }});
-            if (!video.pausedByPiStick || !video.paused || childMessages.length !== 1) process.exit(2);
+            if (
+                !video.pausedByPiStick
+                || !video.paused
+                || childMessages.length !== initialChildMessages + 1
+            ) process.exit(2);
             window.postMessage({{
                 type: 'pistick-media-command',
                 bridgeToken: 'test-bridge-token',
                 action: 'toggle'
             }});
-            if (!video.played || video.paused || childMessages.length !== 2) process.exit(3);
+            if (!video.played || video.paused || childMessages.length !== initialChildMessages + 2) process.exit(3);
             window.postMessage({{
                 type: 'pistick-media-command',
                 bridgeToken: 'test-bridge-token',
                 action: 'seek',
                 positionSeconds: 65
             }});
-            if (video.currentTime !== 65 || childMessages.length !== 3) process.exit(4);
+            if (video.currentTime !== 65 || childMessages.length !== initialChildMessages + 3) process.exit(4);
             window.postMessage({{
                 type: 'pistick-media-command',
                 bridgeToken: 'test-bridge-token',
                 action: 'seek-relative',
                 offsetSeconds: -10
             }});
-            if (video.currentTime !== 55 || childMessages.length !== 4) process.exit(5);
+            if (video.currentTime !== 55 || childMessages.length !== initialChildMessages + 4) process.exit(5);
+            """
+        )
+
+    def test_bridge_autoplays_and_toggles_only_english_subtitles(self) -> None:
+        bridge = json.dumps(self.bridge_source)
+        self.run_node(
+            f"""
+            const vm = require('vm');
+            class EventTarget {{
+                constructor() {{ this.listeners = new Map(); }}
+                addEventListener(name, callback) {{
+                    if (!this.listeners.has(name)) this.listeners.set(name, []);
+                    this.listeners.get(name).push(callback);
+                }}
+                dispatch(name, event) {{
+                    for (const callback of this.listeners.get(name) || []) callback(event);
+                }}
+            }}
+            const english = {{ language: 'en-US', label: 'English', mode: 'showing' }};
+            const french = {{ language: 'fr', label: 'French', mode: 'showing' }};
+            const video = {{
+                currentTime: 0,
+                duration: 120,
+                readyState: 4,
+                clientWidth: 1280,
+                clientHeight: 720,
+                paused: true,
+                ended: false,
+                textTracks: [english, french],
+                addEventListener() {{}},
+                play() {{
+                    this.playedByPiStick = true;
+                    this.paused = false;
+                    return Promise.resolve();
+                }},
+                pause() {{ this.paused = true; }}
+            }};
+            const hls = {{
+                levels: [],
+                subtitleTracks: [
+                    {{ lang: 'eng', name: 'English' }},
+                    {{ lang: 'fra', name: 'French' }}
+                ],
+                subtitleTrack: 0,
+                subtitleDisplay: true
+            }};
+            const window = new EventTarget();
+            window.top = window;
+            window.frames = [];
+            window.__player = {{ state: {{ hls }} }};
+            window.setInterval = (callback) => {{ callback(); return 1; }};
+            window.clearInterval = () => {{}};
+            window.postMessage = (data) => window.dispatch('message', {{ data }});
+            const document = {{
+                readyState: 'complete',
+                querySelectorAll: (selector) => selector === 'video' ? [video] : [],
+                addEventListener() {{}}
+            }};
+            const context = {{ window, document, console, Number, Array, Math, Date, String, Promise }};
+            vm.createContext(context);
+            vm.runInContext({bridge}, context);
+            if (!video.playedByPiStick || video.paused) process.exit(1);
+            if (english.mode !== 'disabled' || french.mode !== 'disabled') process.exit(2);
+            if (hls.subtitleTrack !== -1 || hls.subtitleDisplay !== false) process.exit(3);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'subtitles-english-toggle'
+            }});
+            if (english.mode !== 'showing' || french.mode !== 'disabled') process.exit(4);
+            if (hls.subtitleTrack !== 0 || hls.subtitleDisplay !== true) process.exit(5);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'subtitles-english-toggle'
+            }});
+            if (english.mode !== 'disabled' || hls.subtitleTrack !== -1) process.exit(6);
             """
         )
 

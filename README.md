@@ -11,12 +11,12 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - Keyboard, mouse, and controller navigation
 - Infinite horizontal discovery carousels
 - On-screen keyboard for controller searches
-- Movie watch-state tracking
+- Movie, show, and individual-episode watch-state controls
 - Season and episode selection with per-profile resume data
 - Videasy movie and episode playback from TMDB-number-based URLs
 - Client-side 1080p HLS selection with the best available fallback
 - Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
-- On-demand YouTube trailer screen with controller play/pause
+- Autoplaying Videasy and YouTube players with controller subtitle controls
 - Low-memory mode for the original Raspberry Pi Zero W
 - Manual, release-only installation and updates with rollback
 
@@ -53,7 +53,7 @@ https://player.videasy.to/tv/1399/1/3
 
 Videasy's docs currently show `player.videasy.net`, which redirects to `player.videasy.to`. PiStick uses the final HTTPS origin directly so its anti-popup navigation lock does not reject that redirect. When saved progress exists, PiStick appends only Videasy's documented `progress` parameter, such as `?progress=120`.
 
-On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same player. The player expands fullscreen after opening. Controller A toggles play/pause, Left/Right seeks backward/forward 10 seconds, and B closes playback directly back to the title details screen.
+On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open and autoplay from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens and autoplays in the same player. The player expands fullscreen after opening. Subtitles begin off; controller X toggles the available English track. Controller A toggles play/pause, Left/Right seeks backward/forward 10 seconds, and B or keyboard Escape closes playback directly back to the title details screen.
 
 Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. PiStick accepts those documented messages and also keeps its HTML5-video bridge as a fallback. Qt WebEngine on the Pi injects the bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
 
@@ -65,11 +65,13 @@ A custom player can also expose its playback state in one of these ways:
 - Use a top-level HTML5 `<video>` element; PiStick reads it automatically.
 - From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the top window.
 
-For a custom player that does not expose an HTML5 `<video>` element, define `window.pistickSeekTo(seconds)` so PiStick can apply the saved resume position without changing the API URL. It can also define `window.pistickSeekBy(offsetSeconds)` for controller skipping and `window.pistickSetQuality(label, height)` for the preferred resolution.
+For a custom player that does not expose an HTML5 `<video>` element, define `window.pistickSeekTo(seconds)` so PiStick can apply the saved resume position without changing the API URL. It can also define `window.pistickSeekBy(offsetSeconds)` for controller skipping, `window.pistickSetQuality(label, height)` for the preferred resolution, and `window.pistickSetSubtitles(enabled, language)` for PiStick's English subtitle toggle.
 
 PiStick requests 1080p from YouTube trailers and locks an exposed HLS player to its 1080p rendition. If a particular source has no 1080p rendition, PiStick selects the closest available rendition, preferring the highest one below 1080p. This is done inside the loaded player and does not add anything to the documented API URL.
 
 PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. When playback closes, the Home page's Continue Watching row is rebuilt immediately—even if Home is currently behind Search or the title-details dialog. When that title is reopened, the bridge seeks to the saved timestamp after its video metadata becomes available. The values are not stored beside secrets in `config.json`.
+
+An in-progress TV show exposes separate **Mark Episode as Finished** and **Mark Show as Finished** actions. Finishing the whole show removes it from Continue Watching and replaces those actions with the same **Mark as Unwatched** action used for finished movies.
 
 Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
 
@@ -305,9 +307,11 @@ sudo systemctl restart pistick.service
 Controller playback controls:
 
 - A: play/pause trailers, movies, and episodes
+- X: toggle English subtitles; subtitles start off whenever a player opens
 - Left/Right on the D-pad or left stick: seek 10 seconds backward/forward in a movie or episode
-- B during movie or episode fullscreen: close playback and return directly to title details
+- B or keyboard Escape during movie or episode playback: close playback and return directly to title details
 - B during trailer fullscreen: return to the trailer window; press B again to close it
+- Keyboard Escape follows the same two-step back behavior for trailers
 
 ## Optional remote viewing
 
