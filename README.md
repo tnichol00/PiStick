@@ -1,8 +1,8 @@
 # PiStick
 
-PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers.
+PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through a user-configured legal playback service.
 
-PiStick is currently an alpha. Browsing, profiles, trailers, and watch-state features work, but actual movie and episode playback is still a placeholder until Jellyfin is connected.
+PiStick is currently an alpha. Browsing, profiles, trailers, watch-state features, and embedded movie and episode playback are implemented. Playback progress inside the embedded webpage is not yet synchronized automatically, so PiStick records a title as started when its player opens.
 
 ## Features
 
@@ -13,6 +13,7 @@ PiStick is currently an alpha. Browsing, profiles, trailers, and watch-state fea
 - On-screen keyboard for controller searches
 - Movie watch-state tracking
 - Season and episode selection with per-profile resume data
+- Embedded movie and episode playback from TMDB-number-based URLs
 - On-demand YouTube trailer screen with fullscreen controls
 - Low-memory mode for the original Raspberry Pi Zero W
 - Manual, release-only installation and updates with rollback
@@ -27,8 +28,29 @@ PiStick is currently an alpha. Browsing, profiles, trailers, and watch-state fea
 - A computer with a microSD-card reader for Raspberry Pi Imager
 - Optional Bluetooth controller or USB controller with a micro-USB OTG adapter
 - Free [TMDB account](https://www.themoviedb.org/signup)
+- The HTTPS base URL of a legal playback service you control or are authorized to use
 
-The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but the Chromium-based YouTube trailer player is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
+The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
+
+## Playback API
+
+The playback URL helpers live in `playback_api.py` and are called by `main.py` like this:
+
+```python
+from playback_api import getmovie, getshow
+
+movie_url = getmovie(550)
+episode_url = getshow(1399, 1, 3)
+```
+
+The service's base URL is read at runtime from the private `playback_base_url` field in `/etc/pistick/config.json`. The tracked example contains only a placeholder. With a locally configured base URL of `https://playback.example`, the calls produce:
+
+```text
+https://playback.example/embed/movie/550
+https://playback.example/embed/tv/1399/1/3
+```
+
+The repository and published releases never contain the real playback host. PiStick loads the resulting page directly in Qt WebEngine. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
 
 ## Install PiStick
 
@@ -75,7 +97,7 @@ ssh pistick@192.168.1.123
 
 Replace `192.168.1.123` with the Pi's actual address.
 
-### 3. Get the TMDB API Read Access Token
+### 3. Get the required configuration
 
 1. Sign in to TMDB.
 2. Open [TMDB API settings](https://www.themoviedb.org/settings/api).
@@ -83,6 +105,8 @@ Replace `192.168.1.123` with the Pi's actual address.
 4. Copy the long **API Read Access Token**.
 
 PiStick uses the long Read Access Token as a Bearer token. Do not use the shorter v3 API key.
+
+Also have the base URL for your legal playback service ready. It must begin with `https://` and must not include `/embed/movie/...`, `/embed/tv/...`, credentials, a query, or a fragment.
 
 ### 4. Run the installer
 
@@ -92,13 +116,14 @@ Paste this complete command into the Pi's SSH terminal:
 curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-The installer has one PiStick-specific prompt:
+The installer has two PiStick-specific prompts:
 
 ```text
 Paste your TMDB API Read Access Token:
+Paste your legal playback service base URL:
 ```
 
-Paste the token and press Enter. The prompt is hidden, so the token will not appear while it is pasted or typed.
+Paste each value and press Enter. Both prompts are hidden, so neither value appears while it is pasted or typed. They are stored only in `/etc/pistick/config.json` on the Pi.
 
 The first installation can take a while on an original Pi Zero W because the Pi must download and install Qt WebEngine and the other system packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again; completed package work and configuration are reused.
 
@@ -111,6 +136,7 @@ The installer automatically:
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
 - Installs Python, Requests, pygame, PyQt5, Qt WebEngine, minimal X11, Matchbox, fonts, graphics libraries, and Bluetooth support.
 - Validates the TMDB API Read Access Token before saving it.
+- Validates and normalizes the private HTTPS playback base URL before saving it.
 - Downloads the newest published PiStick GitHub Release, never an unfinished branch commit.
 - Ignores draft releases. Published pre-releases are eligible for installation.
 - Validates the release manifest, required files, Bash syntax, and Python syntax.
@@ -140,7 +166,7 @@ When a new release exists, the updater:
 2. Validates its required files and syntax.
 3. Stops PiStick only after validation succeeds.
 4. Activates the new release and watches its startup health.
-5. Keeps the user's TMDB token, profiles, watch history, and caches.
+5. Keeps the user's TMDB token, playback base URL, profiles, watch history, and caches.
 6. Automatically returns to the previous release if startup fails.
 
 The updater never installs a normal tag, branch commit, or draft release.
@@ -151,7 +177,7 @@ These files survive every update:
 
 | Purpose | Path |
 | --- | --- |
-| TMDB configuration | `/etc/pistick/config.json` |
+| Private TMDB and playback configuration | `/etc/pistick/config.json` |
 | Profiles and watch history | `/var/lib/pistick/user-data.json` |
 | Installed release record | `/var/lib/pistick/installed-release.json` |
 | Posters, API data, and WebEngine cache | `/var/cache/pistick/` |
@@ -268,7 +294,7 @@ The installer found no non-draft GitHub Release. A tag or branch by itself is in
 
 ### `pistick-update: command not found`
 
-Rerun the full installation command. It safely reuses the existing TMDB token and release data while restoring the updater command.
+Rerun the full installation command. It safely reuses the existing private configuration and release data while restoring the updater command.
 
 ### `pistick.service` repeatedly restarts or stays failed
 
@@ -321,6 +347,28 @@ If no device appears, reconnect or pair the controller again. If a device appear
 
 The trailer screen uses Qt WebEngine and Chromium, making it the heaviest part of PiStick. It is created only after **Watch Trailer** is selected and destroyed after closing. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
 
+### A movie or episode does not load
+
+First validate the local configuration and confirm that `playback_base_url` is present:
+
+```bash
+sudo python3 -m json.tool /etc/pistick/config.json
+```
+
+Then test that configured host from the Pi, replacing the placeholder below with the private value shown in the configuration:
+
+```bash
+curl -I https://YOUR-LEGAL-PLAYBACK-HOST.example/
+```
+
+The player needs JavaScript and media playback support from Qt WebEngine. Check the PiStick logs for Chromium, network, or certificate errors:
+
+```bash
+journalctl -u pistick.service -b -n 100 --no-pager
+```
+
+No playback API key is required. The TMDB token is used only for title metadata; `playback_base_url` supplies the private host, and movie or episode paths are built from the selected TMDB number, season, and episode.
+
 ## Creating a release
 
 PiStick installs only published GitHub Releases. Maintainers should release from a tested `main` commit:
@@ -330,13 +378,15 @@ PiStick installs only published GitHub Releases. Maintainers should release from
    ```bash
    bash -n install.sh
    bash tests/test_installer.sh
-   python3 -m py_compile main.py
+   python3 -m py_compile main.py playback_api.py
+   python3 -m unittest discover -s tests -p 'test_*.py'
    python3 -m json.tool config.example.json >/dev/null
    python3 -m json.tool pistick-release.json >/dev/null
    ```
 
 2. Confirm the release contains:
    - `main.py`
+   - `playback_api.py`
    - `config.example.json`
    - `install.sh`
    - `pistick-release.json`
@@ -350,9 +400,10 @@ GitHub's automatic source archive is enough; no separate ZIP asset is required. 
 
 - TMDB metadata and posters come from TMDB.
 - Trailers play through YouTube.
+- Selecting playback sends the TMDB title number—and, for TV, the season and episode numbers—to the configured playback host.
 - Profiles and watch history stay on the Pi.
-- The TMDB token is stored at `/etc/pistick/config.json` with restricted permissions.
+- The TMDB token and playback base URL are stored at `/etc/pistick/config.json` with restricted permissions.
 - The installer does not collect or store a GitHub credential.
-- A real `config.json` must never be committed or included in a release.
+- The repository's `config.example.json` contains only placeholders. A real `config.json` must never be committed or included in a release.
 
 This product uses the TMDB API but is not endorsed or certified by TMDB.

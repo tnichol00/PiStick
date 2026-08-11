@@ -15,6 +15,8 @@ from typing import Any, Callable, Optional
 import requests
 from requests.adapters import HTTPAdapter
 
+from playback_api import PlaybackAPIError, getmovie, getshow
+
 # Keep Chromium lean before QtWebEngine is imported. PiStick uses one embedded
 # player, so extra renderer processes, extension services, update checks, and a
 # large browser cache only waste RAM on a television appliance.
@@ -154,7 +156,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.1.1-on-demand-trailers"
+APP_VERSION = "3.2.0-embedded-playback"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -311,22 +313,6 @@ def _release_worker(worker: QRunnable) -> None:
     _ACTIVE_WORKERS.discard(worker)
 
 
-# -----------------------------------------------------------------------------
-# JELLYFIN HOOK
-# -----------------------------------------------------------------------------
-def watch_title(media: dict[str, Any]) -> None:
-    """
-    Replace this function with your Jellyfin API / playback code later.
-
-    PiStick records that the current profile started this title before calling
-    this function. TV episode payloads include ``media_type="episode"``,
-    ``series_id``, ``season_number`` and ``episode_number``. When Jellyfin is
-    connected, report episode progress through
-    WatchStateStore.set_episode_progress().
-    """
-    pass
-
-
 @dataclass
 class AppConfig:
     tmdb_read_token: str = ""
@@ -348,7 +334,7 @@ class AppConfig:
 
 
 class WatchStateStore:
-    """Local per-profile watch history used until Jellyfin provides real progress."""
+    """Local per-profile watch history for the embedded playback experience."""
 
     DEFAULT_AVATARS = ["red", "blue", "green", "purple", "orange", "teal"]
 
@@ -386,8 +372,7 @@ class WatchStateStore:
 
     @staticmethod
     def _serialize(data: dict[str, Any]) -> str:
-        # Compact JSON materially reduces SD-card writes once Jellyfin begins
-        # reporting progress, while preserving the exact state schema.
+        # Compact JSON reduces SD-card writes while preserving the state schema.
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     def _save_data(self, data: dict[str, Any]) -> None:
@@ -680,7 +665,7 @@ class WatchStateStore:
         episode: dict[str, Any],
         progress: float,
     ) -> None:
-        """Call this from Jellyfin with progress for one TV episode."""
+        """Store progress for one TV episode when a player reports it."""
         self._write_episode_progress(profile_id, media, episode, progress)
 
     def mark_started(self, profile_id: Optional[str], media: dict[str, Any]) -> None:
@@ -690,7 +675,7 @@ class WatchStateStore:
         key = self.media_key(media)
         previous = history.get(key, {})
         progress = float(previous.get("progress", 0.0) or 0.0)
-        # Without Jellyfin progress yet, 3% simply means "started".
+        # Until the embed service exposes progress, 3% simply means "started".
         if previous.get("status") == "finished":
             progress = 0.03
         else:
@@ -724,7 +709,7 @@ class WatchStateStore:
         self.save()
 
     def set_progress(self, profile_id: Optional[str], media: dict[str, Any], progress: float) -> None:
-        """Call this later from Jellyfin with a 0.0-1.0 playback fraction."""
+        """Store a 0.0-1.0 playback fraction when a player reports one."""
         if not profile_id:
             return
         progress = max(0.0, min(1.0, float(progress)))
@@ -1719,12 +1704,11 @@ def get_trailer_web_view_class():
 
         def __init__(self, parent: Optional[QWidget] = None):
             super().__init__(parent)
-            # A trailer-scoped profile/page lets Chromium's renderer and page
-            # data be torn down when this one screen closes. Using Qt's default
-            # profile would keep the heavy browser session alive for the rest
-            # of PiStick even after the trailer was gone.
+            # A media-scoped profile/page lets Chromium's renderer and page data
+            # be torn down when the player closes. Using Qt's default profile
+            # would keep the heavy browser session alive for the rest of PiStick.
             try:
-                self._profile = QWebEngineProfile("pistick-trailer", self)
+                self._profile = QWebEngineProfile("pistick-embedded-media", self)
             except TypeError:
                 self._profile = QWebEngineProfile(self)
             self._configure_profile(self._profile, QWebEngineProfile)
@@ -1795,15 +1779,40 @@ def get_trailer_web_view_class():
                 self.clicked.emit()
             return False
 
-        def play_trailer(self) -> None:
+        def play_media(self) -> None:
             self.page().runJavaScript(
-                "window.pistickPlayTrailer && window.pistickPlayTrailer();"
+                """
+                (() => {
+                    if (typeof window.pistickPlayTrailer === 'function') {
+                        return window.pistickPlayTrailer();
+                    }
+                    const video = document.querySelector('video');
+                    if (!video) return false;
+                    const result = video.play();
+                    if (result && typeof result.catch === 'function') result.catch(() => {});
+                    return true;
+                })();
+                """
             )
 
-        def pause_trailer(self) -> None:
+        def pause_media(self) -> None:
             self.page().runJavaScript(
-                "window.pistickPauseTrailer && window.pistickPauseTrailer();"
+                """
+                (() => {
+                    if (typeof window.pistickPauseTrailer === 'function') {
+                        return window.pistickPauseTrailer();
+                    }
+                    const video = document.querySelector('video');
+                    if (!video) return false;
+                    video.pause();
+                    return true;
+                })();
+                """
             )
+
+        # Compatibility aliases for the existing trailer dialog.
+        play_trailer = play_media
+        pause_trailer = pause_media
 
         def dispose(self) -> None:
             if self._filter_installed:
@@ -1814,9 +1823,7 @@ def get_trailer_web_view_class():
             try:
                 self.stop()
                 self.page().setAudioMuted(True)
-                self.page().runJavaScript(
-                    "window.pistickPauseTrailer && window.pistickPauseTrailer();"
-                )
+                self.pause_media()
                 self.setUrl(QUrl("about:blank"))
             except RuntimeError:
                 pass
@@ -2924,18 +2931,23 @@ class TextInputDialog(QDialog):
 
 
 class TrailerDialog(QDialog):
-    """On-demand trailer player whose Chromium lifetime matches this screen."""
+    """On-demand embedded player whose Chromium lifetime matches this screen."""
 
     controlsReady = Signal(object)
 
     def __init__(
         self,
         title: str,
-        trailer: dict[str, Any],
+        trailer: Optional[dict[str, Any]] = None,
         parent: Optional[QWidget] = None,
+        *,
+        embed_url: str = "",
+        player_label: str = "Trailer",
     ):
         super().__init__(parent)
-        self.trailer = dict(trailer)
+        self.trailer = dict(trailer or {})
+        self.embed_url = str(embed_url).strip()
+        self.player_label = str(player_label).strip() or "Player"
         self.trailer_web: Optional[QWidget] = None
         self.trailer_placeholder: Optional[QFrame] = None
         self.trailer_overlay: Optional[QFrame] = None
@@ -2955,7 +2967,7 @@ class TrailerDialog(QDialog):
         self._fullscreen_timer.setInterval(2000)
         self._fullscreen_timer.timeout.connect(self.enter_fullscreen)
 
-        self.setWindowTitle(f"{title} — Trailer")
+        self.setWindowTitle(f"{title} — {self.player_label}")
         self.resize(1080, 700)
         self.setMinimumSize(860, 540)
         self.setModal(True)
@@ -2967,7 +2979,7 @@ class TrailerDialog(QDialog):
 
         topbar = QHBoxLayout()
         topbar.setContentsMargins(28, 18, 24, 12)
-        heading = QLabel(f"Trailer  •  {title}")
+        heading = QLabel(f"{self.player_label}  •  {title}")
         heading.setObjectName("rowHeading")
         topbar.addWidget(heading)
         topbar.addStretch(1)
@@ -2997,7 +3009,7 @@ class TrailerDialog(QDialog):
 
         trailer_view_class = get_trailer_web_view_class()
         if trailer_view_class is None:
-            note = QLabel("Embedded trailer playback is unavailable in this build.")
+            note = QLabel("Embedded playback is unavailable in this build.")
             note.setObjectName("mutedLabel")
             note.setAlignment(Qt.AlignCenter)
             placeholder_layout.addWidget(note, 1)
@@ -3006,10 +3018,16 @@ class TrailerDialog(QDialog):
             web.setMinimumHeight(360)
             web.setFocusPolicy(Qt.NoFocus)
             web.clicked.connect(self._schedule_fullscreen)
-            web.setHtml(
-                build_youtube_embed_html(str(trailer.get("key", ""))),
-                QUrl(f"{YOUTUBE_REFERER}trailer.html"),
+            web.loadFinished.connect(
+                lambda loaded, player=web: player.play_media() if loaded else None
             )
+            if self.embed_url:
+                web.setUrl(QUrl(self.embed_url))
+            else:
+                web.setHtml(
+                    build_youtube_embed_html(str(self.trailer.get("key", ""))),
+                    QUrl(f"{YOUTUBE_REFERER}trailer.html"),
+                )
             placeholder_layout.addWidget(web)
             self.trailer_web = web
 
@@ -3021,8 +3039,8 @@ class TrailerDialog(QDialog):
         if self._play_started or self.trailer_web is None:
             return
         self._play_started = True
-        if hasattr(self.trailer_web, "play_trailer"):
-            self.trailer_web.play_trailer()
+        if hasattr(self.trailer_web, "play_media"):
+            self.trailer_web.play_media()
         self._schedule_fullscreen()
 
     def _schedule_fullscreen(self) -> None:
@@ -3125,9 +3143,9 @@ class TrailerDialog(QDialog):
         if (
             self._trailer_fullscreen
             and self.trailer_web is not None
-            and hasattr(self.trailer_web, "pause_trailer")
+            and hasattr(self.trailer_web, "pause_media")
         ):
-            self.trailer_web.pause_trailer()
+            self.trailer_web.pause_media()
 
     def exit_fullscreen(self) -> bool:
         if not self._trailer_fullscreen or self.trailer_overlay is None:
@@ -3247,6 +3265,23 @@ class TrailerDialog(QDialog):
         super().closeEvent(event)
 
 
+class PlaybackDialog(TrailerDialog):
+    """Movie or episode player backed by PiStick's playback API."""
+
+    def __init__(
+        self,
+        title: str,
+        embed_url: str,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(
+            title,
+            parent=parent,
+            embed_url=embed_url,
+            player_label="Now Playing",
+        )
+
+
 class DetailDialog(QDialog):
     stateChanged = Signal()
     controlsReady = Signal(object)
@@ -3286,6 +3321,7 @@ class DetailDialog(QDialog):
         self.trailer: Optional[dict[str, Any]] = None
         self.trailer_button: Optional[QPushButton] = None
         self._trailer_dialog: Optional[TrailerDialog] = None
+        self._playback_dialog: Optional[PlaybackDialog] = None
         self.setWindowTitle(initial_media.get("title", APP_NAME))
         self.resize(1080, 760)
         self.setMinimumSize(860, 620)
@@ -3788,12 +3824,76 @@ class DetailDialog(QDialog):
         return payload
 
     def _watch_episode_clicked(self, episode: dict[str, Any]) -> None:
+        payload = self._episode_playback_payload(episode)
+        try:
+            embed_url = getshow(
+                int(self.media.get("id", 0) or 0),
+                int(payload["season_number"]),
+                int(payload["episode_number"]),
+            )
+        except (PlaybackAPIError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Playback unavailable", str(exc))
+            return
+
         self.watch_state.mark_episode_started(self.profile_id, self.media, episode)
         self.stateChanged.emit()
-        watch_title(self._episode_playback_payload(episode))
         media = dict(self.media)
-        self._episode_after_close = lambda: self._render(media)
+
+        def start_playback() -> None:
+            self._render(media)
+            self._open_playback_dialog(str(payload["title"]), embed_url)
+
+        self._episode_after_close = start_playback
+        if not self.close_episode_picker():
+            self._episode_after_close = None
+            start_playback()
+
+    def _active_playback_dialog(self) -> Optional[PlaybackDialog]:
+        dialog = self._playback_dialog
+        if dialog is None:
+            return None
+        try:
+            if dialog.isVisible():
+                return dialog
+        except RuntimeError:
+            pass
+        self._playback_dialog = None
+        return None
+
+    def _active_player_dialog(self) -> Optional[TrailerDialog]:
+        return self._active_playback_dialog() or self._active_trailer_dialog()
+
+    def _discard_playback_state(self) -> None:
+        dialog = self._playback_dialog
+        self._playback_dialog = None
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+        except RuntimeError:
+            pass
+
+    def _open_playback_dialog(self, title: str, embed_url: str) -> None:
+        active = self._active_player_dialog()
+        if active is not None:
+            active.raise_()
+            active.activateWindow()
+            return
+
         self.close_episode_picker()
+        dialog = PlaybackDialog(title, embed_url, self)
+        self._playback_dialog = dialog
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.controlsReady.connect(self.controlsReady.emit)
+        dialog.finished.connect(lambda _result, d=dialog: self._playback_finished(d))
+        dialog.open()
+
+    def _playback_finished(self, dialog: PlaybackDialog) -> None:
+        if self._playback_dialog is dialog:
+            self._playback_dialog = None
+        preferred = self.watch_show_button or self.preferred_controller_widget
+        if preferred is not None:
+            self.controlsReady.emit(preferred)
 
     def _active_trailer_dialog(self) -> Optional[TrailerDialog]:
         dialog = self._trailer_dialog
@@ -3845,24 +3945,24 @@ class DetailDialog(QDialog):
         if preferred is not None:
             self.controlsReady.emit(preferred)
 
-    def is_trailer_screen_open(self) -> bool:
-        return self._active_trailer_dialog() is not None
+    def is_player_screen_open(self) -> bool:
+        return self._active_player_dialog() is not None
 
-    def is_trailer_fullscreen(self) -> bool:
-        dialog = self._active_trailer_dialog()
+    def is_player_fullscreen(self) -> bool:
+        dialog = self._active_player_dialog()
         return bool(dialog is not None and dialog.is_fullscreen())
 
-    def exit_trailer_fullscreen(self) -> bool:
-        dialog = self._active_trailer_dialog()
+    def exit_player_fullscreen(self) -> bool:
+        dialog = self._active_player_dialog()
         return bool(dialog is not None and dialog.exit_fullscreen())
 
-    def pause_fullscreen_trailer(self) -> None:
-        dialog = self._active_trailer_dialog()
+    def pause_fullscreen_player(self) -> None:
+        dialog = self._active_player_dialog()
         if dialog is not None:
             dialog.pause_fullscreen()
 
     def controller_back(self) -> bool:
-        dialog = self._active_trailer_dialog()
+        dialog = self._active_player_dialog()
         if dialog is not None:
             return dialog.controller_back()
         if self.close_episode_picker():
@@ -3885,6 +3985,7 @@ class DetailDialog(QDialog):
             self.episode_panel.raise_()
 
     def closeEvent(self, event) -> None:
+        self._discard_playback_state()
         self._discard_trailer_state()
         if self._episode_panel_animation is not None:
             self._episode_panel_animation.stop()
@@ -3895,6 +3996,7 @@ class DetailDialog(QDialog):
         self.controller_actions = []
         self.preferred_controller_widget = None
         self.trailer_button = None
+        self._discard_playback_state()
         self._discard_trailer_state()
         self._discard_episode_picker()
         self._clear_body()
@@ -4045,9 +4147,9 @@ class DetailDialog(QDialog):
             self.controlsReady.emit(self.preferred_controller_widget)
 
     def controller_focusables(self) -> list[QWidget]:
-        trailer_dialog = self._active_trailer_dialog()
-        if trailer_dialog is not None:
-            return trailer_dialog.controller_focusables()
+        player_dialog = self._active_player_dialog()
+        if player_dialog is not None:
+            return player_dialog.controller_focusables()
         if self._episode_picker_open:
             widgets: list[QWidget] = [
                 button
@@ -4070,9 +4172,9 @@ class DetailDialog(QDialog):
         return widgets
 
     def controller_current_target(self, current: Optional[QWidget] = None) -> Optional[QWidget]:
-        trailer_dialog = self._active_trailer_dialog()
-        if trailer_dialog is not None:
-            return trailer_dialog.controller_current_target(current)
+        player_dialog = self._active_player_dialog()
+        if player_dialog is not None:
+            return player_dialog.controller_current_target(current)
         focusables = self.controller_focusables()
         if current in focusables:
             return current
@@ -4094,9 +4196,9 @@ class DetailDialog(QDialog):
         current: Optional[QWidget] = None,
     ) -> Optional[QWidget]:
         """Return the next details control without relying on WebEngine focus."""
-        trailer_dialog = self._active_trailer_dialog()
-        if trailer_dialog is not None:
-            return trailer_dialog.controller_move_target(direction, current)
+        player_dialog = self._active_player_dialog()
+        if player_dialog is not None:
+            return player_dialog.controller_move_target(direction, current)
         if self._episode_picker_open:
             focusables = self.controller_focusables()
             current = self.controller_current_target(current)
@@ -4173,11 +4275,16 @@ class DetailDialog(QDialog):
         if media.get("media_type") == "tv":
             self.toggle_episode_picker()
             return
+        try:
+            embed_url = getmovie(int(media.get("id", 0) or 0))
+        except (PlaybackAPIError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Playback unavailable", str(exc))
+            return
+
         self.watch_state.mark_started(self.profile_id, media)
         self.stateChanged.emit()
-        # Intentionally blank until you add Jellyfin logic to watch_title().
-        watch_title(media)
         self._render(media)
+        self._open_playback_dialog(str(media.get("title") or "Movie"), embed_url)
 
     def _mark_finished(self, media: dict[str, Any]) -> None:
         self.watch_state.mark_finished(self.profile_id, media)
@@ -4198,6 +4305,7 @@ class DetailDialog(QDialog):
         self._render(media)
 
     def _show_error(self, error: str) -> None:
+        self._discard_playback_state()
         self._discard_trailer_state()
         self._clear_body()
         label = QLabel(f"Could not load this title.\n\n{error}")
@@ -4649,7 +4757,7 @@ class MainWindow(QMainWindow):
             "PiStick uses TMDB for titles, posters, descriptions, search results, and trailers.\n\n"
             "1. Create a free TMDB account and request API access.\n"
             "2. Copy your API Read Access Token.\n"
-            "3. Copy config.example.json to config.json and paste your token.\n"
+            "3. Copy config.example.json to config.json and paste your token and legal playback base URL.\n"
             "4. Restart this app.\n\n"
             "You can also set the TMDB_READ_TOKEN environment variable instead."
         )
@@ -5331,8 +5439,8 @@ class MainWindow(QMainWindow):
 
     def _controller_pause(self) -> None:
         detail = self._active_detail_dialog()
-        if detail is not None and detail.is_trailer_fullscreen():
-            detail.pause_fullscreen_trailer()
+        if detail is not None and detail.is_player_fullscreen():
+            detail.pause_fullscreen_player()
 
     def _open_controller_search_keyboard(self) -> None:
         if not self.controller.connected or self._controller_keyboard is not None:

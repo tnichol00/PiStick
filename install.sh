@@ -10,7 +10,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly INSTALLER_VERSION="1.0.0"
+readonly INSTALLER_VERSION="1.1.0"
 readonly REPOSITORY="tnichol00/PiStick"
 readonly DEFAULT_RELEASES_API="https://api.github.com/repos/${REPOSITORY}/releases?per_page=100"
 readonly SERVICE_NAME="pistick.service"
@@ -326,6 +326,68 @@ print(token)
 PY
 }
 
+config_playback_base_url() {
+    local path="$1"
+    [[ -f "$path" ]] || return 1
+    python3 - "$path" <<'PY'
+import json
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+    configured = str(payload.get("playback_base_url") or "").strip()
+    parts = urlsplit(configured)
+    port = parts.port
+except (OSError, ValueError, TypeError, AttributeError):
+    raise SystemExit(1)
+
+if (
+    parts.scheme.lower() != "https"
+    or not parts.hostname
+    or parts.username is not None
+    or parts.password is not None
+    or parts.query
+    or parts.fragment
+):
+    raise SystemExit(1)
+
+hostname = parts.hostname.lower()
+if ":" in hostname and not hostname.startswith("["):
+    hostname = f"[{hostname}]"
+netloc = hostname if port is None else f"{hostname}:{port}"
+print(urlunsplit(("https", netloc, parts.path.rstrip("/"), "", "")))
+PY
+}
+
+normalize_playback_base_url() {
+    python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+configured = sys.stdin.read().strip()
+try:
+    parts = urlsplit(configured)
+    port = parts.port
+except ValueError:
+    raise SystemExit(1)
+if (
+    parts.scheme.lower() != "https"
+    or not parts.hostname
+    or parts.username is not None
+    or parts.password is not None
+    or parts.query
+    or parts.fragment
+):
+    raise SystemExit(1)
+hostname = parts.hostname.lower()
+if ":" in hostname and not hostname.startswith("["):
+    hostname = f"[{hostname}]"
+netloc = hostname if port is None else f"{hostname}:{port}"
+print(urlunsplit(("https", netloc, parts.path.rstrip("/"), "", "")))
+'
+}
+
 validate_tmdb_token() {
     local token="$1"
     if [[ "$TEST_MODE" == "1" && "${PISTICK_SKIP_TMDB_VALIDATION:-0}" == "1" ]]; then
@@ -364,16 +426,30 @@ else:
 
 write_config() {
     local token="$1"
+    local playback_base_url="$2"
     local temporary="${CONFIG_DIR}/.config.json.tmp"
-    python3 -c '
+    printf '%s\n%s\n' "$token" "$playback_base_url" | python3 -c '
 import json
 import sys
 
-token = sys.stdin.read().strip()
+values = sys.stdin.read().splitlines()
+if len(values) != 2 or not all(values):
+    raise SystemExit("Invalid PiStick configuration")
+token, playback_base_url = values
+try:
+    payload = json.load(open(sys.argv[2], encoding="utf-8"))
+    if not isinstance(payload, dict):
+        payload = {}
+except (OSError, ValueError, TypeError):
+    payload = {}
+payload.update({
+    "tmdb_read_token": token,
+    "playback_base_url": playback_base_url,
+})
 with open(sys.argv[1], "w", encoding="utf-8") as output:
-    json.dump({"tmdb_read_token": token}, output, indent=2)
+    json.dump(payload, output, indent=2)
     output.write("\n")
-' "$temporary" <<<"$token"
+' "$temporary" "$CONFIG_FILE"
     chown root:"$PISTICK_GROUP" "$temporary"
     chmod 0640 "$temporary"
     mv -f "$temporary" "$CONFIG_FILE"
@@ -386,7 +462,7 @@ migrate_legacy_data() {
         if config_token "${legacy_dir}/config.json" >/dev/null 2>&1; then
             install -o root -g "$PISTICK_GROUP" -m 0640 \
                 "${legacy_dir}/config.json" "$CONFIG_FILE"
-            log "Preserved the existing TMDB configuration"
+            log "Preserved the existing PiStick configuration"
         fi
     fi
 
@@ -399,14 +475,12 @@ migrate_legacy_data() {
     fi
 }
 
-ensure_tmdb_config() {
-    local existing=""
-    existing="$(config_token "$CONFIG_FILE" 2>/dev/null || true)"
-    if [[ -n "$existing" ]]; then
-        return 0
-    fi
-
+ensure_runtime_config() {
     local token=""
+    local playback_base_url=""
+    token="$(config_token "$CONFIG_FILE" 2>/dev/null || true)"
+    playback_base_url="$(config_playback_base_url "$CONFIG_FILE" 2>/dev/null || true)"
+
     while [[ -z "$token" ]]; do
         if [[ "$TEST_MODE" == "1" && -n "${PISTICK_TMDB_TOKEN:-}" ]]; then
             token="$PISTICK_TMDB_TOKEN"
@@ -427,9 +501,25 @@ ensure_tmdb_config() {
         fi
     done
 
-    write_config "$token"
-    unset token existing
-    log "TMDB configuration saved privately at /etc/pistick/config.json"
+    while [[ -z "$playback_base_url" ]]; do
+        if [[ "$TEST_MODE" == "1" && -n "${PISTICK_PLAYBACK_BASE_URL:-}" ]]; then
+            playback_base_url="$PISTICK_PLAYBACK_BASE_URL"
+        else
+            [[ -r /dev/tty ]] || die "An interactive SSH terminal is required to enter the playback base URL."
+            printf '\nPaste your legal playback service base URL: ' >/dev/tty
+            IFS= read -r -s playback_base_url </dev/tty
+            printf '\n' >/dev/tty
+        fi
+        playback_base_url="${playback_base_url//$'\r'/}"
+        playback_base_url="$(printf '%s' "$playback_base_url" | normalize_playback_base_url 2>/dev/null || true)"
+        [[ -n "$playback_base_url" ]] || {
+            warn "Enter a complete HTTPS base URL without credentials, a query, or a fragment."
+        }
+    done
+
+    write_config "$token" "$playback_base_url"
+    unset token playback_base_url
+    log "Private TMDB and playback configuration saved at /etc/pistick/config.json"
 }
 
 fetch_releases_json() {
@@ -449,7 +539,7 @@ fetch_releases_json() {
 
     case "$status" in
         200) ;;
-        404) die "GitHub cannot access ${REPOSITORY} without authentication. Make the repository public so a fresh Pi needs only the TMDB token." ;;
+        404) die "GitHub cannot access ${REPOSITORY} without authentication. The release repository must be public for credential-free installation." ;;
         403) die "GitHub refused the release check, usually because its anonymous API rate limit was reached. Try again later." ;;
         *) die "The GitHub release check failed with HTTP ${status:-unknown}." ;;
     esac
@@ -599,16 +689,35 @@ PY
     [[ -f "${staging}/pistick-release.json" ]] || \
         die "Release ${RELEASE_TAG} predates the release installer and cannot safely separate user data."
 
-    python3 - "${staging}/pistick-release.json" <<'PY'
+    python3 - "${staging}/pistick-release.json" "$staging" <<'PY'
 import json
+from pathlib import Path, PurePosixPath
 import sys
-manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+
+manifest_path = Path(sys.argv[1])
+release_root = Path(sys.argv[2]).resolve()
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 if (
     manifest.get("installer_schema") != 1
     or manifest.get("entrypoint") != "main.py"
     or manifest.get("updater") != "install.sh"
 ):
     raise SystemExit("Unsupported PiStick release manifest")
+
+required_files = manifest.get("required_files", [])
+if not isinstance(required_files, list) or any(not isinstance(item, str) for item in required_files):
+    raise SystemExit("Invalid required_files in PiStick release manifest")
+for item in required_files:
+    relative = PurePosixPath(item)
+    if relative.is_absolute() or not relative.parts or any(
+        part in ("", ".", "..") for part in relative.parts
+    ):
+        raise SystemExit(f"Unsafe required file path in release manifest: {item}")
+    target = release_root.joinpath(*relative.parts)
+    if not target.is_file():
+        raise SystemExit(f"Release is missing required file: {item}")
+    if target.suffix == ".py":
+        compile(target.read_text(encoding="utf-8"), item, "exec")
 PY
     bash -n "${staging}/install.sh" || die "Release ${RELEASE_TAG} contains an invalid updater."
     grep -q 'PISTICK_CONFIG_PATH' "${staging}/main.py" || die "Release does not support external configuration storage."
@@ -732,7 +841,7 @@ main() {
     write_runtime_files
     resolve_latest_release
     migrate_legacy_data
-    ensure_tmdb_config
+    ensure_runtime_config
 
     local current_tag=""
     current_tag="$(installed_tag 2>/dev/null || true)"

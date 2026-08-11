@@ -1,3 +1,4 @@
 {
-  "tmdb_read_token": "PASTE_YOUR_TMDB_TOKEN_HERE"
+  "tmdb_read_token": "PASTE_YOUR_TMDB_TOKEN_HERE",
+  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example"
 }

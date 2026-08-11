@@ -55,9 +55,11 @@ PISTICK_STATE_PATH = os.getenv("PISTICK_STATE_PATH", "pistick_state.json")
 PISTICK_CACHE_DIR = os.getenv("PISTICK_CACHE_DIR", ".cache")
 MARKER = "${marker}"
 EOF
+    cp "${PROJECT_DIR}/playback_api.py" "${source_dir}/PiStick-${tag}/playback_api.py"
     cat >"${source_dir}/PiStick-${tag}/config.example.json" <<'EOF'
 {
-  "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE"
+  "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE",
+  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example"
 }
 EOF
     cp "$INSTALLER" "${source_dir}/PiStick-${tag}/install.sh"
@@ -66,7 +68,13 @@ EOF
 {
   "installer_schema": 1,
   "entrypoint": "main.py",
-  "updater": "install.sh"
+  "updater": "install.sh",
+  "required_files": [
+    "main.py",
+    "playback_api.py",
+    "config.example.json",
+    "install.sh"
+  ]
 }
 EOF
     tar -C "$source_dir" -czf "$archive" "PiStick-${tag}"
@@ -127,6 +135,7 @@ run_installer() {
         PISTICK_TEST_ROOT="$TEST_ROOT" \
         PISTICK_RELEASES_API_URL="file://${RELEASES_JSON}" \
         PISTICK_TMDB_TOKEN="test-tmdb-read-token" \
+        PISTICK_PLAYBACK_BASE_URL="https://playback.example" \
         PISTICK_SKIP_TMDB_VALIDATION=1 \
         "$@" \
         bash "$INSTALLER"
@@ -138,6 +147,7 @@ run_installed_updater() {
         PISTICK_TEST_ROOT="$TEST_ROOT" \
         PISTICK_RELEASES_API_URL="file://${RELEASES_JSON}" \
         PISTICK_TMDB_TOKEN="test-tmdb-read-token" \
+        PISTICK_PLAYBACK_BASE_URL="https://playback.example" \
         PISTICK_SKIP_TMDB_VALIDATION=1 \
         "$@" \
         bash "${TEST_ROOT}/usr/local/bin/pistick-update"
@@ -145,7 +155,8 @@ run_installed_updater() {
 
 mkdir -p "$TEST_ROOT" "$FIXTURES"
 bash -n "$INSTALLER"
-python3 -m py_compile "${PROJECT_DIR}/main.py"
+python3 -m py_compile "${PROJECT_DIR}/main.py" "${PROJECT_DIR}/playback_api.py"
+python3 -m unittest discover -s "${PROJECT_DIR}/tests" -p 'test_*.py'
 
 # Verify main.py's external data paths without importing Qt.
 python3 - "${PROJECT_DIR}/main.py" <<'PY'
@@ -171,10 +182,12 @@ run_installer
 
 assert_symlink "${TEST_ROOT}/opt/pistick/current"
 assert_file "${TEST_ROOT}/opt/pistick/current/main.py"
+assert_file "${TEST_ROOT}/opt/pistick/current/playback_api.py"
 assert_file "${TEST_ROOT}/etc/pistick/config.json"
 assert_file "${TEST_ROOT}/usr/local/bin/pistick-update"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.0.0"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmdb_read_token"])' "${TEST_ROOT}/etc/pistick/config.json")" "test-tmdb-read-token"
+assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["playback_base_url"])' "${TEST_ROOT}/etc/pistick/config.json")" "https://playback.example"
 
 printf '{"profiles":[{"id":"kept"}],"watch_state":{}}\n' >"${TEST_ROOT}/var/lib/pistick/user-data.json"
 config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
