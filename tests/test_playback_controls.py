@@ -40,7 +40,8 @@ class PlaybackControllerTests(unittest.TestCase):
         self.assertIn("let playRequested = true", self.main_source)
         self.assertIn("autoplay: 1", self.main_source)
         self.assertIn("let autoplayPending = true", self.main_source)
-        self.assertIn("if (autoplayPending) requestLocalPlay()", self.main_source)
+        self.assertIn("triggerVideasyStartOverlay", self.main_source)
+        self.assertIn("if (autoplayPending) requestPlaybackStart()", self.main_source)
         self.assertIn("PlaybackRequiresUserGesture", self.main_source)
         self.assertIn("--autoplay-policy=no-user-gesture-required", self.main_source)
 

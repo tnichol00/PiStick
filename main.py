@@ -1920,6 +1920,7 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
     let lastForcedHls = null;
     let lastForcedLevel = -1;
     let autoplayPending = true;
+    let providerStartAttemptAt = 0;
     let englishSubtitlesEnabled = false;
 
     const numberOrZero = (value) => {
@@ -1962,6 +1963,37 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         return selected;
     };
 
+    const triggerVideasyStartOverlay = () => {
+        if (!autoplayPending) return false;
+        let hostname = '';
+        try {
+            hostname = String(window.location && window.location.hostname || '')
+                .toLowerCase();
+        } catch (_error) {
+            return false;
+        }
+        if (hostname !== 'player.videasy.to' && hostname !== 'player.videasy.net') {
+            return false;
+        }
+
+        const now = Date.now();
+        if (now - providerStartAttemptAt < 1500) return false;
+        const overlays = document.querySelectorAll(
+            'div.fixed.inset-0.bg-black.cursor-pointer.select-none'
+        );
+        for (const overlay of overlays) {
+            if (!overlay || typeof overlay.querySelector !== 'function') continue;
+            const playIcon = overlay.querySelector(
+                'button svg path[d="M8 5v14l11-7z"]'
+            );
+            if (!playIcon || typeof overlay.click !== 'function') continue;
+            providerStartAttemptAt = now;
+            overlay.click();
+            return true;
+        }
+        return false;
+    };
+
     const requestLocalPlay = () => {
         const video = localVideo();
         if (!video) return false;
@@ -1980,6 +2012,11 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         } catch (_error) {
             return false;
         }
+    };
+
+    const requestPlaybackStart = () => {
+        if (requestLocalPlay()) return true;
+        return triggerVideasyStartOverlay();
     };
 
     const englishTrack = (tracks) => Array.from(tracks || []).find((track) => {
@@ -2108,12 +2145,12 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
     const toggleLocalPlayback = () => {
         const video = localVideo();
         if (!video) {
-            autoplayPending = !autoplayPending;
-            return true;
+            autoplayPending = true;
+            return requestPlaybackStart();
         }
         if (video.paused || video.ended) {
             autoplayPending = true;
-            requestLocalPlay();
+            requestPlaybackStart();
         } else {
             autoplayPending = false;
             video.pause();
@@ -2266,7 +2303,7 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         }
         if (data.action === 'play') {
             autoplayPending = true;
-            requestLocalPlay();
+            requestPlaybackStart();
         }
         if (data.action === 'toggle') toggleLocalPlayback();
         if (data.action === 'seek') requestSeek(data.positionSeconds);
@@ -2288,7 +2325,7 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
 
     const bindVideoEvents = () => {
         forcePreferredQuality();
-        if (autoplayPending) requestLocalPlay();
+        if (autoplayPending) requestPlaybackStart();
         setEnglishSubtitles(englishSubtitlesEnabled);
         applyPendingSeek(localVideo());
         for (const video of document.querySelectorAll('video')) {

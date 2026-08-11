@@ -257,6 +257,86 @@ class PlaybackBridgeTests(unittest.TestCase):
             """
         )
 
+    def test_bridge_advances_past_videasy_start_overlay_before_video_exists(self) -> None:
+        bridge = json.dumps(self.bridge_source)
+        self.run_node(
+            f"""
+            const vm = require('vm');
+            class EventTarget {{
+                constructor() {{ this.listeners = new Map(); }}
+                addEventListener(name, callback) {{
+                    if (!this.listeners.has(name)) this.listeners.set(name, []);
+                    this.listeners.get(name).push(callback);
+                }}
+                dispatch(name, event) {{
+                    for (const callback of this.listeners.get(name) || []) callback(event);
+                }}
+            }}
+            const playIcon = {{}};
+            const overlay = {{
+                clicks: 0,
+                querySelector(selector) {{
+                    return selector === 'button svg path[d="M8 5v14l11-7z"]'
+                        ? playIcon
+                        : null;
+                }},
+                click() {{ this.clicks += 1; }}
+            }};
+            const video = {{
+                currentTime: 0,
+                duration: 120,
+                readyState: 4,
+                clientWidth: 1280,
+                clientHeight: 720,
+                paused: true,
+                ended: false,
+                textTracks: [],
+                addEventListener() {{}},
+                play() {{
+                    this.playedByPiStick = true;
+                    this.paused = false;
+                    return Promise.resolve();
+                }},
+                pause() {{ this.paused = true; }}
+            }};
+            let videos = [];
+            let intervalCallback = null;
+            const window = new EventTarget();
+            window.top = window;
+            window.frames = [];
+            window.location = {{ hostname: 'player.videasy.to' }};
+            window.setInterval = (callback) => {{
+                intervalCallback = callback;
+                callback();
+                return 1;
+            }};
+            window.clearInterval = () => {{}};
+            window.postMessage = (data) => window.dispatch('message', {{ data }});
+            const document = {{
+                readyState: 'complete',
+                querySelectorAll(selector) {{
+                    if (selector === 'video') return videos;
+                    if (
+                        selector === 'div.fixed.inset-0.bg-black.cursor-pointer.select-none'
+                    ) return [overlay];
+                    return [];
+                }},
+                addEventListener() {{}}
+            }};
+            const context = {{
+                window, document, console, Number, Array, Math, Date, String, Promise
+            }};
+            vm.createContext(context);
+            vm.runInContext({bridge}, context);
+            if (overlay.clicks !== 1) process.exit(1);
+            if (!intervalCallback) process.exit(2);
+            videos = [video];
+            intervalCallback();
+            if (!video.playedByPiStick || video.paused) process.exit(3);
+            if (overlay.clicks !== 1) process.exit(4);
+            """
+        )
+
     def test_bridge_forces_the_1080p_hls_level_when_available(self) -> None:
         bridge = json.dumps(self.bridge_source)
         self.run_node(
