@@ -56,10 +56,13 @@ PISTICK_CACHE_DIR = os.getenv("PISTICK_CACHE_DIR", ".cache")
 MARKER = "${marker}"
 EOF
     cp "${PROJECT_DIR}/playback_api.py" "${source_dir}/PiStick-${tag}/playback_api.py"
+    cp "${PROJECT_DIR}/adblock.py" "${source_dir}/PiStick-${tag}/adblock.py"
     cat >"${source_dir}/PiStick-${tag}/config.example.json" <<'EOF'
 {
   "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE",
-  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example"
+  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example",
+  "adblock_enabled": true,
+  "adblock_domains": []
 }
 EOF
     cp "$INSTALLER" "${source_dir}/PiStick-${tag}/install.sh"
@@ -71,6 +74,7 @@ EOF
   "updater": "install.sh",
   "required_files": [
     "main.py",
+    "adblock.py",
     "playback_api.py",
     "config.example.json",
     "install.sh"
@@ -155,7 +159,10 @@ run_installed_updater() {
 
 mkdir -p "$TEST_ROOT" "$FIXTURES"
 bash -n "$INSTALLER"
-python3 -m py_compile "${PROJECT_DIR}/main.py" "${PROJECT_DIR}/playback_api.py"
+python3 -m py_compile \
+    "${PROJECT_DIR}/main.py" \
+    "${PROJECT_DIR}/adblock.py" \
+    "${PROJECT_DIR}/playback_api.py"
 python3 -m unittest discover -s "${PROJECT_DIR}/tests" -p 'test_*.py'
 
 # Verify main.py's external data paths without importing Qt.
@@ -182,6 +189,7 @@ run_installer
 
 assert_symlink "${TEST_ROOT}/opt/pistick/current"
 assert_file "${TEST_ROOT}/opt/pistick/current/main.py"
+assert_file "${TEST_ROOT}/opt/pistick/current/adblock.py"
 assert_file "${TEST_ROOT}/opt/pistick/current/playback_api.py"
 assert_file "${TEST_ROOT}/etc/pistick/config.json"
 assert_file "${TEST_ROOT}/usr/local/bin/pistick-update"
@@ -189,6 +197,17 @@ assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmdb_read_token"])' "${TEST_ROOT}/etc/pistick/config.json")" "test-tmdb-read-token"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["playback_base_url"])' "${TEST_ROOT}/etc/pistick/config.json")" "https://playback.example"
 
+python3 - "${TEST_ROOT}/etc/pistick/config.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["adblock_enabled"] = True
+payload["adblock_domains"] = ["ads.private-example.test"]
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
 printf '{"profiles":[{"id":"kept"}],"watch_state":{}}\n' >"${TEST_ROOT}/var/lib/pistick/user-data.json"
 config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
 state_hash="$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)"
@@ -197,6 +216,7 @@ state_hash="$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' 
 run_installed_updater
 assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
 assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
+assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "ads.private-example.test"
 
 # A newer published pre-release is installed; a newer draft is ignored.
 release_two="$(make_release 202 v1.1.0-alpha second)"

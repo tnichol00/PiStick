@@ -16,6 +16,13 @@ from typing import Any, Callable, Optional
 import requests
 from requests.adapters import HTTPAdapter
 
+from adblock import (
+    AdBlockSettings,
+    build_playback_adblock_script,
+    is_blocked_ad_url,
+    load_adblock_settings,
+    same_origin,
+)
 from playback_api import PlaybackAPIError, getmovie, getshow
 
 # Keep Chromium lean before QtWebEngine is imported. PiStick uses one embedded
@@ -157,7 +164,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.2.1-windows-webview2"
+APP_VERSION = "3.3.0-playback-adblock"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -1712,7 +1719,9 @@ class RemoteImage(QLabel):
 
 TrailerWebView = None
 _WEBENGINE_ATTEMPTED = False
-_MEDIA_WEB_PROFILE = None
+_TRAILER_WEB_PROFILE = None
+_PLAYBACK_WEB_PROFILE = None
+_PLAYBACK_AD_INTERCEPTOR = None
 WindowsPlaybackWebView = None
 _WINDOWS_WEBVIEW_ATTEMPTED = False
 _WINDOWS_WEBVIEW_INITIALIZED = False
@@ -1938,9 +1947,13 @@ def get_trailer_web_view_class():
                 QWebEngineProfile,
                 QWebEngineScript,
                 QWebEngineSettings,
+                QWebEngineUrlRequestInterceptor,
             )
             from PySide6.QtWebEngineWidgets import QWebEngineView
         else:
+            from PyQt5.QtWebEngineCore import (  # type: ignore[no-redef]
+                QWebEngineUrlRequestInterceptor,
+            )
             from PyQt5.QtWebEngineWidgets import (  # type: ignore[no-redef]
                 QWebEnginePage,
                 QWebEngineProfile,
@@ -1951,28 +1964,104 @@ def get_trailer_web_view_class():
     except (ImportError, OSError):
         return None
 
+    class _PlaybackRequestInterceptor(QWebEngineUrlRequestInterceptor):
+        """Block known ad hosts before Chromium reaches the network stack."""
+
+        def __init__(self, settings: AdBlockSettings, parent: Optional[QObject] = None):
+            super().__init__(parent)
+            self._settings = settings
+
+        def interceptRequest(self, info) -> None:
+            try:
+                request_url = info.requestUrl().toString()
+                if is_blocked_ad_url(request_url, self._settings):
+                    info.block(True)
+            except (AttributeError, RuntimeError):
+                return
+
+    class _MediaPage(QWebEnginePage):
+        """Keep API playback in its trusted window and discard pop-ups."""
+
+        def __init__(self, profile, parent, *, block_ads: bool = False):
+            super().__init__(profile, parent)
+            self._block_ads = bool(block_ads)
+            self._trusted_url = ""
+
+        def set_trusted_url(self, url: str) -> None:
+            self._trusted_url = str(url or "")
+
+        def acceptNavigationRequest(self, url, navigation_type, is_main_frame):
+            candidate = url.toString()
+            if (
+                self._block_ads
+                and is_main_frame
+                and self._trusted_url
+                and candidate != "about:blank"
+                and not same_origin(candidate, self._trusted_url)
+            ):
+                return False
+            return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
+
+        def createWindow(self, window_type):
+            if self._block_ads:
+                return None
+            return super().createWindow(window_type)
+
     class _TrailerWebView(QWebEngineView):
         """Web player that observes clicks without stealing controller focus."""
 
         clicked = Signal()
 
-        def __init__(self, parent: Optional[QWidget] = None):
+        def __init__(
+            self,
+            parent: Optional[QWidget] = None,
+            *,
+            block_ads: bool = False,
+        ):
             super().__init__(parent)
+            self._block_ads = bool(block_ads)
+            self._adblock_settings = (
+                load_adblock_settings(CONFIG_PATH)
+                if self._block_ads
+                else AdBlockSettings(enabled=False, blocked_hosts=frozenset())
+            )
             # The profile must outlive every page that uses it. A shared,
             # application-owned profile avoids Qt releasing a dialog-scoped
             # profile while its asynchronous WebEnginePage is still shutting
             # down. Pages remain view-scoped and are discarded after playback.
-            global _MEDIA_WEB_PROFILE
-            if _MEDIA_WEB_PROFILE is None:
+            global _TRAILER_WEB_PROFILE
+            global _PLAYBACK_WEB_PROFILE
+            global _PLAYBACK_AD_INTERCEPTOR
+            profile = _PLAYBACK_WEB_PROFILE if self._block_ads else _TRAILER_WEB_PROFILE
+            if profile is None:
                 profile_parent = QApplication.instance()
+                profile_name = (
+                    "pistick-playback-media"
+                    if self._block_ads
+                    else "pistick-trailer-media"
+                )
                 try:
-                    profile = QWebEngineProfile("pistick-embedded-media", profile_parent)
+                    profile = QWebEngineProfile(profile_name, profile_parent)
                 except TypeError:
                     profile = QWebEngineProfile(profile_parent)
                 self._configure_profile(profile, QWebEngineProfile)
-                _MEDIA_WEB_PROFILE = profile
-            self._profile = _MEDIA_WEB_PROFILE
-            self._page = QWebEnginePage(self._profile, self)
+                if self._block_ads:
+                    if self._adblock_settings.enabled:
+                        interceptor = _PlaybackRequestInterceptor(
+                            self._adblock_settings,
+                            profile,
+                        )
+                        profile.setUrlRequestInterceptor(interceptor)
+                        _PLAYBACK_AD_INTERCEPTOR = interceptor
+                    _PLAYBACK_WEB_PROFILE = profile
+                else:
+                    _TRAILER_WEB_PROFILE = profile
+            self._profile = profile
+            self._page = _MediaPage(
+                self._profile,
+                self,
+                block_ads=self._block_ads,
+            )
             # QWebEngineView owns its automatically created page. On PySide6,
             # setPage() can destroy that page immediately, which also
             # invalidates its Python wrapper. Do not call deleteLater() on the
@@ -1995,6 +2084,19 @@ def get_trailer_web_view_class():
                 )
             )
             self._page.scripts().insert(self._bridge_script)
+            self._adblock_script = None
+            if self._adblock_settings.enabled:
+                self._adblock_script = QWebEngineScript()
+                self._adblock_script.setName("pistick-playback-adblock")
+                self._adblock_script.setInjectionPoint(
+                    getattr(injection_points, "DocumentCreation")
+                )
+                self._adblock_script.setWorldId(getattr(worlds, "MainWorld", 0))
+                self._adblock_script.setRunsOnSubFrames(True)
+                self._adblock_script.setSourceCode(
+                    build_playback_adblock_script(self._adblock_settings)
+                )
+                self._page.scripts().insert(self._adblock_script)
 
             web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
             for name, enabled in (
@@ -2011,6 +2113,11 @@ def get_trailer_web_view_class():
             if app is not None:
                 app.installEventFilter(self)
                 self._filter_installed = True
+
+        def setUrl(self, url: QUrl) -> None:
+            if self._block_ads:
+                self._page.set_trusted_url(url.toString())
+            super().setUrl(url)
 
         @staticmethod
         def _configure_profile(profile, profile_type) -> None:
@@ -2178,6 +2285,7 @@ def get_trailer_web_view_class():
             except RuntimeError:
                 pass
             self._bridge_script = None
+            self._adblock_script = None
 
     _TrailerWebView.__name__ = "TrailerWebView"
     TrailerWebView = _TrailerWebView
@@ -2208,17 +2316,35 @@ def get_windows_playback_web_view_class():
         clicked = Signal()
         loadFinished = Signal(bool)
 
-        def __init__(self, parent: Optional[QWidget] = None):
+        def __init__(
+            self,
+            parent: Optional[QWidget] = None,
+            *,
+            block_ads: bool = True,
+        ):
             super().__init__(parent)
             self._bridge_token = uuid.uuid4().hex
             self._disposed = False
             self._capabilities_reported = False
+            self._adblock_settings = (
+                load_adblock_settings(CONFIG_PATH)
+                if block_ads
+                else AdBlockSettings(enabled=False, blocked_hosts=frozenset())
+            )
+            self._adblock_source = build_playback_adblock_script(
+                self._adblock_settings
+            )
+            self._trusted_url = ""
+            self._adblock_injected_for_url = ""
+            self._restore_scheduled = False
             self._native_view = QWebView()
             window_type = getattr(Qt, "WindowType", Qt)
             no_focus = getattr(window_type, "WindowDoesNotAcceptFocus", None)
             if no_focus is not None:
                 self._native_view.setFlag(no_focus, True)
             self._native_view.loadingChanged.connect(self._loading_changed)
+            self._native_view.loadProgressChanged.connect(self._load_progress_changed)
+            self._native_view.urlChanged.connect(self._url_changed)
             self._window_container = QWidget.createWindowContainer(
                 self._native_view,
                 self,
@@ -2252,13 +2378,48 @@ def get_windows_playback_web_view_class():
             except (AttributeError, RuntimeError):
                 return
             if status == load_succeeded:
-                source = _PLAYBACK_FRAME_BRIDGE_SOURCE.replace(
+                bridge_source = _PLAYBACK_FRAME_BRIDGE_SOURCE.replace(
                     "__PISTICK_BRIDGE_TOKEN__",
                     json.dumps(self._bridge_token),
                 )
+                source = f"{self._adblock_source}\n{bridge_source}"
                 self._run_javascript(source, self._bridge_ready)
             elif status in {load_failed, load_stopped}:
                 self.loadFinished.emit(False)
+
+        def _load_progress_changed(self, progress: int) -> None:
+            """Install filtering as early as Qt's native WebView API permits."""
+            if self._disposed or not self._adblock_settings.enabled or progress <= 0:
+                return
+            try:
+                current_url = self._native_view.url().toString()
+            except RuntimeError:
+                return
+            if not current_url or current_url == self._adblock_injected_for_url:
+                return
+            self._adblock_injected_for_url = current_url
+            self._run_javascript(self._adblock_source)
+
+        def _url_changed(self, url: QUrl) -> None:
+            if self._disposed or not self._adblock_settings.enabled:
+                return
+            candidate = url.toString()
+            if not self._trusted_url or candidate == "about:blank":
+                return
+            if same_origin(candidate, self._trusted_url) or self._restore_scheduled:
+                return
+            self._restore_scheduled = True
+            QTimer.singleShot(0, self._restore_trusted_url)
+
+        def _restore_trusted_url(self) -> None:
+            self._restore_scheduled = False
+            if self._disposed or not self._trusted_url:
+                return
+            try:
+                self._native_view.stop()
+                self._native_view.setUrl(QUrl(self._trusted_url))
+            except RuntimeError:
+                pass
 
         def _bridge_ready(self, _result: object) -> None:
             if self._disposed:
@@ -2296,6 +2457,9 @@ def get_windows_playback_web_view_class():
             )
 
         def setUrl(self, url: QUrl) -> None:
+            if self._adblock_settings.enabled:
+                self._trusted_url = url.toString()
+                self._adblock_injected_for_url = ""
             self._native_view.setUrl(url)
 
         def mouseReleaseEvent(self, event) -> None:
@@ -2419,6 +2583,7 @@ def get_windows_playback_web_view_class():
             if self._disposed:
                 return
             self._disposed = True
+            self._trusted_url = ""
             try:
                 self._native_view.stop()
                 self._native_view.setUrl(QUrl("about:blank"))
@@ -3621,7 +3786,10 @@ class TrailerDialog(QDialog):
             note.setWordWrap(True)
             placeholder_layout.addWidget(note, 1)
         else:
-            web = trailer_view_class(placeholder)
+            web = trailer_view_class(
+                placeholder,
+                block_ads=bool(self.embed_url),
+            )
             web.setMinimumHeight(360)
             web.setFocusPolicy(Qt.NoFocus)
             web.clicked.connect(self._schedule_fullscreen)

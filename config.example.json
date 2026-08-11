@@ -1,4 +1,6 @@
 {
   "tmdb_read_token": "PASTE_YOUR_TMDB_TOKEN_HERE and keep the quotes",
-  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example and keep the quotes"
+  "playback_base_url": "https://YOUR-LEGAL-PLAYBACK-HOST.example and keep the quotes",
+  "adblock_enabled": true,
+  "adblock_domains": []
 }

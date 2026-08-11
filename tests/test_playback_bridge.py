@@ -76,7 +76,8 @@ class PlaybackBridgeTests(unittest.TestCase):
         self.assertIn("resume_seconds=start_seconds", self.main_source)
 
     def test_webengine_profile_outlives_pages(self) -> None:
-        self.assertIn("_MEDIA_WEB_PROFILE = profile", self.main_source)
+        self.assertIn("_PLAYBACK_WEB_PROFILE = profile", self.main_source)
+        self.assertIn("_TRAILER_WEB_PROFILE = profile", self.main_source)
         self.assertIn("replacement_page = QWebEnginePage(self)", self.main_source)
         self.assertNotIn('QWebEngineProfile("pistick-embedded-media", self)', self.main_source)
 

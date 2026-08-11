@@ -4,6 +4,7 @@
   "updater": "install.sh",
   "required_files": [
     "main.py",
+    "adblock.py",
     "playback_api.py",
     "config.example.json",
     "install.sh"
