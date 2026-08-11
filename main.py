@@ -167,7 +167,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.5.0-strong-adblock"
+APP_VERSION = "3.6.0-explicit-ad-shield"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -186,7 +186,7 @@ CACHE_ROOT = Path(
     os.getenv("PISTICK_CACHE_DIR", "").strip()
     or Path(os.getenv("XDG_CACHE_HOME", "").strip() or (Path.home() / ".cache")) / "pistick"
 )
-ADBLOCK_CACHE_PATH = CACHE_ROOT / "adblock" / "stevenblack-unified-porn.txt"
+ADBLOCK_CACHE_PATH = CACHE_ROOT / "adblock" / "oisd-big.txt"
 
 
 def _system_memory_mb() -> int:

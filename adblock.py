@@ -24,11 +24,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-DEFAULT_REMOTE_BLOCKLIST_URL = (
-    "https://raw.githubusercontent.com/StevenBlack/hosts/"
-    "master/alternates/porn/hosts"
-)
-REMOTE_BLOCKLIST_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_REMOTE_BLOCKLIST_URL = "https://big.oisd.nl/domainswild"
+REMOTE_BLOCKLIST_MAX_AGE_SECONDS = 24 * 60 * 60
 REMOTE_BLOCKLIST_MAX_BYTES = 32 * 1024 * 1024
 REMOTE_BLOCKLIST_MAX_HOSTS = 300_000
 REMOTE_BLOCKLIST_MIN_HOSTS = 10_000
@@ -50,6 +47,10 @@ DEFAULT_AD_HOST_SUFFIXES = frozenset(
         "doubleclick.net",
         "exoclick.com",
         "exosrv.com",
+        # VidCore currently injects this pop-under loader twice per minute.
+        # It is intentionally built in so first-run playback is protected
+        # before the maintained online list has finished downloading.
+        "ferocitycandour.com",
         "googleadservices.com",
         "googlesyndication.com",
         "googletagservices.com",
@@ -675,6 +676,68 @@ def build_playback_adblock_script(settings: AdBlockSettings) -> str:
         }}
     }};
 
+    // Some embedded players register an ad timer in their own first-party
+    // document and rotate the external loader hostname.  Stop only callbacks
+    // that contain multiple advertising markers plus destructive storage or
+    // script-injection behavior; ordinary player/HLS timers remain untouched.
+    const isKnownAdScheduler = (handler) => {{
+        let source = '';
+        try {{
+            source = typeof handler === 'function'
+                ? Function.prototype.toString.call(handler)
+                : String(handler || '');
+        }} catch (_error) {{
+            return false;
+        }}
+        const markers = [
+            '_popads',
+            'adsbygoogle',
+            'googletag.pubads',
+            'ferocitycandour'
+        ];
+        const markerCount = markers.reduce(
+            (count, marker) => count + (source.includes(marker) ? 1 : 0),
+            0
+        );
+        const injectsAds = source.includes('createElement')
+            || source.includes('appendChild')
+            || source.includes('document.cookie');
+        const clearsStorage = source.includes('localStorage.clear')
+            || source.includes('sessionStorage.clear');
+        return markerCount >= 2 && (injectsAds || clearsStorage);
+    }};
+    const protectScheduler = (name) => {{
+        const nativeScheduler = window[name];
+        if (typeof nativeScheduler !== 'function') return;
+        const protectedScheduler = function(handler, delay, ...args) {{
+            if (isKnownAdScheduler(handler)) return 0;
+            return nativeScheduler.call(window, handler, delay, ...args);
+        }};
+        try {{
+            Object.defineProperty(window, name, {{
+                configurable: false,
+                writable: false,
+                value: protectedScheduler
+            }});
+        }} catch (_error) {{
+            window[name] = protectedScheduler;
+        }}
+    }};
+    protectScheduler('setInterval');
+    protectScheduler('setTimeout');
+
+    // A harmless object makes common pop-under bootstrap code take its
+    // already-initialized branch without loading or displaying an advert.
+    try {{
+        if (!('_popads' in window)) {{
+            Object.defineProperty(window, '_popads', {{
+                configurable: false,
+                writable: false,
+                value: Object.freeze({{ show: () => null }})
+            }});
+        }}
+    }} catch (_error) {{}}
+
     try {{
         Object.defineProperty(window, 'open', {{
             configurable: false,
@@ -711,6 +774,38 @@ def build_playback_adblock_script(settings: AdBlockSettings) -> str:
         if (!node || node.nodeType !== 1) return '';
         return node.src || node.href || node.getAttribute('data-src') || '';
     }};
+    const blockInsertedNode = (node) => {{
+        if (!urlBlocked(elementUrl(node))) return false;
+        try {{ node.remove(); }} catch (_error) {{}}
+        return true;
+    }};
+
+    // MutationObserver runs after insertion, which can be late enough for a
+    // dynamic script request to leave the browser.  Block known-host nodes
+    // synchronously at the DOM insertion point as a no-proxy fallback.
+    if (window.Node && Node.prototype) {{
+        const nativeAppendChild = Node.prototype.appendChild;
+        if (typeof nativeAppendChild === 'function') {{
+            Node.prototype.appendChild = function(node) {{
+                if (blockInsertedNode(node)) return node;
+                return nativeAppendChild.call(this, node);
+            }};
+        }}
+        const nativeInsertBefore = Node.prototype.insertBefore;
+        if (typeof nativeInsertBefore === 'function') {{
+            Node.prototype.insertBefore = function(node, reference) {{
+                if (blockInsertedNode(node)) return node;
+                return nativeInsertBefore.call(this, node, reference);
+            }};
+        }}
+        const nativeReplaceChild = Node.prototype.replaceChild;
+        if (typeof nativeReplaceChild === 'function') {{
+            Node.prototype.replaceChild = function(node, previous) {{
+                if (blockInsertedNode(node)) return previous;
+                return nativeReplaceChild.call(this, node, previous);
+            }};
+        }}
+    }}
     const hideAd = (node) => {{
         if (!node || !node.style) return;
         node.style.setProperty('display', 'none', 'important');
