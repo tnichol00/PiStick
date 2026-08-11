@@ -43,6 +43,16 @@ class PlaybackAPITests(unittest.TestCase):
             "https://playback.example/base/embed/tv/1399/1/3",
         )
 
+    def test_resume_timestamp_is_added(self) -> None:
+        self.assertEqual(
+            getmovie(550, 1427),
+            "https://playback.example/base/embed/movie/550?start=1427",
+        )
+        self.assertEqual(
+            getshow(1399, 1, 3, 812),
+            "https://playback.example/base/embed/tv/1399/1/3?start=812",
+        )
+
     def test_specials_season_is_supported(self) -> None:
         self.assertTrue(getshow(1399, 0, 1).endswith("/1399/0/1"))
 

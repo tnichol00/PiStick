@@ -2,7 +2,7 @@
 
 PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through a user-configured legal playback service.
 
-PiStick is currently an alpha. Browsing, profiles, trailers, watch-state features, and embedded movie and episode playback are implemented. Playback progress inside the embedded webpage is not yet synchronized automatically, so PiStick records a title as started when its player opens.
+PiStick is currently an alpha. Browsing, profiles, trailers, watch-state features, and embedded movie and episode playback are implemented. Compatible embed pages report playback time to PiStick, which saves and restores an exact per-profile resume timestamp.
 
 ## Features
 
@@ -41,6 +41,8 @@ from playback_api import getmovie, getshow
 
 movie_url = getmovie(550)
 episode_url = getshow(1399, 1, 3)
+resumed_movie_url = getmovie(550, 1427)
+resumed_episode_url = getshow(1399, 1, 3, 812)
 ```
 
 The service's base URL is read at runtime from the private `playback_base_url` field in `/etc/pistick/config.json`. The tracked example contains only a placeholder. With a locally configured base URL of `https://playback.example`, the calls produce:
@@ -48,9 +50,19 @@ The service's base URL is read at runtime from the private `playback_base_url` f
 ```text
 https://playback.example/embed/movie/550
 https://playback.example/embed/tv/1399/1/3
+https://playback.example/embed/movie/550?start=1427
+https://playback.example/embed/tv/1399/1/3?start=812
 ```
 
 The repository and published releases never contain the real playback host. PiStick loads the resulting page directly in Qt WebEngine. Movies open from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens in the same embedded player. The player supports keyboard and controller back controls and expands fullscreen after opening.
+
+For exact resume support, the embed page must use the `start` query parameter and expose its playback state in one of these ways:
+
+- Define `window.pistickGetPlaybackState()` and return `{currentTime, duration}`.
+- Use a top-level HTML5 `<video>` element; PiStick reads it automatically.
+- From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the parent window.
+
+PiStick polls the state every five seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. They are not stored beside secrets in `config.json`.
 
 ## Install PiStick
 
@@ -178,7 +190,7 @@ These files survive every update:
 | Purpose | Path |
 | --- | --- |
 | Private TMDB and playback configuration | `/etc/pistick/config.json` |
-| Profiles and watch history | `/var/lib/pistick/user-data.json` |
+| Profiles, watch history, and resume timestamps | `/var/lib/pistick/user-data.json` |
 | Installed release record | `/var/lib/pistick/installed-release.json` |
 | Posters, API data, and WebEngine cache | `/var/cache/pistick/` |
 

@@ -7,7 +7,7 @@ private runtime configuration and is deliberately never stored in this module.
 import json
 import os
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 
 class PlaybackAPIError(ValueError):
@@ -76,18 +76,31 @@ def _integer(value: object, name: str, minimum: int) -> int:
     return number
 
 
-def getmovie(tmdb_number: int) -> str:
+def _with_start(url: str, start_seconds: object) -> str:
+    start = _integer(start_seconds, "Resume timestamp", 0)
+    return f"{url}?{urlencode({'start': start})}" if start else url
+
+
+def getmovie(tmdb_number: int, start_seconds: int = 0) -> str:
     """Return the configured embed URL for a movie's TMDB identifier."""
     movie_id = _integer(tmdb_number, "TMDB movie number", 1)
-    return f"{_playback_base_url()}/embed/movie/{movie_id}"
+    return _with_start(f"{_playback_base_url()}/embed/movie/{movie_id}", start_seconds)
 
 
-def getshow(tmdb_number: int, season_number: int, episode_number: int) -> str:
+def getshow(
+    tmdb_number: int,
+    season_number: int,
+    episode_number: int,
+    start_seconds: int = 0,
+) -> str:
     """Return the configured embed URL for one TV episode."""
     show_id = _integer(tmdb_number, "TMDB show number", 1)
     season = _integer(season_number, "Season number", 0)
     episode = _integer(episode_number, "Episode number", 1)
-    return f"{_playback_base_url()}/embed/tv/{show_id}/{season}/{episode}"
+    return _with_start(
+        f"{_playback_base_url()}/embed/tv/{show_id}/{season}/{episode}",
+        start_seconds,
+    )
 
 
 __all__ = ["PlaybackAPIError", "getmovie", "getshow"]

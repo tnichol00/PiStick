@@ -668,6 +668,29 @@ class WatchStateStore:
         """Store progress for one TV episode when a player reports it."""
         self._write_episode_progress(profile_id, media, episode, progress)
 
+    def set_episode_position(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+        position_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        duration = max(0.0, float(duration_seconds))
+        position = max(0.0, min(float(position_seconds), duration or float(position_seconds)))
+        progress = position / duration if duration > 0 else 0.03
+        self._write_episode_progress(profile_id, media, episode, progress)
+        entry = self.episode_entry(
+            profile_id,
+            media,
+            int(episode.get("season_number", 1) or 1),
+            int(episode.get("episode_number", 1) or 1),
+        )
+        if entry is not None:
+            entry["position_seconds"] = round(position, 1)
+            entry["duration_seconds"] = round(duration, 1)
+            self.save()
+
     def mark_started(self, profile_id: Optional[str], media: dict[str, Any]) -> None:
         if not profile_id:
             return
@@ -724,6 +747,25 @@ class WatchStateStore:
             "media": self.snapshot(media),
         }
         self.save()
+
+    def set_position(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        position_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        if not profile_id:
+            return
+        duration = max(0.0, float(duration_seconds))
+        position = max(0.0, min(float(position_seconds), duration or float(position_seconds)))
+        progress = position / duration if duration > 0 else 0.03
+        self.set_progress(profile_id, media, progress)
+        entry = self.entry(profile_id, media)
+        if entry is not None:
+            entry["position_seconds"] = round(position, 1)
+            entry["duration_seconds"] = round(duration, 1)
+            self.save()
 
     def continue_watching(self, profile_id: Optional[str]) -> list[dict[str, Any]]:
         entries = [
@@ -1808,6 +1850,40 @@ def get_trailer_web_view_class():
                     return true;
                 })();
                 """
+            )
+
+        def request_playback_state(self, callback: Callable[[object], None]) -> None:
+            """Read progress exposed by the legal embed page or its HTML5 video."""
+            self.page().runJavaScript(
+                """
+                (() => {
+                    try {
+                        if (!window.__pistickProgressBridgeInstalled) {
+                            window.__pistickProgressBridgeInstalled = true;
+                            window.addEventListener('message', (event) => {
+                                const data = event && event.data;
+                                if (!data || data.type !== 'pistick-playback-progress') return;
+                                window.__pistickPlaybackState = {
+                                    currentTime: Number(data.currentTime || data.position || 0),
+                                    duration: Number(data.duration || 0)
+                                };
+                            });
+                        }
+                        if (typeof window.pistickGetPlaybackState === 'function') {
+                            return window.pistickGetPlaybackState();
+                        }
+                        const video = document.querySelector('video');
+                        if (!video) return window.__pistickPlaybackState || null;
+                        return {
+                            currentTime: Number(video.currentTime || 0),
+                            duration: Number.isFinite(video.duration) ? Number(video.duration) : 0
+                        };
+                    } catch (_error) {
+                        return null;
+                    }
+                })();
+                """,
+                callback,
             )
 
         # Compatibility aliases for the existing trailer dialog.
@@ -3268,6 +3344,8 @@ class TrailerDialog(QDialog):
 class PlaybackDialog(TrailerDialog):
     """Movie or episode player backed by PiStick's playback API."""
 
+    progressReported = Signal(float, float)
+
     def __init__(
         self,
         title: str,
@@ -3280,6 +3358,32 @@ class PlaybackDialog(TrailerDialog):
             embed_url=embed_url,
             player_label="Now Playing",
         )
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(5000)
+        self._progress_timer.timeout.connect(self._poll_progress)
+        self._progress_timer.start()
+
+    def _poll_progress(self) -> None:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "request_playback_state"):
+            return
+        web.request_playback_state(self._progress_received)
+
+    def _progress_received(self, state: object) -> None:
+        if not isinstance(state, dict):
+            return
+        try:
+            position = float(state.get("currentTime", state.get("position", 0.0)) or 0.0)
+            duration = float(state.get("duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if position >= 0 and duration > 0:
+            self.progressReported.emit(position, duration)
+
+    def closeEvent(self, event) -> None:
+        self._progress_timer.stop()
+        self._poll_progress()
+        super().closeEvent(event)
 
 
 class DetailDialog(QDialog):
@@ -3825,11 +3929,19 @@ class DetailDialog(QDialog):
 
     def _watch_episode_clicked(self, episode: dict[str, Any]) -> None:
         payload = self._episode_playback_payload(episode)
+        saved = self.watch_state.episode_entry(
+            self.profile_id,
+            self.media,
+            int(payload["season_number"]),
+            int(payload["episode_number"]),
+        ) or {}
+        start_seconds = int(float(saved.get("position_seconds", 0.0) or 0.0))
         try:
             embed_url = getshow(
                 int(self.media.get("id", 0) or 0),
                 int(payload["season_number"]),
                 int(payload["episode_number"]),
+                start_seconds,
             )
         except (PlaybackAPIError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Playback unavailable", str(exc))
@@ -3838,10 +3950,21 @@ class DetailDialog(QDialog):
         self.watch_state.mark_episode_started(self.profile_id, self.media, episode)
         self.stateChanged.emit()
         media = dict(self.media)
+        episode_for_progress = dict(episode)
+
+        def save_progress(position: float, duration: float) -> None:
+            self.watch_state.set_episode_position(
+                self.profile_id,
+                media,
+                episode_for_progress,
+                position,
+                duration,
+            )
+            self.stateChanged.emit()
 
         def start_playback() -> None:
             self._render(media)
-            self._open_playback_dialog(str(payload["title"]), embed_url)
+            self._open_playback_dialog(str(payload["title"]), embed_url, save_progress)
 
         self._episode_after_close = start_playback
         if not self.close_episode_picker():
@@ -3873,7 +3996,12 @@ class DetailDialog(QDialog):
         except RuntimeError:
             pass
 
-    def _open_playback_dialog(self, title: str, embed_url: str) -> None:
+    def _open_playback_dialog(
+        self,
+        title: str,
+        embed_url: str,
+        progress_callback: Callable[[float, float], None],
+    ) -> None:
         active = self._active_player_dialog()
         if active is not None:
             active.raise_()
@@ -3885,6 +4013,7 @@ class DetailDialog(QDialog):
         self._playback_dialog = dialog
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.controlsReady.connect(self.controlsReady.emit)
+        dialog.progressReported.connect(progress_callback)
         dialog.finished.connect(lambda _result, d=dialog: self._playback_finished(d))
         dialog.open()
 
@@ -4275,8 +4404,10 @@ class DetailDialog(QDialog):
         if media.get("media_type") == "tv":
             self.toggle_episode_picker()
             return
+        saved = self.watch_state.entry(self.profile_id, media) or {}
+        start_seconds = int(float(saved.get("position_seconds", 0.0) or 0.0))
         try:
-            embed_url = getmovie(int(media.get("id", 0) or 0))
+            embed_url = getmovie(int(media.get("id", 0) or 0), start_seconds)
         except (PlaybackAPIError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "Playback unavailable", str(exc))
             return
@@ -4284,7 +4415,17 @@ class DetailDialog(QDialog):
         self.watch_state.mark_started(self.profile_id, media)
         self.stateChanged.emit()
         self._render(media)
-        self._open_playback_dialog(str(media.get("title") or "Movie"), embed_url)
+        media_for_progress = dict(media)
+        self._open_playback_dialog(
+            str(media.get("title") or "Movie"),
+            embed_url,
+            lambda position, duration: self.watch_state.set_position(
+                self.profile_id,
+                media_for_progress,
+                position,
+                duration,
+            ),
+        )
 
     def _mark_finished(self, media: dict[str, Any]) -> None:
         self.watch_state.mark_finished(self.profile_id, media)
