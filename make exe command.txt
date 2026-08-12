@@ -1,0 +1,12 @@
+python -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --windowed `
+    --name PiStick `
+    --icon "$PWD\assets\pistick.ico" `
+    --add-data "assets:assets" `
+    --add-data "config.json:." `
+    --hidden-import pygame `
+    --exclude-module PyQt5 `
+    main.py
