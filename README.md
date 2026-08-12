@@ -53,7 +53,7 @@ https://player.videasy.to/tv/1399/1/3
 
 Videasy's docs currently show `player.videasy.net`, which redirects to `player.videasy.to`. PiStick uses the final HTTPS origin directly so its anti-popup navigation lock does not reject that redirect. When saved progress exists, PiStick appends only Videasy's documented `progress` parameter, such as `?progress=120`.
 
-On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open and autoplay from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens and autoplays in the same player. The player expands fullscreen after opening. Subtitles begin off; controller X toggles the available English track. Controller A toggles play/pause, Left/Right seeks backward/forward 10 seconds, and B or keyboard Escape closes playback directly back to the title details screen.
+On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open and autoplay from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens and autoplays in the same player. The player expands fullscreen after opening. Subtitles begin off; controller X toggles the available English track. Controller A toggles play/pause and reveals the timeline, timestamps, volume, and player buttons; Left/Right seeks backward/forward 10 seconds, and B or keyboard Escape closes playback directly back to the title details screen.
 
 Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. PiStick accepts those documented messages and also keeps its HTML5-video bridge as a fallback. Qt WebEngine on the Pi injects the bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
 
@@ -306,7 +306,7 @@ sudo systemctl restart pistick.service
 
 Controller playback controls:
 
-- A: play/pause trailers, movies, and episodes
+- A: play/pause trailers, movies, and episodes; movie/episode playback also reveals the full player control bar
 - X: toggle English subtitles; subtitles start off whenever a player opens
 - Left/Right on the D-pad or left stick: seek 10 seconds backward/forward in a movie or episode
 - B or keyboard Escape during movie or episode playback: close playback and return directly to title details

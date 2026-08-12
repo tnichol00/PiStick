@@ -168,7 +168,7 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.8.0-player-controls"
+APP_VERSION = "3.8.1-controller-playback-controls"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -1963,18 +1963,19 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         return selected;
     };
 
-    const triggerVideasyStartOverlay = () => {
-        if (!autoplayPending) return false;
-        let hostname = '';
+    const isVideasyPlayer = () => {
         try {
-            hostname = String(window.location && window.location.hostname || '')
+            const hostname = String(window.location && window.location.hostname || '')
                 .toLowerCase();
+            return hostname === 'player.videasy.to' || hostname === 'player.videasy.net';
         } catch (_error) {
             return false;
         }
-        if (hostname !== 'player.videasy.to' && hostname !== 'player.videasy.net') {
-            return false;
-        }
+    };
+
+    const triggerVideasyStartOverlay = () => {
+        if (!autoplayPending) return false;
+        if (!isVideasyPlayer()) return false;
 
         const now = Date.now();
         if (now - providerStartAttemptAt < 1500) return false;
@@ -2142,12 +2143,81 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
         }
     };
 
+    const revealPlaybackControls = (video) => {
+        if (!video) return false;
+        let revealed = false;
+        try {
+            if (
+                typeof video.dispatchEvent === 'function'
+                && typeof window.MouseEvent === 'function'
+            ) {
+                video.dispatchEvent(new window.MouseEvent('mousemove', {
+                    bubbles: true,
+                    cancelable: false,
+                    view: window
+                }));
+                revealed = true;
+            }
+        } catch (_error) {}
+
+        // Videasy intentionally uses its own timeline/settings/volume layer.
+        // Other HTML5 players can fall back to their browser-native controls.
+        if (!isVideasyPlayer()) {
+            try {
+                video.controls = true;
+                revealed = true;
+            } catch (_error) {}
+        }
+        return revealed;
+    };
+
+    const toggleVideasyPlayback = (video) => {
+        if (!isVideasyPlayer() || !video || typeof video.click !== 'function') {
+            return false;
+        }
+        const wasPaused = Boolean(video.paused || video.ended);
+        try {
+            // Videasy's React click handler updates its own paused state and
+            // calls showControls(), keeping the full control bar visible while
+            // paused. Calling video.pause() directly bypasses that state.
+            video.click();
+            revealPlaybackControls(video);
+        } catch (_error) {
+            return false;
+        }
+
+        // Keep a direct media fallback in case the provider changes its click
+        // handler. Repeating the same target state is harmless if React was
+        // merely slow to apply it.
+        if (typeof window.setTimeout === 'function') {
+            window.setTimeout(() => {
+                const current = localVideo();
+                if (!current || Boolean(current.paused || current.ended) !== wasPaused) {
+                    return;
+                }
+                try {
+                    if (wasPaused) {
+                        const result = current.play();
+                        if (result && typeof result.catch === 'function') {
+                            result.catch(() => {});
+                        }
+                    } else {
+                        current.pause();
+                    }
+                } catch (_error) {}
+                revealPlaybackControls(current);
+            }, 180);
+        }
+        return true;
+    };
+
     const toggleLocalPlayback = () => {
         const video = localVideo();
         if (!video) {
             autoplayPending = true;
             return requestPlaybackStart();
         }
+        if (toggleVideasyPlayback(video)) return true;
         if (video.paused || video.ended) {
             autoplayPending = true;
             requestPlaybackStart();
@@ -2155,6 +2225,7 @@ _PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
             autoplayPending = false;
             video.pause();
         }
+        revealPlaybackControls(video);
         return true;
     };
 
@@ -4415,7 +4486,7 @@ class TrailerDialog(QDialog):
         overlay_layout.addWidget(web)
 
         controller_hint = (
-            f"Controller: A play/pause  •  X English subtitles  •  "
+            f"Controller: A play/pause + controls  •  X English subtitles  •  "
             f"←/→ skip {PLAYBACK_SEEK_SECONDS}s  •  B return to details"
             if self.embed_url
             else (

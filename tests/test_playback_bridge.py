@@ -337,6 +337,84 @@ class PlaybackBridgeTests(unittest.TestCase):
             """
         )
 
+    def test_controller_toggle_uses_videasy_state_and_reveals_controls(self) -> None:
+        bridge = json.dumps(self.bridge_source)
+        self.run_node(
+            f"""
+            const vm = require('vm');
+            class EventTarget {{
+                constructor() {{ this.listeners = new Map(); }}
+                addEventListener(name, callback) {{
+                    if (!this.listeners.has(name)) this.listeners.set(name, []);
+                    this.listeners.get(name).push(callback);
+                }}
+                dispatch(name, event) {{
+                    for (const callback of this.listeners.get(name) || []) callback(event);
+                }}
+            }}
+            class MouseEvent {{
+                constructor(type, options) {{
+                    this.type = type;
+                    this.bubbles = Boolean(options && options.bubbles);
+                }}
+            }}
+            const video = {{
+                currentTime: 20,
+                duration: 100,
+                readyState: 4,
+                clientWidth: 1280,
+                clientHeight: 720,
+                paused: false,
+                ended: false,
+                controls: false,
+                clicks: 0,
+                mouseMoves: 0,
+                addEventListener() {{}},
+                click() {{
+                    this.clicks += 1;
+                    this.paused = !this.paused;
+                }},
+                dispatchEvent(event) {{
+                    if (event && event.type === 'mousemove') this.mouseMoves += 1;
+                    return true;
+                }},
+                play() {{ this.paused = false; return Promise.resolve(); }},
+                pause() {{ this.paused = true; }}
+            }};
+            const window = new EventTarget();
+            window.top = window;
+            window.frames = [];
+            window.location = {{ hostname: 'player.videasy.to' }};
+            window.MouseEvent = MouseEvent;
+            window.setInterval = (callback) => {{ callback(); return 1; }};
+            window.clearInterval = () => {{}};
+            window.postMessage = (data) => window.dispatch('message', {{ data }});
+            const document = {{
+                readyState: 'complete',
+                querySelectorAll: (selector) => selector === 'video' ? [video] : [],
+                addEventListener() {{}}
+            }};
+            const context = {{
+                window, document, console, Number, Array, Math, Date, String, Promise
+            }};
+            vm.createContext(context);
+            vm.runInContext({bridge}, context);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'toggle'
+            }});
+            if (!video.paused || video.clicks !== 1 || video.mouseMoves < 1) process.exit(1);
+            if (video.controls) process.exit(2);
+            window.postMessage({{
+                type: 'pistick-media-command',
+                bridgeToken: 'test-bridge-token',
+                action: 'toggle'
+            }});
+            if (video.paused || video.clicks !== 2 || video.mouseMoves < 2) process.exit(3);
+            """
+        )
+
     def test_bridge_forces_the_1080p_hls_level_when_available(self) -> None:
         bridge = json.dumps(self.bridge_source)
         self.run_node(
