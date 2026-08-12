@@ -76,20 +76,18 @@ function Get-PythonExecutable {
     $candidates = @()
     $launcher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
     if ($null -ne $launcher) {
-        $candidates += [pscustomobject]@{ Path = $launcher.Source; Arguments = @('-3') }
+        $candidates += [pscustomobject]@{ Path = $launcher.Source; Arguments = @('-3.12') }
     }
-    foreach ($version in @('313', '312', '311', '310')) {
-        $candidatePath = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$version\python.exe"
-        if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
-            $candidates += [pscustomobject]@{ Path = $candidatePath; Arguments = @() }
-        }
+    $candidatePath = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+    if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
+        $candidates += [pscustomobject]@{ Path = $candidatePath; Arguments = @() }
     }
     $python = Get-Command 'python.exe' -ErrorAction SilentlyContinue
     if ($null -ne $python) {
         $candidates += [pscustomobject]@{ Path = $python.Source; Arguments = @() }
     }
 
-    $pythonMetadataScript = 'import sys; print(sys.executable); print("SUPPORTED" if sys.version_info >= (3, 10) and sys.version_info < (4, 0) else "UNSUPPORTED")'
+    $pythonMetadataScript = 'import sys; print(sys.executable); print("SUPPORTED" if sys.version_info[:2] == (3, 12) else "UNSUPPORTED")'
     foreach ($candidate in $candidates) {
         try {
             $candidateArguments = @($candidate.Arguments) + @('-c', $pythonMetadataScript)
@@ -116,7 +114,7 @@ function Ensure-Python {
 
     $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
     if ($null -eq $winget) {
-        throw 'Python 3.10 or newer was not found. Install 64-bit Python from https://www.python.org/downloads/windows/ and run this command again.'
+        throw 'Python 3.12 was not found and Windows Package Manager is unavailable. Install 64-bit Python 3.12 from https://www.python.org/downloads/windows/ and run this command again.'
     }
 
     Write-PiStickStep 'Installing Python 3.12 for the current user'
@@ -508,6 +506,14 @@ try {
     Write-PiStickStep 'Installing the private Python runtime and Windows dependencies'
     $releaseRuntimeDirectory = Join-Path $RuntimesDirectory $releaseName
     $runtimePython = Join-Path $releaseRuntimeDirectory 'Scripts\python.exe'
+    if (Test-Path -LiteralPath $runtimePython -PathType Leaf) {
+        $runtimeVersionCheck = @('-c', 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)')
+        & $runtimePython @runtimeVersionCheck 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Replacing the existing PiStick runtime with the supported Python 3.12 runtime.'
+            Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force
+        }
+    }
     if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
         if (Test-Path -LiteralPath $releaseRuntimeDirectory) {
             Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force

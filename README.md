@@ -44,7 +44,7 @@ For Windows:
 
 - 64-bit Windows 10 or Windows 11
 - Microsoft Edge WebView2 Runtime; Windows 11 normally includes it
-- Windows Package Manager (`winget`) only if Python 3.10 or newer is not already installed
+- Windows Package Manager (`winget`) only if Python 3.12 is not already installed
 
 The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
 
@@ -152,7 +152,7 @@ $ErrorActionPreference='Stop'; $installer=Join-Path $env:TEMP 'pistick-install.p
 The Windows installer:
 
 - Installs PiStick for the current user under `%LOCALAPPDATA%\PiStick` without requiring administrator rights.
-- Installs Python 3.12 through Windows Package Manager if a compatible Python installation is not already available.
+- Uses Python 3.12 for PiStick and installs it through Windows Package Manager if needed. Other installed Python versions, including Python 3.13, are left untouched.
 - Creates an isolated Python runtime and installs the Windows dependencies.
 - Creates a **PiStick** Start Menu shortcut with the PiStick logo.
 - Stores configuration, profiles, watch history, and caches outside versioned release folders so they survive updates.

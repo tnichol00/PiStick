@@ -47,6 +47,19 @@ class WindowsInstallerTests(unittest.TestCase):
         for command in blocked:
             self.assertNotIn(command, self.installer)
 
+    def test_uses_python_312_even_when_newer_python_is_installed(self) -> None:
+        self.assertIn("Arguments = @('-3.12')", self.installer)
+        self.assertIn("Python312\\python.exe", self.installer)
+        self.assertIn("sys.version_info[:2] == (3, 12)", self.installer)
+        self.assertNotIn("Python313\\python.exe", self.installer)
+
+    def test_rebuilds_a_runtime_created_with_the_wrong_python(self) -> None:
+        self.assertIn("Replacing the existing PiStick runtime", self.installer)
+        self.assertIn(
+            "Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force",
+            self.installer,
+        )
+
     def test_release_manifest_contains_windows_runtime_files(self) -> None:
         required = set(self.manifest["required_files"])
         self.assertTrue(
