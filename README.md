@@ -44,7 +44,6 @@ For Windows:
 
 - 64-bit Windows 10 or Windows 11
 - Microsoft Edge WebView2 Runtime; Windows 11 normally includes it
-- Windows Package Manager (`winget`) only if Python 3.12 is not already installed
 
 The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
 
@@ -141,24 +140,8 @@ curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -
 
 The installer saves private configuration under `/etc/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot.
 
-### Windows command
-
-Open a normal, non-administrator PowerShell window and paste this complete command:
-
-```powershell
-$ErrorActionPreference="Stop"; $token=Read-Host "Paste your TMDB API Read Access Token"; if([string]::IsNullOrWhiteSpace($token)){throw "TMDB token cannot be empty"}; $r=Invoke-RestMethod "https://api.github.com/repos/tnichol00/PiStick/releases/latest"; $zip="$env:TEMP\PiStick-release.zip"; $tmp="$env:TEMP\PiStick-release"; $app="$env:LOCALAPPDATA\PiStick"; Remove-Item $zip,$tmp -Recurse -Force -ErrorAction SilentlyContinue; Invoke-WebRequest $r.zipball_url -OutFile $zip; Expand-Archive $zip -DestinationPath $tmp -Force; $src=Get-ChildItem $tmp -Directory | Select-Object -First 1; Remove-Item $app -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Path $app -Force | Out-Null; Copy-Item "$($src.FullName)\*" $app -Recurse -Force; Copy-Item "$app\config.example.json" "$app\config.json" -Force; $config=Get-Content "$app\config.json" -Raw | ConvertFrom-Json; $config.tmdb_read_token=$token; $json=$config | ConvertTo-Json -Depth 20; [IO.File]::WriteAllText("$app\config.json",$json,(New-Object Text.UTF8Encoding($false))); py -m pip install --upgrade -r "$app\requirements-windows.txt"; Remove-Item $zip,$tmp -Recurse -Force -ErrorAction SilentlyContinue; Set-Location $app; py main.py
-```
-
-The Windows installer:
-
-- Installs PiStick for the current user under `%LOCALAPPDATA%\PiStick` without requiring administrator rights.
-- Uses Python 3.12 for PiStick and installs it through Windows Package Manager if needed. Other installed Python versions, including Python 3.13, are left untouched.
-- Creates an isolated Python runtime and installs the Windows dependencies.
-- Creates a **PiStick** Start Menu shortcut with the PiStick logo.
-- Stores configuration, profiles, watch history, and caches outside versioned release folders so they survive updates.
-- Launches PiStick when installation finishes.
-
-Windows movie and episode playback uses Microsoft Edge WebView2 for H.264/AAC HLS support. Windows 11 normally includes the WebView2 Runtime. If it is missing, install Microsoft's current [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) and reopen PiStick from the Start Menu.
+### Windows Donwload:
+Go to releases and download PiStick.exe
 
 ### Raspberry Pi OS setup details
 
