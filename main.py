@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import sys
 import threading
@@ -15,11 +16,24 @@ from typing import Any, Callable, Optional
 import requests
 from requests.adapters import HTTPAdapter
 
+from adblock import (
+    AdBlockSettings,
+    add_webview_proxy_argument,
+    build_playback_adblock_script,
+    is_blocked_ad_url,
+    load_adblock_settings,
+    same_origin,
+    start_adblock_cache_refresh,
+    start_playback_adblock_proxy,
+)
+from playback_api import PlaybackAPIError, getmovie, getshow
+
 # Keep Chromium lean before QtWebEngine is imported. PiStick uses one embedded
 # player, so extra renderer processes, extension services, update checks, and a
 # large browser cache only waste RAM on a television appliance.
 _CHROMIUM_FLAGS = (
     "--renderer-process-limit=1",
+    "--autoplay-policy=no-user-gesture-required",
     "--disable-background-networking",
     "--disable-component-update",
     "--disable-default-apps",
@@ -154,10 +168,11 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.1.1-on-demand-trailers"
+APP_VERSION = "3.8.1-controller-playback-controls"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
+PLAYBACK_SEEK_SECONDS = 10
 
 
 def _runtime_file(env_name: str, filename: str) -> Path:
@@ -172,6 +187,7 @@ CACHE_ROOT = Path(
     os.getenv("PISTICK_CACHE_DIR", "").strip()
     or Path(os.getenv("XDG_CACHE_HOME", "").strip() or (Path.home() / ".cache")) / "pistick"
 )
+ADBLOCK_CACHE_PATH = CACHE_ROOT / "adblock" / "oisd-big.txt"
 
 
 def _system_memory_mb() -> int:
@@ -247,22 +263,71 @@ def build_youtube_embed_html(video_key: str) -> str:
   <div id="player"></div>
   <script>
     let player = null;
-    let playRequested = false;
+    let playRequested = true;
+    let englishSubtitlesEnabled = false;
+
+    function request1080p(target) {{
+      if (!target) return;
+      try {{
+        if (typeof target.setPlaybackQualityRange === 'function') {{
+          target.setPlaybackQualityRange('hd1080');
+        }}
+      }} catch (_error) {{}}
+      try {{
+        if (typeof target.setPlaybackQuality === 'function') {{
+          target.setPlaybackQuality('hd1080');
+        }}
+      }} catch (_error) {{}}
+    }}
+
+    function applyTrailerSubtitles(target) {{
+      if (!target || typeof target.setOption !== 'function') return false;
+      try {{
+        target.setOption(
+          'captions',
+          'track',
+          englishSubtitlesEnabled ? {{ languageCode: 'en' }} : {{}}
+        );
+        if (englishSubtitlesEnabled) {{
+          target.setOption('captions', 'reload', true);
+        }}
+        return true;
+      }} catch (_error) {{
+        return false;
+      }}
+    }}
 
     function onYouTubeIframeAPIReady() {{
       player = new YT.Player('player', {{
         videoId: {safe_key},
         host: 'https://www.youtube.com',
         playerVars: {{
+          autoplay: 1,
+          cc_load_policy: 0,
+          cc_lang_pref: 'en',
           rel: 0,
           playsinline: 1,
           enablejsapi: 1,
+          vq: 'hd1080',
           origin: {safe_origin},
           widget_referrer: {safe_referrer}
         }},
         events: {{
           onReady: function(event) {{
+            request1080p(event.target);
+            applyTrailerSubtitles(event.target);
             if (playRequested) event.target.playVideo();
+          }},
+          onStateChange: function(event) {{
+            const state = Number(event.data);
+            playRequested = state === 1 || state === 3;
+            if (playRequested) {{
+              request1080p(event.target);
+              applyTrailerSubtitles(event.target);
+            }}
+          }},
+          onApiChange: function(event) {{
+            applyTrailerSubtitles(event.target);
           }}
         }}
       }});
@@ -279,6 +344,29 @@ def build_youtube_embed_html(video_key: str) -> str:
       playRequested = false;
       if (!player || typeof player.pauseVideo !== 'function') return false;
       player.pauseVideo();
+      return true;
+    }};
+
+    window.pistickToggleTrailer = function() {{
+      if (!player || typeof player.getPlayerState !== 'function') {{
+        playRequested = !playRequested;
+        return true;
+      }}
+      const state = Number(player.getPlayerState());
+      if (state === 1 || state === 3) {{
+        playRequested = false;
+        player.pauseVideo();
+      }} else {{
+        playRequested = true;
+        request1080p(player);
+        player.playVideo();
+      }}
+      return true;
+    }};
+
+    window.pistickToggleTrailerSubtitles = function() {{
+      englishSubtitlesEnabled = !englishSubtitlesEnabled;
+      applyTrailerSubtitles(player);
       return true;
     }};
 
@@ -311,22 +399,6 @@ def _release_worker(worker: QRunnable) -> None:
     _ACTIVE_WORKERS.discard(worker)
 
 
-# -----------------------------------------------------------------------------
-# JELLYFIN HOOK
-# -----------------------------------------------------------------------------
-def watch_title(media: dict[str, Any]) -> None:
-    """
-    Replace this function with your Jellyfin API / playback code later.
-
-    PiStick records that the current profile started this title before calling
-    this function. TV episode payloads include ``media_type="episode"``,
-    ``series_id``, ``season_number`` and ``episode_number``. When Jellyfin is
-    connected, report episode progress through
-    WatchStateStore.set_episode_progress().
-    """
-    pass
-
-
 @dataclass
 class AppConfig:
     tmdb_read_token: str = ""
@@ -348,7 +420,7 @@ class AppConfig:
 
 
 class WatchStateStore:
-    """Local per-profile watch history used until Jellyfin provides real progress."""
+    """Local per-profile watch history for the embedded playback experience."""
 
     DEFAULT_AVATARS = ["red", "blue", "green", "purple", "orange", "teal"]
 
@@ -386,8 +458,7 @@ class WatchStateStore:
 
     @staticmethod
     def _serialize(data: dict[str, Any]) -> str:
-        # Compact JSON materially reduces SD-card writes once Jellyfin begins
-        # reporting progress, while preserving the exact state schema.
+        # Compact JSON reduces SD-card writes while preserving the state schema.
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     def _save_data(self, data: dict[str, Any]) -> None:
@@ -680,8 +751,31 @@ class WatchStateStore:
         episode: dict[str, Any],
         progress: float,
     ) -> None:
-        """Call this from Jellyfin with progress for one TV episode."""
+        """Store progress for one TV episode when a player reports it."""
         self._write_episode_progress(profile_id, media, episode, progress)
+
+    def set_episode_position(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        episode: dict[str, Any],
+        position_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        duration = max(0.0, float(duration_seconds))
+        position = max(0.0, min(float(position_seconds), duration or float(position_seconds)))
+        progress = position / duration if duration > 0 else 0.03
+        self._write_episode_progress(profile_id, media, episode, progress)
+        entry = self.episode_entry(
+            profile_id,
+            media,
+            int(episode.get("season_number", 1) or 1),
+            int(episode.get("episode_number", 1) or 1),
+        )
+        if entry is not None:
+            entry["position_seconds"] = round(position, 1)
+            entry["duration_seconds"] = round(duration, 1)
+            self.save()
 
     def mark_started(self, profile_id: Optional[str], media: dict[str, Any]) -> None:
         if not profile_id:
@@ -690,7 +784,7 @@ class WatchStateStore:
         key = self.media_key(media)
         previous = history.get(key, {})
         progress = float(previous.get("progress", 0.0) or 0.0)
-        # Without Jellyfin progress yet, 3% simply means "started".
+        # Until the embed service exposes progress, 3% simply means "started".
         if previous.get("status") == "finished":
             progress = 0.03
         else:
@@ -724,7 +818,7 @@ class WatchStateStore:
         self.save()
 
     def set_progress(self, profile_id: Optional[str], media: dict[str, Any], progress: float) -> None:
-        """Call this later from Jellyfin with a 0.0-1.0 playback fraction."""
+        """Store a 0.0-1.0 playback fraction when a player reports one."""
         if not profile_id:
             return
         progress = max(0.0, min(1.0, float(progress)))
@@ -739,6 +833,25 @@ class WatchStateStore:
             "media": self.snapshot(media),
         }
         self.save()
+
+    def set_position(
+        self,
+        profile_id: Optional[str],
+        media: dict[str, Any],
+        position_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        if not profile_id:
+            return
+        duration = max(0.0, float(duration_seconds))
+        position = max(0.0, min(float(position_seconds), duration or float(position_seconds)))
+        progress = position / duration if duration > 0 else 0.03
+        self.set_progress(profile_id, media, progress)
+        entry = self.entry(profile_id, media)
+        if entry is not None:
+            entry["position_seconds"] = round(position, 1)
+            entry["duration_seconds"] = round(duration, 1)
+            self.save()
 
     def continue_watching(self, profile_id: Optional[str]) -> list[dict[str, Any]]:
         entries = [
@@ -1684,6 +1797,639 @@ class RemoteImage(QLabel):
 
 TrailerWebView = None
 _WEBENGINE_ATTEMPTED = False
+_TRAILER_WEB_PROFILE = None
+_PLAYBACK_WEB_PROFILE = None
+_PLAYBACK_AD_INTERCEPTOR = None
+_PLAYBACK_ADBLOCK_SETTINGS = None
+_PLAYBACK_ADBLOCK_REFRESH_THREAD = None
+WindowsPlaybackWebView = None
+_WINDOWS_WEBVIEW_ATTEMPTED = False
+_WINDOWS_WEBVIEW_INITIALIZED = False
+_WINDOWS_WEBVIEW_ERROR = ""
+_WINDOWS_ADBLOCK_PROXY = None
+
+
+def _playback_adblock_settings() -> AdBlockSettings:
+    """Return one live settings object shared by scripts, interceptors, and proxy."""
+    global _PLAYBACK_ADBLOCK_SETTINGS
+    global _PLAYBACK_ADBLOCK_REFRESH_THREAD
+    if _PLAYBACK_ADBLOCK_SETTINGS is None:
+        _PLAYBACK_ADBLOCK_SETTINGS = load_adblock_settings(
+            CONFIG_PATH,
+            ADBLOCK_CACHE_PATH,
+        )
+        _PLAYBACK_ADBLOCK_REFRESH_THREAD = start_adblock_cache_refresh(
+            _PLAYBACK_ADBLOCK_SETTINGS,
+            ADBLOCK_CACHE_PATH,
+        )
+    return _PLAYBACK_ADBLOCK_SETTINGS
+
+
+def _stop_windows_adblock_proxy() -> None:
+    global _WINDOWS_ADBLOCK_PROXY
+    proxy = _WINDOWS_ADBLOCK_PROXY
+    _WINDOWS_ADBLOCK_PROXY = None
+    if proxy is not None:
+        proxy.stop()
+
+
+def _initialize_windows_playback_webview() -> bool:
+    """Prepare Qt WebView's Edge WebView2 backend before QApplication exists."""
+    global _WINDOWS_WEBVIEW_ATTEMPTED
+    global _WINDOWS_WEBVIEW_INITIALIZED
+    global _WINDOWS_WEBVIEW_ERROR
+    global _WINDOWS_ADBLOCK_PROXY
+
+    if _WINDOWS_WEBVIEW_ATTEMPTED:
+        return _WINDOWS_WEBVIEW_INITIALIZED
+    _WINDOWS_WEBVIEW_ATTEMPTED = True
+
+    if sys.platform != "win32" or QT_BINDING != "PySide6":
+        return False
+
+    try:
+        webview_arguments = os.environ.get(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "",
+        ).strip()
+        if "--autoplay-policy" not in webview_arguments:
+            webview_arguments = (
+                f"{webview_arguments} --autoplay-policy=no-user-gesture-required"
+            ).strip()
+            os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = webview_arguments
+        adblock_settings = _playback_adblock_settings()
+        if adblock_settings.enabled:
+            try:
+                proxy = start_playback_adblock_proxy(adblock_settings)
+            except OSError as exc:
+                proxy = None
+                print(
+                    "[PiStick] Loopback ad-block proxy unavailable; "
+                    f"using browser filtering only ({exc.__class__.__name__})."
+                )
+            if proxy is not None:
+                arguments, installed = add_webview_proxy_argument(
+                    os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ""),
+                    proxy.port,
+                )
+                if installed:
+                    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = arguments
+                    _WINDOWS_ADBLOCK_PROXY = proxy
+                else:
+                    proxy.stop()
+                    print(
+                        "[PiStick] Existing WebView2 proxy configuration retained; "
+                        "PiStick network ad blocking is using in-page rules only."
+                    )
+        # Qt WebView defaults to its "native" plug-in, but pin the explicit key
+        # so an installed Qt WebEngine plug-in cannot win by load order.
+        os.environ["QT_WEBVIEW_PLUGIN"] = "webview2"
+        from PySide6.QtWebView import QWebView, QtWebView
+
+        # QWebView's public QWindow API was added in Qt/PySide 6.11. Merely
+        # importing an older QtWebView module is therefore not sufficient.
+        if not hasattr(QWebView, "runJavaScript"):
+            raise RuntimeError("PySide6.QtWebView.QWebView is unavailable")
+        QtWebView.initialize()
+        _WINDOWS_WEBVIEW_INITIALIZED = True
+    except (ImportError, OSError, RuntimeError) as exc:
+        _stop_windows_adblock_proxy()
+        _WINDOWS_WEBVIEW_ERROR = str(exc).strip() or exc.__class__.__name__
+    return _WINDOWS_WEBVIEW_INITIALIZED
+
+
+def _windows_playback_unavailable_message() -> str:
+    message = (
+        "Windows playback needs PySide6 6.11 or newer and the Microsoft Edge "
+        "WebView2 Runtime. Run: py -m pip install --upgrade \"PySide6>=6.11,<7\""
+    )
+    if _WINDOWS_WEBVIEW_ERROR:
+        return f"{message}\n\nDetails: {_WINDOWS_WEBVIEW_ERROR}"
+    return message
+
+
+_PLAYBACK_FRAME_BRIDGE_SOURCE = r"""
+(() => {
+    const bridgeToken = __PISTICK_BRIDGE_TOKEN__;
+    if (window.__pistickMediaBridgeToken === bridgeToken) return;
+    window.__pistickMediaBridgeToken = bridgeToken;
+
+    const progressType = 'pistick-playback-progress';
+    const commandType = 'pistick-media-command';
+    const preferredHeight = 1080;
+    let lastForcedHls = null;
+    let lastForcedLevel = -1;
+    let autoplayPending = true;
+    let providerStartAttemptAt = 0;
+    let englishSubtitlesEnabled = false;
+
+    const numberOrZero = (value) => {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : 0;
+    };
+
+    const decodeMessageData = (value) => {
+        let data = value;
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch (_error) { return null; }
+        }
+        if (!data || typeof data !== 'object') return null;
+        if (data.type !== 'PLAYER_EVENT' || !data.data || typeof data.data !== 'object') {
+            return data;
+        }
+        const event = data.data;
+        return {
+            type: progressType,
+            currentTime: event.timestamp ?? event.currentTime ?? 0,
+            duration: event.duration ?? 0
+        };
+    };
+
+    const localVideo = () => {
+        const videos = Array.from(document.querySelectorAll('video'));
+        let selected = null;
+        let selectedScore = -1;
+        for (const video of videos) {
+            const area = Math.max(0, numberOrZero(video.clientWidth))
+                * Math.max(0, numberOrZero(video.clientHeight));
+            const duration = Math.max(0, numberOrZero(video.duration));
+            const playingBonus = (!video.paused && !video.ended) ? 1000000000000 : 0;
+            const score = playingBonus + (area * 1000) + duration;
+            if (score > selectedScore) {
+                selected = video;
+                selectedScore = score;
+            }
+        }
+        return selected;
+    };
+
+    const isVideasyPlayer = () => {
+        try {
+            const hostname = String(window.location && window.location.hostname || '')
+                .toLowerCase();
+            return hostname === 'player.videasy.to' || hostname === 'player.videasy.net';
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const triggerVideasyStartOverlay = () => {
+        if (!autoplayPending) return false;
+        if (!isVideasyPlayer()) return false;
+
+        const now = Date.now();
+        if (now - providerStartAttemptAt < 1500) return false;
+        const overlays = document.querySelectorAll(
+            'div.fixed.inset-0.bg-black.cursor-pointer.select-none'
+        );
+        for (const overlay of overlays) {
+            if (!overlay || typeof overlay.querySelector !== 'function') continue;
+            const playIcon = overlay.querySelector(
+                'button svg path[d="M8 5v14l11-7z"]'
+            );
+            if (!playIcon || typeof overlay.click !== 'function') continue;
+            providerStartAttemptAt = now;
+            overlay.click();
+            return true;
+        }
+        return false;
+    };
+
+    const requestLocalPlay = () => {
+        const video = localVideo();
+        if (!video) return false;
+        if (!video.paused && !video.ended) {
+            autoplayPending = false;
+            return true;
+        }
+        try {
+            const result = video.play();
+            if (result && typeof result.then === 'function') {
+                result.then(() => { autoplayPending = false; }).catch(() => {});
+            } else if (!video.paused) {
+                autoplayPending = false;
+            }
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const requestPlaybackStart = () => {
+        if (requestLocalPlay()) return true;
+        return triggerVideasyStartOverlay();
+    };
+
+    const englishTrack = (tracks) => Array.from(tracks || []).find((track) => {
+        const language = String(
+            track && (track.language || track.srclang || track.lang || '')
+        ).toLowerCase();
+        const label = String(track && (track.label || track.name || '')).toLowerCase();
+        return /^(en|eng)(?:[-_]|$)/.test(language)
+            || /(?:^|[^a-z])english(?:[^a-z]|$)/.test(label);
+    }) || null;
+
+    const exposedHls = () => {
+        const exposed = window.__player;
+        const state = exposed && exposed.state;
+        return state && state.hls ? state.hls : null;
+    };
+
+    const setEnglishSubtitles = (enabled) => {
+        englishSubtitlesEnabled = Boolean(enabled);
+        window.__pistickEnglishSubtitlesEnabled = englishSubtitlesEnabled;
+        let handled = false;
+
+        if (typeof window.pistickSetSubtitles === 'function') {
+            try {
+                const result = window.pistickSetSubtitles(
+                    englishSubtitlesEnabled,
+                    'en'
+                );
+                handled = result !== false || handled;
+            } catch (_error) {
+                // Native text tracks and HLS.js remain available below.
+            }
+        }
+
+        for (const video of document.querySelectorAll('video')) {
+            const tracks = Array.from(video.textTracks || []);
+            const selected = englishTrack(tracks);
+            for (const track of tracks) {
+                try {
+                    track.mode = englishSubtitlesEnabled && track === selected
+                        ? 'showing'
+                        : 'disabled';
+                    handled = true;
+                } catch (_error) {}
+            }
+        }
+
+        const hls = exposedHls();
+        const hlsTracks = hls && Array.isArray(hls.subtitleTracks)
+            ? hls.subtitleTracks
+            : [];
+        if (hls && hlsTracks.length) {
+            const selected = englishTrack(hlsTracks);
+            const selectedIndex = selected ? hlsTracks.indexOf(selected) : -1;
+            try { hls.subtitleTrack = englishSubtitlesEnabled ? selectedIndex : -1; } catch (_error) {}
+            try { hls.subtitleDisplay = englishSubtitlesEnabled && selectedIndex >= 0; } catch (_error) {}
+            handled = true;
+        }
+        return handled;
+    };
+
+    const applyPendingSeek = (video) => {
+        const target = Number(window.__pistickPendingSeekSeconds);
+        if (!video || !Number.isFinite(target) || target <= 0) return false;
+        const duration = Number(video.duration);
+        if (video.readyState === 0 || !Number.isFinite(duration) || duration <= 0) {
+            if (!video.__pistickSeekMetadataBound) {
+                video.__pistickSeekMetadataBound = true;
+                video.addEventListener(
+                    'loadedmetadata',
+                    () => applyPendingSeek(video),
+                    { once: true }
+                );
+            }
+            return false;
+        }
+        try {
+            video.currentTime = Math.min(target, Math.max(0, duration - 1));
+            window.__pistickPendingSeekSeconds = null;
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const requestSeek = (value) => {
+        const target = Number(value);
+        if (!Number.isFinite(target) || target <= 0) return;
+        window.__pistickPendingSeekSeconds = target;
+        if (typeof window.pistickSeekTo === 'function') {
+            try {
+                window.pistickSeekTo(target);
+                window.__pistickPendingSeekSeconds = null;
+            } catch (_error) {
+                // Fall through to an ordinary HTML5 video when available.
+            }
+        }
+        applyPendingSeek(localVideo());
+    };
+
+    const requestRelativeSeek = (value) => {
+        const offset = Number(value);
+        if (!Number.isFinite(offset) || offset === 0) return false;
+        if (typeof window.pistickSeekBy === 'function') {
+            try {
+                const result = window.pistickSeekBy(offset);
+                if (result !== false) return true;
+            } catch (_error) {
+                // Fall through to an ordinary HTML5 video when available.
+            }
+        }
+        const video = localVideo();
+        if (!video) return false;
+        const currentTime = Math.max(0, numberOrZero(video.currentTime));
+        const duration = Math.max(0, numberOrZero(video.duration));
+        let target = Math.max(0, currentTime + offset);
+        if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.25));
+        try {
+            video.currentTime = target;
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const revealPlaybackControls = (video) => {
+        if (!video) return false;
+        let revealed = false;
+        try {
+            if (
+                typeof video.dispatchEvent === 'function'
+                && typeof window.MouseEvent === 'function'
+            ) {
+                video.dispatchEvent(new window.MouseEvent('mousemove', {
+                    bubbles: true,
+                    cancelable: false,
+                    view: window
+                }));
+                revealed = true;
+            }
+        } catch (_error) {}
+
+        // Videasy intentionally uses its own timeline/settings/volume layer.
+        // Other HTML5 players can fall back to their browser-native controls.
+        if (!isVideasyPlayer()) {
+            try {
+                video.controls = true;
+                revealed = true;
+            } catch (_error) {}
+        }
+        return revealed;
+    };
+
+    const toggleVideasyPlayback = (video) => {
+        if (!isVideasyPlayer() || !video || typeof video.click !== 'function') {
+            return false;
+        }
+        const wasPaused = Boolean(video.paused || video.ended);
+        try {
+            // Videasy's React click handler updates its own paused state and
+            // calls showControls(), keeping the full control bar visible while
+            // paused. Calling video.pause() directly bypasses that state.
+            video.click();
+            revealPlaybackControls(video);
+        } catch (_error) {
+            return false;
+        }
+
+        // Keep a direct media fallback in case the provider changes its click
+        // handler. Repeating the same target state is harmless if React was
+        // merely slow to apply it.
+        if (typeof window.setTimeout === 'function') {
+            window.setTimeout(() => {
+                const current = localVideo();
+                if (!current || Boolean(current.paused || current.ended) !== wasPaused) {
+                    return;
+                }
+                try {
+                    if (wasPaused) {
+                        const result = current.play();
+                        if (result && typeof result.catch === 'function') {
+                            result.catch(() => {});
+                        }
+                    } else {
+                        current.pause();
+                    }
+                } catch (_error) {}
+                revealPlaybackControls(current);
+            }, 180);
+        }
+        return true;
+    };
+
+    const toggleLocalPlayback = () => {
+        const video = localVideo();
+        if (!video) {
+            autoplayPending = true;
+            return requestPlaybackStart();
+        }
+        if (toggleVideasyPlayback(video)) return true;
+        if (video.paused || video.ended) {
+            autoplayPending = true;
+            requestPlaybackStart();
+        } else {
+            autoplayPending = false;
+            video.pause();
+        }
+        revealPlaybackControls(video);
+        return true;
+    };
+
+    const levelHeight = (level) => {
+        if (!level || typeof level !== 'object') return 0;
+        const direct = numberOrZero(level.height);
+        if (direct > 0) return direct;
+        const resolution = level.attrs && level.attrs.RESOLUTION;
+        const nested = resolution && numberOrZero(resolution.height);
+        if (nested > 0) return nested;
+        const text = String(level.name || level.label || level.url || '');
+        const match = text.match(/(?:^|[^0-9])(2160|1440|1080|720|480|360)p?(?:[^0-9]|$)/i);
+        return match ? Number(match[1]) : 0;
+    };
+
+    const forcePreferredQuality = () => {
+        if (
+            typeof window.pistickSetQuality === 'function'
+            && window.__pistickCustomQualityHeight !== preferredHeight
+        ) {
+            try {
+                const result = window.pistickSetQuality(`${preferredHeight}p`, preferredHeight);
+                if (result !== false) window.__pistickCustomQualityHeight = preferredHeight;
+            } catch (_error) {
+                // The exposed HLS state below remains the fallback.
+            }
+        }
+
+        const exposed = window.__player;
+        const state = exposed && exposed.state;
+        const hls = state && state.hls;
+        const levels = hls && Array.isArray(hls.levels) && hls.levels.length
+            ? hls.levels
+            : state && Array.isArray(state.levels)
+                ? state.levels
+                : [];
+        if (!hls || levels.length === 0) return false;
+
+        const choices = levels
+            .map((level, index) => ({
+                index,
+                height: levelHeight(level),
+                bitrate: numberOrZero(level && (level.bitrate || level.bandwidth))
+            }))
+            .filter((choice) => choice.height > 0);
+        if (choices.length === 0) return false;
+
+        const exact = choices.filter((choice) => choice.height === preferredHeight);
+        const below = choices.filter((choice) => choice.height < preferredHeight);
+        const above = choices.filter((choice) => choice.height > preferredHeight);
+        let selected = null;
+        if (exact.length) {
+            selected = exact.sort((a, b) => b.bitrate - a.bitrate)[0];
+        } else if (below.length) {
+            selected = below.sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)[0];
+        } else if (above.length) {
+            selected = above.sort((a, b) => a.height - b.height || b.bitrate - a.bitrate)[0];
+        }
+        if (!selected) return false;
+
+        if (state.settings && typeof state.settings === 'object') {
+            state.settings.quality = `${preferredHeight}p`;
+        }
+        state.quality = selected.index;
+        try { hls.capLevelToPlayerSize = false; } catch (_error) {}
+        try { hls.autoLevelCapping = selected.index; } catch (_error) {}
+        if (
+            hls !== lastForcedHls
+            || selected.index !== lastForcedLevel
+            || Number(hls.currentLevel) !== selected.index
+        ) {
+            try { hls.currentLevel = selected.index; } catch (_error) {}
+            try { hls.nextLevel = selected.index; } catch (_error) {}
+            try { hls.loadLevel = selected.index; } catch (_error) {}
+            lastForcedHls = hls;
+            lastForcedLevel = selected.index;
+        }
+        window.__pistickForcedQuality = {
+            requestedHeight: preferredHeight,
+            selectedHeight: selected.height,
+            level: selected.index
+        };
+        return true;
+    };
+
+    const validProgress = (data) => {
+        if (!data || data.type !== progressType) return null;
+        if (data.bridgeToken && data.bridgeToken !== bridgeToken) return null;
+        const currentTime = numberOrZero(data.currentTime ?? data.position);
+        const duration = numberOrZero(data.duration);
+        if (currentTime < 0 || duration <= 0) return null;
+        return { currentTime, duration, updatedAt: Date.now() };
+    };
+
+    const saveProgress = (data) => {
+        const progress = validProgress(data);
+        if (progress) window.__pistickPlaybackState = progress;
+    };
+
+    const sendProgress = () => {
+        const video = localVideo();
+        if (!video) return;
+        const currentTime = numberOrZero(video.currentTime);
+        const duration = numberOrZero(video.duration);
+        if (currentTime < 0 || duration <= 0) return;
+        const data = {
+            type: progressType,
+            bridgeToken,
+            currentTime,
+            duration
+        };
+        try {
+            if (window === window.top) saveProgress(data);
+            else window.top.postMessage(data, '*');
+        } catch (_error) {
+            // Cross-origin WindowProxy.postMessage is allowed. If a sandboxed
+            // frame blocks even that operation, the next polling pass can retry.
+        }
+    };
+
+    const relayToChildren = (message) => {
+        for (let index = 0; index < window.frames.length; index += 1) {
+            try {
+                window.frames[index].postMessage(message, '*');
+            } catch (_error) {
+                // Never inspect a child Window directly; only post to it.
+            }
+        }
+    };
+
+    // This listener is registered on the current frame's own Window. It never
+    // reads parent.addEventListener or iframe.contentWindow properties.
+    window.addEventListener('message', (event) => {
+        const data = decodeMessageData(event && event.data);
+        if (!data) return;
+        if (data.type === progressType) {
+            if (window === window.top) saveProgress(data);
+            return;
+        }
+        if (data.type !== commandType || data.bridgeToken !== bridgeToken) return;
+
+        const video = localVideo();
+        if (data.action === 'pause') {
+            autoplayPending = false;
+            if (video) video.pause();
+        }
+        if (data.action === 'play') {
+            autoplayPending = true;
+            requestPlaybackStart();
+        }
+        if (data.action === 'toggle') toggleLocalPlayback();
+        if (data.action === 'seek') requestSeek(data.positionSeconds);
+        if (data.action === 'seek-relative') requestRelativeSeek(data.offsetSeconds);
+        let childMessage = data;
+        if (data.action === 'subtitles-english-toggle') {
+            const enabled = !englishSubtitlesEnabled;
+            setEnglishSubtitles(enabled);
+            childMessage = {
+                ...data,
+                action: 'subtitles-english-set',
+                enabled
+            };
+        } else if (data.action === 'subtitles-english-set') {
+            setEnglishSubtitles(Boolean(data.enabled));
+        }
+        relayToChildren(childMessage);
+    });
+
+    const bindVideoEvents = () => {
+        forcePreferredQuality();
+        if (autoplayPending) requestPlaybackStart();
+        setEnglishSubtitles(englishSubtitlesEnabled);
+        applyPendingSeek(localVideo());
+        for (const video of document.querySelectorAll('video')) {
+            if (video.__pistickProgressEventsBound) continue;
+            video.__pistickProgressEventsBound = true;
+            for (const eventName of ['timeupdate', 'durationchange', 'loadedmetadata', 'pause', 'ended']) {
+                video.addEventListener(eventName, sendProgress, { passive: true });
+            }
+        }
+        sendProgress();
+        if (window === window.top) {
+            relayToChildren({
+                type: commandType,
+                bridgeToken,
+                action: 'subtitles-english-set',
+                enabled: englishSubtitlesEnabled
+            });
+        }
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindVideoEvents, { once: true });
+    } else {
+        bindVideoEvents();
+    }
+    const progressTimer = window.setInterval(bindVideoEvents, 1000);
+    window.addEventListener(
+        'pagehide',
+        () => window.clearInterval(progressTimer),
+        { once: true }
+    );
+})();
+"""
 
 
 def get_trailer_web_view_class():
@@ -1699,41 +2445,158 @@ def get_trailer_web_view_class():
             from PySide6.QtWebEngineCore import (
                 QWebEnginePage,
                 QWebEngineProfile,
+                QWebEngineScript,
                 QWebEngineSettings,
+                QWebEngineUrlRequestInterceptor,
             )
             from PySide6.QtWebEngineWidgets import QWebEngineView
         else:
+            from PyQt5.QtWebEngineCore import (  # type: ignore[no-redef]
+                QWebEngineUrlRequestInterceptor,
+            )
             from PyQt5.QtWebEngineWidgets import (  # type: ignore[no-redef]
                 QWebEnginePage,
                 QWebEngineProfile,
+                QWebEngineScript,
                 QWebEngineSettings,
                 QWebEngineView,
             )
     except (ImportError, OSError):
         return None
 
+    class _PlaybackRequestInterceptor(QWebEngineUrlRequestInterceptor):
+        """Block known ad hosts before Chromium reaches the network stack."""
+
+        def __init__(self, settings: AdBlockSettings, parent: Optional[QObject] = None):
+            super().__init__(parent)
+            self._settings = settings
+
+        def interceptRequest(self, info) -> None:
+            try:
+                request_url = info.requestUrl().toString()
+                if is_blocked_ad_url(request_url, self._settings):
+                    info.block(True)
+            except (AttributeError, RuntimeError):
+                return
+
+    class _MediaPage(QWebEnginePage):
+        """Keep API playback in its trusted window and discard pop-ups."""
+
+        def __init__(self, profile, parent, *, block_ads: bool = False):
+            super().__init__(profile, parent)
+            self._block_ads = bool(block_ads)
+            self._trusted_url = ""
+
+        def set_trusted_url(self, url: str) -> None:
+            self._trusted_url = str(url or "")
+
+        def acceptNavigationRequest(self, url, navigation_type, is_main_frame):
+            candidate = url.toString()
+            if (
+                self._block_ads
+                and is_main_frame
+                and self._trusted_url
+                and candidate != "about:blank"
+                and not same_origin(candidate, self._trusted_url)
+            ):
+                return False
+            return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
+
+        def createWindow(self, window_type):
+            if self._block_ads:
+                return None
+            return super().createWindow(window_type)
+
     class _TrailerWebView(QWebEngineView):
         """Web player that observes clicks without stealing controller focus."""
 
         clicked = Signal()
 
-        def __init__(self, parent: Optional[QWidget] = None):
+        def __init__(
+            self,
+            parent: Optional[QWidget] = None,
+            *,
+            block_ads: bool = False,
+        ):
             super().__init__(parent)
-            # A trailer-scoped profile/page lets Chromium's renderer and page
-            # data be torn down when this one screen closes. Using Qt's default
-            # profile would keep the heavy browser session alive for the rest
-            # of PiStick even after the trailer was gone.
-            try:
-                self._profile = QWebEngineProfile("pistick-trailer", self)
-            except TypeError:
-                self._profile = QWebEngineProfile(self)
-            self._configure_profile(self._profile, QWebEngineProfile)
-            self._page = QWebEnginePage(self._profile, self)
+            self._block_ads = bool(block_ads)
+            self._adblock_settings = (
+                _playback_adblock_settings()
+                if self._block_ads
+                else AdBlockSettings(enabled=False, blocked_hosts=frozenset())
+            )
+            # The profile must outlive every page that uses it. A shared,
+            # application-owned profile avoids Qt releasing a dialog-scoped
+            # profile while its asynchronous WebEnginePage is still shutting
+            # down. Pages remain view-scoped and are discarded after playback.
+            global _TRAILER_WEB_PROFILE
+            global _PLAYBACK_WEB_PROFILE
+            global _PLAYBACK_AD_INTERCEPTOR
+            profile = _PLAYBACK_WEB_PROFILE if self._block_ads else _TRAILER_WEB_PROFILE
+            if profile is None:
+                profile_parent = QApplication.instance()
+                profile_name = (
+                    "pistick-playback-media"
+                    if self._block_ads
+                    else "pistick-trailer-media"
+                )
+                try:
+                    profile = QWebEngineProfile(profile_name, profile_parent)
+                except TypeError:
+                    profile = QWebEngineProfile(profile_parent)
+                self._configure_profile(profile, QWebEngineProfile)
+                if self._block_ads:
+                    if self._adblock_settings.enabled:
+                        interceptor = _PlaybackRequestInterceptor(
+                            self._adblock_settings,
+                            profile,
+                        )
+                        profile.setUrlRequestInterceptor(interceptor)
+                        _PLAYBACK_AD_INTERCEPTOR = interceptor
+                    _PLAYBACK_WEB_PROFILE = profile
+                else:
+                    _TRAILER_WEB_PROFILE = profile
+            self._profile = profile
+            self._page = _MediaPage(
+                self._profile,
+                self,
+                block_ads=self._block_ads,
+            )
             # QWebEngineView owns its automatically created page. On PySide6,
             # setPage() can destroy that page immediately, which also
             # invalidates its Python wrapper. Do not call deleteLater() on the
             # old wrapper after setPage(); Qt has already handled its lifetime.
             self.setPage(self._page)
+            self._bridge_token = uuid.uuid4().hex
+            self._bridge_script = QWebEngineScript()
+            self._bridge_script.setName("pistick-cross-frame-media-bridge")
+            injection_points = getattr(QWebEngineScript, "InjectionPoint", QWebEngineScript)
+            self._bridge_script.setInjectionPoint(
+                getattr(injection_points, "DocumentReady")
+            )
+            worlds = getattr(QWebEngineScript, "ScriptWorldId", QWebEngineScript)
+            self._bridge_script.setWorldId(getattr(worlds, "MainWorld", 0))
+            self._bridge_script.setRunsOnSubFrames(True)
+            self._bridge_script.setSourceCode(
+                _PLAYBACK_FRAME_BRIDGE_SOURCE.replace(
+                    "__PISTICK_BRIDGE_TOKEN__",
+                    json.dumps(self._bridge_token),
+                )
+            )
+            self._page.scripts().insert(self._bridge_script)
+            self._adblock_script = None
+            if self._adblock_settings.enabled:
+                self._adblock_script = QWebEngineScript()
+                self._adblock_script.setName("pistick-playback-adblock")
+                self._adblock_script.setInjectionPoint(
+                    getattr(injection_points, "DocumentCreation")
+                )
+                self._adblock_script.setWorldId(getattr(worlds, "MainWorld", 0))
+                self._adblock_script.setRunsOnSubFrames(True)
+                self._adblock_script.setSourceCode(
+                    build_playback_adblock_script(self._adblock_settings)
+                )
+                self._page.scripts().insert(self._adblock_script)
 
             web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
             for name, enabled in (
@@ -1750,6 +2613,11 @@ def get_trailer_web_view_class():
             if app is not None:
                 app.installEventFilter(self)
                 self._filter_installed = True
+
+        def setUrl(self, url: QUrl) -> None:
+            if self._block_ads:
+                self._page.set_trusted_url(url.toString())
+            super().setUrl(url)
 
         @staticmethod
         def _configure_profile(profile, profile_type) -> None:
@@ -1795,15 +2663,178 @@ def get_trailer_web_view_class():
                 self.clicked.emit()
             return False
 
-        def play_trailer(self) -> None:
+        def play_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
             self.page().runJavaScript(
-                "window.pistickPlayTrailer && window.pistickPlayTrailer();"
+                """
+                (() => {
+                    if (typeof window.pistickPlayTrailer === 'function') {
+                        window.pistickPlayTrailer();
+                    }
+                    const video = document.querySelector('video');
+                    if (video) {
+                        const result = video.play();
+                        if (result && typeof result.catch === 'function') result.catch(() => {});
+                    }
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'play'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
             )
 
-        def pause_trailer(self) -> None:
+        def pause_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
             self.page().runJavaScript(
-                "window.pistickPauseTrailer && window.pistickPauseTrailer();"
+                """
+                (() => {
+                    if (typeof window.pistickPauseTrailer === 'function') {
+                        window.pistickPauseTrailer();
+                    }
+                    const video = document.querySelector('video');
+                    if (video) video.pause();
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'pause'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
             )
+
+        def toggle_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self.page().runJavaScript(
+                """
+                (() => {
+                    let handled = false;
+                    if (typeof window.pistickToggleTrailer === 'function') {
+                        try { handled = window.pistickToggleTrailer() !== false; } catch (_error) {}
+                    }
+                    if (!handled) {
+                        window.postMessage({
+                            type: 'pistick-media-command',
+                            bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                            action: 'toggle'
+                        }, '*');
+                    }
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def toggle_subtitles(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self.page().runJavaScript(
+                """
+                (() => {
+                    let handled = false;
+                    if (typeof window.pistickToggleTrailerSubtitles === 'function') {
+                        try {
+                            handled = window.pistickToggleTrailerSubtitles() !== false;
+                        } catch (_error) {}
+                    }
+                    if (!handled) {
+                        window.postMessage({
+                            type: 'pistick-media-command',
+                            bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                            action: 'subtitles-english-toggle'
+                        }, '*');
+                    }
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def seek_media(self, position_seconds: float) -> None:
+            try:
+                position = float(position_seconds)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(position) or position <= 0:
+                return
+            bridge_token = json.dumps(self._bridge_token)
+            seek_position = json.dumps(position)
+            self.page().runJavaScript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'seek',
+                        positionSeconds: __PISTICK_SEEK_POSITION__
+                    }, '*');
+                    return true;
+                })();
+                """
+                .replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+                .replace("__PISTICK_SEEK_POSITION__", seek_position)
+            )
+
+        def seek_relative(self, offset_seconds: float) -> None:
+            try:
+                offset = float(offset_seconds)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(offset) or offset == 0:
+                return
+            bridge_token = json.dumps(self._bridge_token)
+            seek_offset = json.dumps(offset)
+            self.page().runJavaScript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'seek-relative',
+                        offsetSeconds: __PISTICK_SEEK_OFFSET__
+                    }, '*');
+                    return true;
+                })();
+                """
+                .replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+                .replace("__PISTICK_SEEK_OFFSET__", seek_offset)
+            )
+
+        def request_playback_state(self, callback: Callable[[object], None]) -> None:
+            """Read progress reported by the page or any nested player frame."""
+            try:
+                self.page().runJavaScript(
+                    """
+                    (() => {
+                        try {
+                            if (typeof window.pistickGetPlaybackState === 'function') {
+                                const state = window.pistickGetPlaybackState();
+                                if (state && typeof state.then !== 'function') return state;
+                            }
+                            const video = document.querySelector('video');
+                            if (video) {
+                                return {
+                                    currentTime: Number(video.currentTime || 0),
+                                    duration: Number.isFinite(video.duration) ? Number(video.duration) : 0
+                                };
+                            }
+                            const state = window.__pistickPlaybackState || null;
+                            if (!state) return null;
+                            if (state.updatedAt && Date.now() - state.updatedAt > 15000) return null;
+                            return state;
+                        } catch (_error) {
+                            return null;
+                        }
+                    })();
+                    """,
+                    callback,
+                )
+            except RuntimeError:
+                callback(None)
+
+        # Compatibility aliases for the existing trailer dialog.
+        play_trailer = play_media
+        pause_trailer = pause_media
 
         def dispose(self) -> None:
             if self._filter_installed:
@@ -1814,21 +2845,385 @@ def get_trailer_web_view_class():
             try:
                 self.stop()
                 self.page().setAudioMuted(True)
-                self.page().runJavaScript(
-                    "window.pistickPauseTrailer && window.pistickPauseTrailer();"
-                )
-                self.setUrl(QUrl("about:blank"))
+                # setPage() immediately deletes the current page because that
+                # page is parented to this view. The shared profile therefore
+                # never begins teardown while a page still refers to it.
+                replacement_page = QWebEnginePage(self)
+                self.setPage(replacement_page)
+                self._page = replacement_page
             except RuntimeError:
                 pass
-            # The page and profile are QObject children of this view. The
-            # dialog schedules the view itself for deletion immediately after
-            # dispose(), so Qt will destroy both children in the correct order.
-            # Deleting them independently can race QWebEngineView teardown and
-            # leave PySide holding another invalid C++ wrapper.
+            self._bridge_script = None
+            self._adblock_script = None
 
     _TrailerWebView.__name__ = "TrailerWebView"
     TrailerWebView = _TrailerWebView
     return TrailerWebView
+
+
+def get_windows_playback_web_view_class():
+    """Return a QWidget wrapper around Windows' native Edge WebView2 view."""
+    global WindowsPlaybackWebView
+    if WindowsPlaybackWebView is not None:
+        return WindowsPlaybackWebView
+    if not _WINDOWS_WEBVIEW_INITIALIZED:
+        return None
+
+    try:
+        from PySide6.QtWebView import QWebView, QWebViewLoadingInfo
+    except (ImportError, OSError):
+        return None
+
+    load_status = getattr(QWebViewLoadingInfo, "LoadStatus", None)
+    load_succeeded = getattr(load_status, "Succeeded", None)
+    load_failed = getattr(load_status, "Failed", None)
+    load_stopped = getattr(load_status, "Stopped", None)
+
+    class _WindowsPlaybackWebView(QWidget):
+        """Edge-backed player used on Windows when Qt WebEngine lacks HLS codecs."""
+
+        clicked = Signal()
+        loadFinished = Signal(bool)
+
+        def __init__(
+            self,
+            parent: Optional[QWidget] = None,
+            *,
+            block_ads: bool = True,
+        ):
+            super().__init__(parent)
+            self._bridge_token = uuid.uuid4().hex
+            self._disposed = False
+            self._capabilities_reported = False
+            self._adblock_settings = (
+                _playback_adblock_settings()
+                if block_ads
+                else AdBlockSettings(enabled=False, blocked_hosts=frozenset())
+            )
+            self._adblock_source = build_playback_adblock_script(
+                self._adblock_settings
+            )
+            self._trusted_url = ""
+            self._adblock_injected_for_url = ""
+            self._restore_scheduled = False
+            self._native_view = QWebView()
+            window_type = getattr(Qt, "WindowType", Qt)
+            no_focus = getattr(window_type, "WindowDoesNotAcceptFocus", None)
+            if no_focus is not None:
+                self._native_view.setFlag(no_focus, True)
+            self._native_view.loadingChanged.connect(self._loading_changed)
+            self._native_view.loadProgressChanged.connect(self._load_progress_changed)
+            self._native_view.urlChanged.connect(self._url_changed)
+            self._window_container = QWidget.createWindowContainer(
+                self._native_view,
+                self,
+            )
+            self._window_container.setFocusPolicy(Qt.NoFocus)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            layout.addWidget(self._window_container)
+
+        def _run_javascript(
+            self,
+            source: str,
+            callback: Optional[Callable[[object], None]] = None,
+        ) -> None:
+            if self._disposed:
+                if callback is not None:
+                    callback(None)
+                return
+            result_callback = callback or (lambda _result: None)
+            try:
+                self._native_view.runJavaScript(source, result_callback)
+            except (RuntimeError, TypeError):
+                result_callback(None)
+
+        def _loading_changed(self, info) -> None:
+            if self._disposed:
+                return
+            try:
+                status = info.status()
+            except (AttributeError, RuntimeError):
+                return
+            if status == load_succeeded:
+                bridge_source = _PLAYBACK_FRAME_BRIDGE_SOURCE.replace(
+                    "__PISTICK_BRIDGE_TOKEN__",
+                    json.dumps(self._bridge_token),
+                )
+                source = f"{self._adblock_source}\n{bridge_source}"
+                self._run_javascript(source, self._bridge_ready)
+            elif status in {load_failed, load_stopped}:
+                self.loadFinished.emit(False)
+
+        def _load_progress_changed(self, progress: int) -> None:
+            """Install filtering as early as Qt's native WebView API permits."""
+            if self._disposed or not self._adblock_settings.enabled or progress <= 0:
+                return
+            try:
+                current_url = self._native_view.url().toString()
+            except RuntimeError:
+                return
+            if not current_url or current_url == self._adblock_injected_for_url:
+                return
+            self._adblock_injected_for_url = current_url
+            self._run_javascript(self._adblock_source)
+
+        def _url_changed(self, url: QUrl) -> None:
+            if self._disposed or not self._adblock_settings.enabled:
+                return
+            candidate = url.toString()
+            if not self._trusted_url or candidate == "about:blank":
+                return
+            if same_origin(candidate, self._trusted_url) or self._restore_scheduled:
+                return
+            self._restore_scheduled = True
+            QTimer.singleShot(0, self._restore_trusted_url)
+
+        def _restore_trusted_url(self) -> None:
+            self._restore_scheduled = False
+            if self._disposed or not self._trusted_url:
+                return
+            try:
+                self._native_view.stop()
+                self._native_view.setUrl(QUrl(self._trusted_url))
+            except RuntimeError:
+                pass
+
+        def _bridge_ready(self, _result: object) -> None:
+            if self._disposed:
+                return
+            if not self._capabilities_reported:
+                self._run_javascript(
+                    """
+                    (() => JSON.stringify({
+                        userAgent: navigator.userAgent || '',
+                        mediaSource: typeof MediaSource !== 'undefined',
+                        h264Aac: typeof MediaSource !== 'undefined'
+                            && typeof MediaSource.isTypeSupported === 'function'
+                            && MediaSource.isTypeSupported(
+                                'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'
+                            )
+                    }))();
+                    """,
+                    self._media_capabilities_received,
+                )
+            self.loadFinished.emit(True)
+
+        def _media_capabilities_received(self, result: object) -> None:
+            self._capabilities_reported = True
+            capabilities = self._decode_javascript_result(result)
+            if not isinstance(capabilities, dict):
+                return
+            user_agent = str(capabilities.get("userAgent") or "")
+            engine = "Edge WebView2" if "Edg/" in user_agent else "unknown native WebView"
+            hls_ready = bool(capabilities.get("mediaSource")) and bool(
+                capabilities.get("h264Aac")
+            )
+            print(
+                f"[PiStick] Windows playback engine: {engine}; "
+                f"H.264/AAC MSE: {'available' if hls_ready else 'unavailable'}"
+            )
+
+        def setUrl(self, url: QUrl) -> None:
+            if self._adblock_settings.enabled:
+                self._trusted_url = url.toString()
+                self._adblock_injected_for_url = ""
+            self._native_view.setUrl(url)
+
+        def mouseReleaseEvent(self, event) -> None:
+            self.clicked.emit()
+            super().mouseReleaseEvent(event)
+
+        def play_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    const video = document.querySelector('video');
+                    if (video) {
+                        const result = video.play();
+                        if (result && typeof result.catch === 'function') result.catch(() => {});
+                    }
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'play'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def pause_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    const video = document.querySelector('video');
+                    if (video) video.pause();
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'pause'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def toggle_media(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'toggle'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def toggle_subtitles(self) -> None:
+            bridge_token = json.dumps(self._bridge_token)
+            self._run_javascript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'subtitles-english-toggle'
+                    }, '*');
+                    return true;
+                })();
+                """.replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+            )
+
+        def seek_media(self, position_seconds: float) -> None:
+            try:
+                position = float(position_seconds)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(position) or position <= 0:
+                return
+            bridge_token = json.dumps(self._bridge_token)
+            seek_position = json.dumps(position)
+            self._run_javascript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'seek',
+                        positionSeconds: __PISTICK_SEEK_POSITION__
+                    }, '*');
+                    return true;
+                })();
+                """
+                .replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+                .replace("__PISTICK_SEEK_POSITION__", seek_position)
+            )
+
+        def seek_relative(self, offset_seconds: float) -> None:
+            try:
+                offset = float(offset_seconds)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(offset) or offset == 0:
+                return
+            bridge_token = json.dumps(self._bridge_token)
+            seek_offset = json.dumps(offset)
+            self._run_javascript(
+                """
+                (() => {
+                    window.postMessage({
+                        type: 'pistick-media-command',
+                        bridgeToken: __PISTICK_BRIDGE_TOKEN__,
+                        action: 'seek-relative',
+                        offsetSeconds: __PISTICK_SEEK_OFFSET__
+                    }, '*');
+                    return true;
+                })();
+                """
+                .replace("__PISTICK_BRIDGE_TOKEN__", bridge_token)
+                .replace("__PISTICK_SEEK_OFFSET__", seek_offset)
+            )
+
+        @staticmethod
+        def _decode_javascript_result(result: object) -> object:
+            decoded = result
+            for _attempt in range(2):
+                if not isinstance(decoded, str) or not decoded.strip():
+                    break
+                try:
+                    decoded = json.loads(decoded)
+                except (TypeError, ValueError):
+                    break
+            return decoded
+
+        def request_playback_state(self, callback: Callable[[object], None]) -> None:
+            def result_received(result: object) -> None:
+                callback(self._decode_javascript_result(result))
+
+            self._run_javascript(
+                """
+                (() => {
+                    try {
+                        let state = null;
+                        if (typeof window.pistickGetPlaybackState === 'function') {
+                            const reported = window.pistickGetPlaybackState();
+                            if (reported && typeof reported.then !== 'function') state = reported;
+                        }
+                        if (!state) {
+                            const video = document.querySelector('video');
+                            if (video) {
+                                state = {
+                                    currentTime: Number(video.currentTime || 0),
+                                    duration: Number.isFinite(video.duration) ? Number(video.duration) : 0
+                                };
+                            }
+                        }
+                        if (!state) state = window.__pistickPlaybackState || null;
+                        if (state && state.updatedAt && Date.now() - state.updatedAt > 15000) {
+                            state = null;
+                        }
+                        return state ? JSON.stringify(state) : '';
+                    } catch (_error) {
+                        return '';
+                    }
+                })();
+                """,
+                result_received,
+            )
+
+        # Compatibility aliases for TrailerDialog's shared controls.
+        play_trailer = play_media
+        pause_trailer = pause_media
+
+        def dispose(self) -> None:
+            if self._disposed:
+                return
+            self._disposed = True
+            self._trusted_url = ""
+            try:
+                self._native_view.stop()
+                self._native_view.setUrl(QUrl("about:blank"))
+            except RuntimeError:
+                pass
+
+    _WindowsPlaybackWebView.__name__ = "WindowsPlaybackWebView"
+    WindowsPlaybackWebView = _WindowsPlaybackWebView
+    return WindowsPlaybackWebView
+
+
+def get_playback_web_view_class():
+    """Select a codec-capable player without changing the documented API URL."""
+    if sys.platform == "win32" and QT_BINDING == "PySide6":
+        return get_windows_playback_web_view_class()
+    return get_trailer_web_view_class()
 
 
 class SmoothScrollArea(QScrollArea):
@@ -1913,6 +3308,11 @@ class SmoothScrollArea(QScrollArea):
 
         self._animate(hbar, self._h_animation, htarget, 210)
         self._animate(vbar, self._v_animation, vtarget, 240)
+
+    def smooth_scroll_to_top(self) -> None:
+        """Move a page to its exact top instead of only revealing a child."""
+        bar = self.verticalScrollBar()
+        self._animate(bar, self._v_animation, bar.minimum(), 240)
 
 
 class HorizontalMediaScrollArea(SmoothScrollArea):
@@ -2614,7 +4014,7 @@ class ControllerManager(QObject):
     navigate = Signal(str)
     activate = Signal()
     back = Signal()
-    pause = Signal()
+    subtitles = Signal()
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -2740,7 +4140,7 @@ class ControllerManager(QObject):
         if self._button_edge(1):  # B / Circle
             self.back.emit()
         if self._button_edge(2):  # X / Square
-            self.pause.emit()
+            self.subtitles.emit()
 
         current = self._direction_values()
         for direction, pressed in current.items():
@@ -2924,18 +4324,23 @@ class TextInputDialog(QDialog):
 
 
 class TrailerDialog(QDialog):
-    """On-demand trailer player whose Chromium lifetime matches this screen."""
+    """On-demand embedded player whose browser lifetime matches this screen."""
 
     controlsReady = Signal(object)
 
     def __init__(
         self,
         title: str,
-        trailer: dict[str, Any],
+        trailer: Optional[dict[str, Any]] = None,
         parent: Optional[QWidget] = None,
+        *,
+        embed_url: str = "",
+        player_label: str = "Trailer",
     ):
         super().__init__(parent)
-        self.trailer = dict(trailer)
+        self.trailer = dict(trailer or {})
+        self.embed_url = str(embed_url).strip()
+        self.player_label = str(player_label).strip() or "Player"
         self.trailer_web: Optional[QWidget] = None
         self.trailer_placeholder: Optional[QFrame] = None
         self.trailer_overlay: Optional[QFrame] = None
@@ -2955,7 +4360,7 @@ class TrailerDialog(QDialog):
         self._fullscreen_timer.setInterval(2000)
         self._fullscreen_timer.timeout.connect(self.enter_fullscreen)
 
-        self.setWindowTitle(f"{title} — Trailer")
+        self.setWindowTitle(f"{title} — {self.player_label}")
         self.resize(1080, 700)
         self.setMinimumSize(860, 540)
         self.setModal(True)
@@ -2967,7 +4372,7 @@ class TrailerDialog(QDialog):
 
         topbar = QHBoxLayout()
         topbar.setContentsMargins(28, 18, 24, 12)
-        heading = QLabel(f"Trailer  •  {title}")
+        heading = QLabel(f"{self.player_label}  •  {title}")
         heading.setObjectName("rowHeading")
         topbar.addWidget(heading)
         topbar.addStretch(1)
@@ -2995,21 +4400,38 @@ class TrailerDialog(QDialog):
         body.addWidget(placeholder, 1)
         self.trailer_placeholder = placeholder
 
-        trailer_view_class = get_trailer_web_view_class()
+        trailer_view_class = (
+            get_playback_web_view_class()
+            if self.embed_url
+            else get_trailer_web_view_class()
+        )
         if trailer_view_class is None:
-            note = QLabel("Embedded trailer playback is unavailable in this build.")
+            message = "Embedded playback is unavailable in this build."
+            if self.embed_url and sys.platform == "win32" and QT_BINDING == "PySide6":
+                message = _windows_playback_unavailable_message()
+            note = QLabel(message)
             note.setObjectName("mutedLabel")
             note.setAlignment(Qt.AlignCenter)
+            note.setWordWrap(True)
             placeholder_layout.addWidget(note, 1)
         else:
-            web = trailer_view_class(placeholder)
+            web = trailer_view_class(
+                placeholder,
+                block_ads=bool(self.embed_url),
+            )
             web.setMinimumHeight(360)
             web.setFocusPolicy(Qt.NoFocus)
             web.clicked.connect(self._schedule_fullscreen)
-            web.setHtml(
-                build_youtube_embed_html(str(trailer.get("key", ""))),
-                QUrl(f"{YOUTUBE_REFERER}trailer.html"),
+            web.loadFinished.connect(
+                lambda loaded, player=web: player.play_media() if loaded else None
             )
+            if self.embed_url:
+                web.setUrl(QUrl(self.embed_url))
+            else:
+                web.setHtml(
+                    build_youtube_embed_html(str(self.trailer.get("key", ""))),
+                    QUrl(f"{YOUTUBE_REFERER}trailer.html"),
+                )
             placeholder_layout.addWidget(web)
             self.trailer_web = web
 
@@ -3021,8 +4443,8 @@ class TrailerDialog(QDialog):
         if self._play_started or self.trailer_web is None:
             return
         self._play_started = True
-        if hasattr(self.trailer_web, "play_trailer"):
-            self.trailer_web.play_trailer()
+        if hasattr(self.trailer_web, "play_media"):
+            self.trailer_web.play_media()
         self._schedule_fullscreen()
 
     def _schedule_fullscreen(self) -> None:
@@ -3063,7 +4485,16 @@ class TrailerDialog(QDialog):
         web.setParent(overlay)
         overlay_layout.addWidget(web)
 
-        hint = QLabel("Controller: X pause  •  B back     Keyboard: Esc back", overlay)
+        controller_hint = (
+            f"Controller: A play/pause + controls  •  X English subtitles  •  "
+            f"←/→ skip {PLAYBACK_SEEK_SECONDS}s  •  B return to details"
+            if self.embed_url
+            else (
+                "Controller: A play/pause  •  X English subtitles  •  B back"
+                "     Keyboard: Esc back"
+            )
+        )
+        hint = QLabel(controller_hint, overlay)
         hint.setObjectName("trailerFullscreenHint")
         hint.setStyleSheet(
             "background:rgba(0,0,0,185); color:#ffffff; border-radius:8px; "
@@ -3125,9 +4556,29 @@ class TrailerDialog(QDialog):
         if (
             self._trailer_fullscreen
             and self.trailer_web is not None
-            and hasattr(self.trailer_web, "pause_trailer")
+            and hasattr(self.trailer_web, "pause_media")
         ):
-            self.trailer_web.pause_trailer()
+            self.trailer_web.pause_media()
+
+    def toggle_playback(self) -> bool:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "toggle_media"):
+            return False
+        try:
+            web.toggle_media()
+        except RuntimeError:
+            return False
+        return True
+
+    def toggle_subtitles(self) -> bool:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "toggle_subtitles"):
+            return False
+        try:
+            web.toggle_subtitles()
+        except RuntimeError:
+            return False
+        return True
 
     def exit_fullscreen(self) -> bool:
         if not self._trailer_fullscreen or self.trailer_overlay is None:
@@ -3215,8 +4666,7 @@ class TrailerDialog(QDialog):
         return True
 
     def _escape_requested(self) -> None:
-        if not self.exit_fullscreen():
-            self.reject()
+        self.controller_back()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -3247,8 +4697,120 @@ class TrailerDialog(QDialog):
         super().closeEvent(event)
 
 
+class PlaybackDialog(TrailerDialog):
+    """Movie or episode player backed by PiStick's playback API."""
+
+    progressReported = Signal(float, float)
+
+    def __init__(
+        self,
+        title: str,
+        embed_url: str,
+        parent: Optional[QWidget] = None,
+        *,
+        resume_seconds: float = 0.0,
+    ):
+        super().__init__(
+            title,
+            parent=parent,
+            embed_url=embed_url,
+            player_label="Now Playing",
+        )
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(2000)
+        self._progress_timer.timeout.connect(self._poll_progress)
+        self._progress_request_pending = False
+        self._closing_player = False
+        try:
+            requested_resume = float(resume_seconds)
+        except (TypeError, ValueError):
+            requested_resume = 0.0
+        self._resume_seconds = (
+            requested_resume
+            if math.isfinite(requested_resume) and requested_resume > 0
+            else 0.0
+        )
+        self._resume_attempts = 0
+        self._resume_timer = QTimer(self)
+        self._resume_timer.setInterval(1000)
+        self._resume_timer.timeout.connect(self._try_resume)
+        if self._resume_seconds > 0:
+            self._resume_timer.start()
+            QTimer.singleShot(250, self._try_resume)
+        self._progress_timer.start()
+
+    def _try_resume(self) -> None:
+        if self._closing_player or self._resume_seconds <= 0:
+            self._resume_timer.stop()
+            return
+        web = self.trailer_web
+        if web is not None and hasattr(web, "seek_media"):
+            try:
+                web.seek_media(self._resume_seconds)
+            except RuntimeError:
+                pass
+        self._resume_attempts += 1
+        if self._resume_attempts >= 30:
+            self._resume_timer.stop()
+
+    def _poll_progress(self) -> None:
+        web = self.trailer_web
+        if (
+            self._closing_player
+            or self._progress_request_pending
+            or web is None
+            or not hasattr(web, "request_playback_state")
+        ):
+            return
+        self._progress_request_pending = True
+        try:
+            web.request_playback_state(self._progress_received)
+        except RuntimeError:
+            self._progress_request_pending = False
+
+    def _progress_received(self, state: object) -> None:
+        self._progress_request_pending = False
+        if self._closing_player:
+            return
+        if not isinstance(state, dict):
+            return
+        try:
+            position = float(state.get("currentTime", state.get("position", 0.0)) or 0.0)
+            duration = float(state.get("duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if position >= 0 and duration > 0:
+            if self._resume_seconds > 0 and position >= max(0.0, self._resume_seconds - 3.0):
+                self._resume_seconds = 0.0
+                self._resume_timer.stop()
+            self.progressReported.emit(position, duration)
+
+    def seek_relative(self, offset_seconds: float) -> bool:
+        web = self.trailer_web
+        if web is None or not hasattr(web, "seek_relative"):
+            return False
+        try:
+            web.seek_relative(offset_seconds)
+        except RuntimeError:
+            return False
+        return True
+
+    def controller_back(self) -> bool:
+        # Actual content returns directly to the title details screen. Trailers
+        # retain TrailerDialog's one-level fullscreen collapse behavior.
+        self.reject()
+        return True
+
+    def closeEvent(self, event) -> None:
+        self._closing_player = True
+        self._resume_timer.stop()
+        self._progress_timer.stop()
+        super().closeEvent(event)
+
+
 class DetailDialog(QDialog):
     stateChanged = Signal()
+    playbackExited = Signal()
     controlsReady = Signal(object)
 
     def __init__(
@@ -3286,6 +4848,7 @@ class DetailDialog(QDialog):
         self.trailer: Optional[dict[str, Any]] = None
         self.trailer_button: Optional[QPushButton] = None
         self._trailer_dialog: Optional[TrailerDialog] = None
+        self._playback_dialog: Optional[PlaybackDialog] = None
         self.setWindowTitle(initial_media.get("title", APP_NAME))
         self.resize(1080, 760)
         self.setMinimumSize(860, 620)
@@ -3788,12 +5351,114 @@ class DetailDialog(QDialog):
         return payload
 
     def _watch_episode_clicked(self, episode: dict[str, Any]) -> None:
+        payload = self._episode_playback_payload(episode)
+        saved = self.watch_state.episode_entry(
+            self.profile_id,
+            self.media,
+            int(payload["season_number"]),
+            int(payload["episode_number"]),
+        ) or {}
+        start_seconds = int(float(saved.get("position_seconds", 0.0) or 0.0))
+        try:
+            embed_url = getshow(
+                int(self.media.get("id", 0) or 0),
+                int(payload["season_number"]),
+                int(payload["episode_number"]),
+                progress_seconds=start_seconds,
+            )
+        except (PlaybackAPIError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Playback unavailable", str(exc))
+            return
+
         self.watch_state.mark_episode_started(self.profile_id, self.media, episode)
         self.stateChanged.emit()
-        watch_title(self._episode_playback_payload(episode))
         media = dict(self.media)
-        self._episode_after_close = lambda: self._render(media)
+        episode_for_progress = dict(episode)
+
+        def save_progress(position: float, duration: float) -> None:
+            self.watch_state.set_episode_position(
+                self.profile_id,
+                media,
+                episode_for_progress,
+                position,
+                duration,
+            )
+            self.stateChanged.emit()
+
+        def start_playback() -> None:
+            self._render(media)
+            self._open_playback_dialog(
+                str(payload["title"]),
+                embed_url,
+                save_progress,
+                resume_seconds=start_seconds,
+            )
+
+        self._episode_after_close = start_playback
+        if not self.close_episode_picker():
+            self._episode_after_close = None
+            start_playback()
+
+    def _active_playback_dialog(self) -> Optional[PlaybackDialog]:
+        dialog = self._playback_dialog
+        if dialog is None:
+            return None
+        try:
+            if dialog.isVisible():
+                return dialog
+        except RuntimeError:
+            pass
+        self._playback_dialog = None
+        return None
+
+    def _active_player_dialog(self) -> Optional[TrailerDialog]:
+        return self._active_playback_dialog() or self._active_trailer_dialog()
+
+    def _discard_playback_state(self) -> None:
+        dialog = self._playback_dialog
+        self._playback_dialog = None
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+        except RuntimeError:
+            pass
+
+    def _open_playback_dialog(
+        self,
+        title: str,
+        embed_url: str,
+        progress_callback: Callable[[float, float], None],
+        *,
+        resume_seconds: float = 0.0,
+    ) -> None:
+        active = self._active_player_dialog()
+        if active is not None:
+            active.raise_()
+            active.activateWindow()
+            return
+
         self.close_episode_picker()
+        dialog = PlaybackDialog(
+            title,
+            embed_url,
+            self,
+            resume_seconds=resume_seconds,
+        )
+        self._playback_dialog = dialog
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.controlsReady.connect(self.controlsReady.emit)
+        dialog.progressReported.connect(progress_callback)
+        dialog.finished.connect(lambda _result, d=dialog: self._playback_finished(d))
+        dialog.open()
+
+    def _playback_finished(self, dialog: PlaybackDialog) -> None:
+        if self._playback_dialog is dialog:
+            self._playback_dialog = None
+        self.playbackExited.emit()
+        preferred = self.watch_show_button or self.preferred_controller_widget
+        if preferred is not None:
+            self.controlsReady.emit(preferred)
 
     def _active_trailer_dialog(self) -> Optional[TrailerDialog]:
         dialog = self._trailer_dialog
@@ -3845,24 +5510,36 @@ class DetailDialog(QDialog):
         if preferred is not None:
             self.controlsReady.emit(preferred)
 
-    def is_trailer_screen_open(self) -> bool:
-        return self._active_trailer_dialog() is not None
+    def is_player_screen_open(self) -> bool:
+        return self._active_player_dialog() is not None
 
-    def is_trailer_fullscreen(self) -> bool:
-        dialog = self._active_trailer_dialog()
+    def is_player_fullscreen(self) -> bool:
+        dialog = self._active_player_dialog()
         return bool(dialog is not None and dialog.is_fullscreen())
 
-    def exit_trailer_fullscreen(self) -> bool:
-        dialog = self._active_trailer_dialog()
+    def exit_player_fullscreen(self) -> bool:
+        dialog = self._active_player_dialog()
         return bool(dialog is not None and dialog.exit_fullscreen())
 
-    def pause_fullscreen_trailer(self) -> None:
-        dialog = self._active_trailer_dialog()
+    def pause_fullscreen_player(self) -> None:
+        dialog = self._active_player_dialog()
         if dialog is not None:
             dialog.pause_fullscreen()
 
+    def toggle_player_playback(self) -> bool:
+        dialog = self._active_player_dialog()
+        return bool(dialog is not None and dialog.toggle_playback())
+
+    def toggle_player_subtitles(self) -> bool:
+        dialog = self._active_player_dialog()
+        return bool(dialog is not None and dialog.toggle_subtitles())
+
+    def seek_playback(self, offset_seconds: float) -> bool:
+        dialog = self._active_playback_dialog()
+        return bool(dialog is not None and dialog.seek_relative(offset_seconds))
+
     def controller_back(self) -> bool:
-        dialog = self._active_trailer_dialog()
+        dialog = self._active_player_dialog()
         if dialog is not None:
             return dialog.controller_back()
         if self.close_episode_picker():
@@ -3885,6 +5562,7 @@ class DetailDialog(QDialog):
             self.episode_panel.raise_()
 
     def closeEvent(self, event) -> None:
+        self._discard_playback_state()
         self._discard_trailer_state()
         if self._episode_panel_animation is not None:
             self._episode_panel_animation.stop()
@@ -3895,6 +5573,7 @@ class DetailDialog(QDialog):
         self.controller_actions = []
         self.preferred_controller_widget = None
         self.trailer_button = None
+        self._discard_playback_state()
         self._discard_trailer_state()
         self._discard_episode_picker()
         self._clear_body()
@@ -4002,7 +5681,7 @@ class DetailDialog(QDialog):
         entry = self.watch_state.entry(self.profile_id, media)
         if entry and entry.get("status") == "in_progress":
             if media.get("media_type") == "tv":
-                finished = QPushButton("✓  Mark Episode Finished")
+                finished = QPushButton("✓  Mark Episode as Finished")
                 finished.clicked.connect(lambda: self._mark_current_episode_finished(media))
             else:
                 finished = QPushButton("✓  Mark as Finished")
@@ -4012,6 +5691,14 @@ class DetailDialog(QDialog):
             finished.setFocusPolicy(Qt.StrongFocus)
             buttons.addWidget(finished)
             self.controller_actions.append(finished)
+            if media.get("media_type") == "tv":
+                show_finished = QPushButton("✓  Mark Show as Finished")
+                show_finished.setObjectName("secondaryButton")
+                show_finished.setProperty("controllerSelected", False)
+                show_finished.setFocusPolicy(Qt.StrongFocus)
+                show_finished.clicked.connect(lambda: self._mark_finished(media))
+                buttons.addWidget(show_finished)
+                self.controller_actions.append(show_finished)
         elif entry and entry.get("status") == "finished":
             unwatched = QPushButton("Mark as Unwatched")
             unwatched.setObjectName("secondaryButton")
@@ -4045,9 +5732,9 @@ class DetailDialog(QDialog):
             self.controlsReady.emit(self.preferred_controller_widget)
 
     def controller_focusables(self) -> list[QWidget]:
-        trailer_dialog = self._active_trailer_dialog()
-        if trailer_dialog is not None:
-            return trailer_dialog.controller_focusables()
+        player_dialog = self._active_player_dialog()
+        if player_dialog is not None:
+            return player_dialog.controller_focusables()
         if self._episode_picker_open:
             widgets: list[QWidget] = [
                 button
@@ -4070,9 +5757,9 @@ class DetailDialog(QDialog):
         return widgets
 
     def controller_current_target(self, current: Optional[QWidget] = None) -> Optional[QWidget]:
-        trailer_dialog = self._active_trailer_dialog()
-        if trailer_dialog is not None:
-            return trailer_dialog.controller_current_target(current)
+        player_dialog = self._active_player_dialog()
+        if player_dialog is not None:
+            return player_dialog.controller_current_target(current)
         focusables = self.controller_focusables()
         if current in focusables:
             return current
@@ -4094,9 +5781,9 @@ class DetailDialog(QDialog):
         current: Optional[QWidget] = None,
     ) -> Optional[QWidget]:
         """Return the next details control without relying on WebEngine focus."""
-        trailer_dialog = self._active_trailer_dialog()
-        if trailer_dialog is not None:
-            return trailer_dialog.controller_move_target(direction, current)
+        player_dialog = self._active_player_dialog()
+        if player_dialog is not None:
+            return player_dialog.controller_move_target(direction, current)
         if self._episode_picker_open:
             focusables = self.controller_focusables()
             current = self.controller_current_target(current)
@@ -4173,11 +5860,32 @@ class DetailDialog(QDialog):
         if media.get("media_type") == "tv":
             self.toggle_episode_picker()
             return
+        saved = self.watch_state.entry(self.profile_id, media) or {}
+        start_seconds = int(float(saved.get("position_seconds", 0.0) or 0.0))
+        try:
+            embed_url = getmovie(
+                int(media.get("id", 0) or 0),
+                progress_seconds=start_seconds,
+            )
+        except (PlaybackAPIError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Playback unavailable", str(exc))
+            return
+
         self.watch_state.mark_started(self.profile_id, media)
         self.stateChanged.emit()
-        # Intentionally blank until you add Jellyfin logic to watch_title().
-        watch_title(media)
         self._render(media)
+        media_for_progress = dict(media)
+        self._open_playback_dialog(
+            str(media.get("title") or "Movie"),
+            embed_url,
+            lambda position, duration: self.watch_state.set_position(
+                self.profile_id,
+                media_for_progress,
+                position,
+                duration,
+            ),
+            resume_seconds=start_seconds,
+        )
 
     def _mark_finished(self, media: dict[str, Any]) -> None:
         self.watch_state.mark_finished(self.profile_id, media)
@@ -4198,6 +5906,7 @@ class DetailDialog(QDialog):
         self._render(media)
 
     def _show_error(self, error: str) -> None:
+        self._discard_playback_state()
         self._discard_trailer_state()
         self._clear_body()
         label = QLabel(f"Could not load this title.\n\n{error}")
@@ -4352,7 +6061,7 @@ class MainWindow(QMainWindow):
         self.controller.navigate.connect(self._controller_navigate)
         self.controller.activate.connect(self._controller_activate)
         self.controller.back.connect(self._controller_back)
-        self.controller.pause.connect(self._controller_pause)
+        self.controller.subtitles.connect(self._controller_subtitles)
 
         QApplication.instance().installEventFilter(self)
 
@@ -4650,7 +6359,7 @@ class MainWindow(QMainWindow):
             "1. Create a free TMDB account and request API access.\n"
             "2. Copy your API Read Access Token.\n"
             "3. Copy config.example.json to config.json and paste your token.\n"
-            "4. Restart this app.\n\n"
+            "4. Restart this app. Videasy playback needs no separate API key.\n\n"
             "You can also set the TMDB_READ_TOKEN environment variable instead."
         )
         body.setObjectName("setupBody")
@@ -4763,13 +6472,15 @@ class MainWindow(QMainWindow):
         self.home_layout.addWidget(scroll)
         self.stack.setCurrentWidget(self.home_page)
 
-    def _refresh_home_from_state(self) -> None:
-        if self.home_payload is None or self.stack.currentWidget() != self.home_page:
-            return
+    def _refresh_home_from_state(self, *, allow_render: bool = False) -> bool:
+        if self.home_payload is None:
+            return False
         layout = self._home_content_layout
         if layout is None:
-            self._render_home(self.home_payload)
-            return
+            if allow_render:
+                self._render_home(self.home_payload)
+                return True
+            return False
 
         # Rebuild only the small profile-specific row and update badges in
         # place. Reconstructing all five infinite discovery carousels after a
@@ -4801,6 +6512,7 @@ class MainWindow(QMainWindow):
             card.refresh_watch_state()
         self._invalidate_controller_focusables()
         _notify_image_view_changed()
+        return True
 
     def _show_home_error(self, error: str) -> None:
         self._home_loading = False
@@ -5010,6 +6722,7 @@ class MainWindow(QMainWindow):
         self._detail_state_dirty = False
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.stateChanged.connect(self._detail_state_changed)
+        dialog.playbackExited.connect(self._detail_playback_exited)
         dialog.controlsReady.connect(
             lambda preferred, d=dialog: self._detail_controls_ready(d, preferred)
         )
@@ -5027,8 +6740,13 @@ class MainWindow(QMainWindow):
         if self._detail_dialog is dialog:
             self._detail_dialog = None
         if self._detail_state_dirty:
-            self._detail_state_dirty = False
-            self._refresh_home_from_state()
+            self._detail_state_dirty = not self._refresh_home_from_state()
+
+    def _detail_playback_exited(self) -> None:
+        # Refresh the hidden Home page immediately after movie/episode playback
+        # closes. This also covers titles opened from Search, where the previous
+        # current-page guard left Continue Watching stale indefinitely.
+        self._detail_state_dirty = not self._refresh_home_from_state()
 
     def _detail_state_changed(self) -> None:
         # The details window is modal, so rebuilding hundreds of hidden home
@@ -5058,6 +6776,8 @@ class MainWindow(QMainWindow):
             return
         self.header.show()
         self.controller_status.setVisible(self.controller.connected)
+        if self._refresh_home_from_state(allow_render=True):
+            self._detail_state_dirty = False
         self.stack.setCurrentWidget(self.home_page)
 
     def _focus_search(self) -> None:
@@ -5199,6 +6919,10 @@ class MainWindow(QMainWindow):
     def _controller_navigate(self, direction: str) -> None:
         detail = self._active_detail_dialog()
         if detail is not None:
+            if direction in {"left", "right"}:
+                offset = -PLAYBACK_SEEK_SECONDS if direction == "left" else PLAYBACK_SEEK_SECONDS
+                if detail.seek_playback(offset):
+                    return
             current = self._controller_selected
             if current not in detail.controller_focusables():
                 focus = QApplication.focusWidget()
@@ -5275,10 +6999,14 @@ class MainWindow(QMainWindow):
         self._ensure_focus_visible(widget)
 
     def _ensure_focus_visible(self, widget: QWidget) -> None:
+        focused_feature = self._find_ancestor(widget, HeroBanner) is not None
         parent = widget.parentWidget()
         while parent is not None:
             if isinstance(parent, SmoothScrollArea):
-                parent.smooth_ensure_widget_visible(widget, 48, 48)
+                if focused_feature and parent.objectName() == "mainScroll":
+                    parent.smooth_scroll_to_top()
+                else:
+                    parent.smooth_ensure_widget_visible(widget, 48, 48)
             elif isinstance(parent, QScrollArea):
                 parent.ensureWidgetVisible(widget, 48, 48)
             parent = parent.parentWidget()
@@ -5286,6 +7014,9 @@ class MainWindow(QMainWindow):
     def _controller_activate(self) -> None:
         detail = self._active_detail_dialog()
         if detail is not None:
+            if detail.is_player_screen_open():
+                detail.toggle_player_playback()
+                return
             current = self._controller_selected
             if current not in detail.controller_focusables():
                 focus = QApplication.focusWidget()
@@ -5329,10 +7060,10 @@ class MainWindow(QMainWindow):
             return
         self._escape_action()
 
-    def _controller_pause(self) -> None:
+    def _controller_subtitles(self) -> None:
         detail = self._active_detail_dialog()
-        if detail is not None and detail.is_trailer_fullscreen():
-            detail.pause_fullscreen_trailer()
+        if detail is not None and detail.is_player_screen_open():
+            detail.toggle_player_subtitles()
 
     def _open_controller_search_keyboard(self) -> None:
         if not self.controller.connected or self._controller_keyboard is not None:
@@ -5768,6 +7499,10 @@ def _ensure_app_stylesheet() -> None:
 
 def main() -> int:
     print(f"Starting {APP_NAME} {APP_VERSION}")
+    _playback_adblock_settings()
+    # Qt WebView must select its native Windows backend before QApplication
+    # creates a platform graphics context.
+    _initialize_windows_playback_webview()
     application_attributes = getattr(Qt, "ApplicationAttribute", Qt)
     share_contexts = getattr(application_attributes, "AA_ShareOpenGLContexts", None)
     if share_contexts is not None:
@@ -5776,6 +7511,7 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
+    app.aboutToQuit.connect(_stop_windows_adblock_proxy)
     _ensure_app_stylesheet()
     window = MainWindow(AppConfig.load())
     window.show()

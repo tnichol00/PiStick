@@ -1,5 +1,12 @@
 {
   "installer_schema": 1,
   "entrypoint": "main.py",
-  "updater": "install.sh"
+  "updater": "install.sh",
+  "required_files": [
+    "main.py",
+    "adblock.py",
+    "playback_api.py",
+    "config.example.json",
+    "install.sh"
+  ]
 }

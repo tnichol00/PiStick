@@ -55,9 +55,13 @@ PISTICK_STATE_PATH = os.getenv("PISTICK_STATE_PATH", "pistick_state.json")
 PISTICK_CACHE_DIR = os.getenv("PISTICK_CACHE_DIR", ".cache")
 MARKER = "${marker}"
 EOF
+    cp "${PROJECT_DIR}/playback_api.py" "${source_dir}/PiStick-${tag}/playback_api.py"
+    cp "${PROJECT_DIR}/adblock.py" "${source_dir}/PiStick-${tag}/adblock.py"
     cat >"${source_dir}/PiStick-${tag}/config.example.json" <<'EOF'
 {
-  "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE"
+  "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE",
+  "adblock_enabled": true,
+  "adblock_domains": []
 }
 EOF
     cp "$INSTALLER" "${source_dir}/PiStick-${tag}/install.sh"
@@ -66,7 +70,14 @@ EOF
 {
   "installer_schema": 1,
   "entrypoint": "main.py",
-  "updater": "install.sh"
+  "updater": "install.sh",
+  "required_files": [
+    "main.py",
+    "adblock.py",
+    "playback_api.py",
+    "config.example.json",
+    "install.sh"
+  ]
 }
 EOF
     tar -C "$source_dir" -czf "$archive" "PiStick-${tag}"
@@ -145,7 +156,11 @@ run_installed_updater() {
 
 mkdir -p "$TEST_ROOT" "$FIXTURES"
 bash -n "$INSTALLER"
-python3 -m py_compile "${PROJECT_DIR}/main.py"
+python3 -m py_compile \
+    "${PROJECT_DIR}/main.py" \
+    "${PROJECT_DIR}/adblock.py" \
+    "${PROJECT_DIR}/playback_api.py"
+python3 -m unittest discover -s "${PROJECT_DIR}/tests" -p 'test_*.py'
 
 # Verify main.py's external data paths without importing Qt.
 python3 - "${PROJECT_DIR}/main.py" <<'PY'
@@ -171,16 +186,41 @@ run_installer
 
 assert_symlink "${TEST_ROOT}/opt/pistick/current"
 assert_file "${TEST_ROOT}/opt/pistick/current/main.py"
+assert_file "${TEST_ROOT}/opt/pistick/current/adblock.py"
+assert_file "${TEST_ROOT}/opt/pistick/current/playback_api.py"
 assert_file "${TEST_ROOT}/etc/pistick/config.json"
 assert_file "${TEST_ROOT}/usr/local/bin/pistick-update"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.0.0"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmdb_read_token"])' "${TEST_ROOT}/etc/pistick/config.json")" "test-tmdb-read-token"
+python3 -c 'import json,sys; assert "playback_base_url" not in json.load(open(sys.argv[1]))' "${TEST_ROOT}/etc/pistick/config.json"
 
+python3 - "${TEST_ROOT}/etc/pistick/config.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["adblock_enabled"] = True
+payload["adblock_online_lists"] = True
+payload["adblock_domains"] = ["ads.private-example.test"]
+payload["adblock_allow_domains"] = ["video.private-example.test"]
+payload["playback_base_url"] = "https://legacy-provider.example"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
 printf '{"profiles":[{"id":"kept"}],"watch_state":{}}\n' >"${TEST_ROOT}/var/lib/pistick/user-data.json"
-config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
 state_hash="$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)"
 
-# A repeated manual run is idempotent.
+# An update removes the obsolete provider field while preserving private
+# ad-block settings and watch state.
+run_installed_updater
+assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
+assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "ads.private-example.test"
+assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_allow_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "video.private-example.test"
+python3 -c 'import json,sys; assert "playback_base_url" not in json.load(open(sys.argv[1]))' "${TEST_ROOT}/etc/pistick/config.json"
+config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
+
+# A repeated manual run is idempotent after migration.
 run_installed_updater
 assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
 assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"

@@ -1,19 +1,22 @@
 # PiStick
 
-PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers.
+PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through [Videasy's documented player API](https://www.videasy.to/docs).
 
-PiStick is currently an alpha. Browsing, profiles, trailers, and watch-state features work, but actual movie and episode playback is still a placeholder until Jellyfin is connected.
+PiStick is currently an alpha. Browsing, profiles, trailers, watch-state features, and embedded movie and episode playback are implemented. Compatible embed pages report playback time to PiStick, which saves and restores an exact per-profile resume timestamp.
 
 ## Features
 
 - Netflix-style profiles with separate watch histories
-- Featured titles, movies, TV shows, and Continue Watching
+- Featured titles, movies, TV shows, and immediately refreshed Continue Watching
 - Keyboard, mouse, and controller navigation
 - Infinite horizontal discovery carousels
 - On-screen keyboard for controller searches
-- Movie watch-state tracking
+- Movie, show, and individual-episode watch-state controls
 - Season and episode selection with per-profile resume data
-- On-demand YouTube trailer screen with fullscreen controls
+- Videasy movie and episode playback from TMDB-number-based URLs
+- Client-side 1080p HLS selection with the best available fallback
+- Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
+- Autoplaying Videasy and YouTube players with controller subtitle controls
 - Low-memory mode for the original Raspberry Pi Zero W
 - Manual, release-only installation and updates with rollback
 
@@ -28,7 +31,88 @@ PiStick is currently an alpha. Browsing, profiles, trailers, and watch-state fea
 - Optional Bluetooth controller or USB controller with a micro-USB OTG adapter
 - Free [TMDB account](https://www.themoviedb.org/signup)
 
-The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but the Chromium-based YouTube trailer player is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
+The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
+
+## Videasy playback
+
+The playback URL helpers live in `playback_api.py` and are called by `main.py` like this:
+
+```python
+from playback_api import getmovie, getshow
+
+movie_url = getmovie(550)
+episode_url = getshow(1399, 1, 3)
+```
+
+The calls produce Videasy's documented movie and TV paths:
+
+```text
+https://player.videasy.to/movie/550
+https://player.videasy.to/tv/1399/1/3
+```
+
+Videasy's docs currently show `player.videasy.net`, which redirects to `player.videasy.to`. PiStick uses the final HTTPS origin directly so its anti-popup navigation lock does not reject that redirect. When saved progress exists, PiStick appends only Videasy's documented `progress` parameter, such as `?progress=120`.
+
+On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open and autoplay from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens and autoplays in the same player. The player expands fullscreen after opening. Subtitles begin off; controller X toggles the available English track. Controller A toggles play/pause and reveals the timeline, timestamps, volume, and player buttons; Left/Right seeks backward/forward 10 seconds, and B or keyboard Escape closes playback directly back to the title details screen.
+
+Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. PiStick accepts those documented messages and also keeps its HTML5-video bridge as a fallback. Qt WebEngine on the Pi injects the bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+
+The native Windows WebView2 path can directly read a top-level HTML5 `<video>` element and accepts the same `pistick-playback-progress` messages. If a Windows embed keeps its video inside a different-origin nested iframe, that frame must post progress itself; PiStick does not disable browser security or read through the origin boundary.
+
+A custom player can also expose its playback state in one of these ways:
+
+- Define `window.pistickGetPlaybackState()` and return `{currentTime, duration}`.
+- Use a top-level HTML5 `<video>` element; PiStick reads it automatically.
+- From a nested player iframe, post `{type: "pistick-playback-progress", currentTime, duration}` to the top window.
+
+For a custom player that does not expose an HTML5 `<video>` element, define `window.pistickSeekTo(seconds)` so PiStick can apply the saved resume position without changing the API URL. It can also define `window.pistickSeekBy(offsetSeconds)` for controller skipping, `window.pistickSetQuality(label, height)` for the preferred resolution, and `window.pistickSetSubtitles(enabled, language)` for PiStick's English subtitle toggle.
+
+PiStick requests 1080p from YouTube trailers and locks an exposed HLS player to its 1080p rendition. If a particular source has no 1080p rendition, PiStick selects the closest available rendition, preferring the highest one below 1080p. This is done inside the loaded player and does not add anything to the documented API URL.
+
+PiStick reads the latest reported state every two seconds. The timestamp and duration are stored beside that movie or episode's existing Continue Watching record in the private per-profile state file. When playback closes, the Home page's Continue Watching row is rebuilt immediately—even if Home is currently behind Search or the title-details dialog. When that title is reopened, the bridge seeks to the saved timestamp after its video metadata becomes available. The values are not stored beside secrets in `config.json`.
+
+An in-progress TV show exposes separate **Mark Episode as Finished** and **Mark Show as Finished** actions. Finishing the whole show removes it from Continue Watching and replaces those actions with the same **Mark as Unwatched** action used for finished movies.
+
+Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
+
+### Playback ad blocker
+
+Ad blocking is enabled by default only for movie and episode playback. YouTube trailers keep their separate, unfiltered browser profile so a playback rule cannot break trailers.
+
+PiStick combines its built-in rules with the maintained [oisd big blocklist](https://oisd.nl/). The list is downloaded directly over HTTPS, validated, normalized, cached locally, and refreshed in the background when it is more than 24 hours old. If the first download or a later refresh fails, playback continues with the last cache and built-in rules. Videasy's player and core source/subtitle API hosts are explicitly allowed so a broad public list cannot block the player itself.
+
+On Raspberry Pi, the Qt WebEngine profile blocks matching hosts before requests reach Chromium, rejects pop-up windows and off-origin top-level redirects, and injects cosmetic filtering into every frame. On Windows, all playback WebView2 requests—including requests from cross-origin nested frames—pass through a random-port proxy bound only to `127.0.0.1`. The proxy checks the destination hostname and then tunnels allowed HTTPS bytes unchanged; it does not decrypt, inspect, or modify the video stream. If `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` already contains a different proxy, PiStick preserves it and falls back to browser/in-page filtering.
+
+On both engines, nested playback frames are sandboxed with only the permissions needed for scripts, autoplay, encrypted media, and fullscreen playback. Pop-ups, downloads, payment requests, and attempts to navigate the top-level PiStick player are not permitted. PiStick blocks dynamic scripts from known ad hosts synchronously, before their requests can race the DOM observer. It does not disable browser security or broadly block URL paths that might contain video, HLS, or subtitle data.
+
+Extra block or allow domains can be added privately without changing tracked code:
+
+```json
+{
+  "adblock_enabled": true,
+  "adblock_online_lists": true,
+  "adblock_domains": [
+    "ads.example",
+    "*.popups.example"
+  ],
+  "adblock_allow_domains": [
+    "video-cdn.example"
+  ]
+}
+```
+
+Add only hostnames, without `https://`, a path, or a query. The installer preserves these fields during updates and rollback. If a legitimate provider or CDN is blocked, add it to `adblock_allow_domains`. Set `adblock_online_lists` to `false` to use only built-in/private rules, or set `adblock_enabled` to `false` to disable all playback filtering.
+
+### Testing playback on Windows
+
+Windows playback requires Python 3.10 or newer, PySide6 6.11 or newer, and the Microsoft Edge WebView2 Runtime. Windows 11 normally includes WebView2. From the PiStick folder, run:
+
+```powershell
+py -m pip install --upgrade -r requirements-windows.txt
+py main.py
+```
+
+PiStick continues to use Qt WebEngine for YouTube trailers, but uses Edge WebView2 for movies and episodes. If the native player is unavailable, the playback screen shows the missing requirement instead of opening the known codec-limited Qt WebEngine fallback.
 
 ## Install PiStick
 
@@ -75,7 +159,7 @@ ssh pistick@192.168.1.123
 
 Replace `192.168.1.123` with the Pi's actual address.
 
-### 3. Get the TMDB API Read Access Token
+### 3. Get the required configuration
 
 1. Sign in to TMDB.
 2. Open [TMDB API settings](https://www.themoviedb.org/settings/api).
@@ -98,7 +182,7 @@ The installer has one PiStick-specific prompt:
 Paste your TMDB API Read Access Token:
 ```
 
-Paste the token and press Enter. The prompt is hidden, so the token will not appear while it is pasted or typed.
+Paste the token and press Enter. The prompt is hidden, so the value does not appear while it is pasted or typed. It is stored only in `/etc/pistick/config.json` on the Pi.
 
 The first installation can take a while on an original Pi Zero W because the Pi must download and install Qt WebEngine and the other system packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again; completed package work and configuration are reused.
 
@@ -111,6 +195,7 @@ The installer automatically:
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
 - Installs Python, Requests, pygame, PyQt5, Qt WebEngine, minimal X11, Matchbox, fonts, graphics libraries, and Bluetooth support.
 - Validates the TMDB API Read Access Token before saving it.
+- Validates and normalizes the private HTTPS playback base URL before saving it.
 - Downloads the newest published PiStick GitHub Release, never an unfinished branch commit.
 - Ignores draft releases. Published pre-releases are eligible for installation.
 - Validates the release manifest, required files, Bash syntax, and Python syntax.
@@ -140,7 +225,7 @@ When a new release exists, the updater:
 2. Validates its required files and syntax.
 3. Stops PiStick only after validation succeeds.
 4. Activates the new release and watches its startup health.
-5. Keeps the user's TMDB token, profiles, watch history, and caches.
+5. Keeps the user's TMDB token, playback base URL, profiles, watch history, and caches.
 6. Automatically returns to the previous release if startup fails.
 
 The updater never installs a normal tag, branch commit, or draft release.
@@ -151,8 +236,8 @@ These files survive every update:
 
 | Purpose | Path |
 | --- | --- |
-| TMDB configuration | `/etc/pistick/config.json` |
-| Profiles and watch history | `/var/lib/pistick/user-data.json` |
+| Private TMDB and playback configuration | `/etc/pistick/config.json` |
+| Profiles, watch history, and resume timestamps | `/var/lib/pistick/user-data.json` |
 | Installed release record | `/var/lib/pistick/installed-release.json` |
 | Posters, API data, and WebEngine cache | `/var/cache/pistick/` |
 
@@ -219,6 +304,15 @@ Restart PiStick after pairing:
 sudo systemctl restart pistick.service
 ```
 
+Controller playback controls:
+
+- A: play/pause trailers, movies, and episodes; movie/episode playback also reveals the full player control bar
+- X: toggle English subtitles; subtitles start off whenever a player opens
+- Left/Right on the D-pad or left stick: seek 10 seconds backward/forward in a movie or episode
+- B or keyboard Escape during movie or episode playback: close playback and return directly to title details
+- B during trailer fullscreen: return to the trailer window; press B again to close it
+- Keyboard Escape follows the same two-step back behavior for trailers
+
 ## Optional remote viewing
 
 SSH is the normal maintenance method. To temporarily see and control PiStick without a normal desktop, install `x11vnc`:
@@ -268,7 +362,7 @@ The installer found no non-draft GitHub Release. A tag or branch by itself is in
 
 ### `pistick-update: command not found`
 
-Rerun the full installation command. It safely reuses the existing TMDB token and release data while restoring the updater command.
+Rerun the full installation command. It safely reuses the existing private configuration and release data while restoring the updater command.
 
 ### `pistick.service` repeatedly restarts or stays failed
 
@@ -321,6 +415,48 @@ If no device appears, reconnect or pair the controller again. If a device appear
 
 The trailer screen uses Qt WebEngine and Chromium, making it the heaviest part of PiStick. It is created only after **Watch Trailer** is selected and destroyed after closing. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
 
+### A movie or episode does not load
+
+First validate the local configuration and confirm the TMDB token file is valid JSON:
+
+```bash
+sudo python3 -m json.tool /etc/pistick/config.json
+```
+
+Then test Videasy's player from the Pi:
+
+```bash
+curl -I https://player.videasy.to/movie/550
+```
+
+The player needs JavaScript and media playback support from the browser engine. Check the PiStick logs for Chromium, network, or certificate errors:
+
+```bash
+journalctl -u pistick.service -b -n 100 --no-pager
+```
+
+No Videasy API key is required. The TMDB token is used only for title metadata; Videasy movie or episode paths are built from the selected TMDB number, season, and episode.
+
+### The log shows iframe or cross-origin JavaScript warnings
+
+These messages come from the embed page rather than the TMDB request:
+
+- `document.domain mutation is ignored` means the page still uses the obsolete `document.domain` workaround. Remove that assignment.
+- `Allow attribute will take precedence over 'allowfullscreen'` means an iframe contains both attributes. Use `allow="autoplay; encrypted-media; fullscreen"` and remove the separate `allowfullscreen` attribute.
+- `Blocked a frame ... Protocols, domains, and ports must match` means code is directly accessing a parent or child frame from a different origin. Use `postMessage()`; matching only the domain name is insufficient when the scheme, subdomain, or port differs.
+
+PiStick's Qt WebEngine progress bridge follows this model and runs separately inside every frame. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
+
+### The Windows log says `HLS not supported`
+
+Qt WebEngine cannot enable H.264/AAC after it has been built. Update the Windows test dependencies and restart PiStick so movie and episode playback uses Edge WebView2:
+
+```powershell
+py -m pip install --upgrade -r requirements-windows.txt
+```
+
+Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error or source-fetch error is emitted by Videasy or one of its upstream services, not by PiStick's movie/TV URL builder.
+
 ## Creating a release
 
 PiStick installs only published GitHub Releases. Maintainers should release from a tested `main` commit:
@@ -330,13 +466,16 @@ PiStick installs only published GitHub Releases. Maintainers should release from
    ```bash
    bash -n install.sh
    bash tests/test_installer.sh
-   python3 -m py_compile main.py
+   python3 -m py_compile main.py adblock.py playback_api.py
+   python3 -m unittest discover -s tests -p 'test_*.py'
    python3 -m json.tool config.example.json >/dev/null
    python3 -m json.tool pistick-release.json >/dev/null
    ```
 
 2. Confirm the release contains:
    - `main.py`
+   - `adblock.py`
+   - `playback_api.py`
    - `config.example.json`
    - `install.sh`
    - `pistick-release.json`
@@ -350,9 +489,12 @@ GitHub's automatic source archive is enough; no separate ZIP asset is required. 
 
 - TMDB metadata and posters come from TMDB.
 - Trailers play through YouTube.
+- Selecting playback sends the TMDB title number—and, for TV, the season and episode numbers—to Videasy. A saved resume timestamp is also sent through Videasy's documented `progress` query parameter.
+- The playback ad blocker refreshes its public OISD hosts list at most once every 24 hours. That request contains no title, playback URL, profile, or watch-history data. The normalized list is cached locally; private block/allow domains stay in the private configuration.
 - Profiles and watch history stay on the Pi.
 - The TMDB token is stored at `/etc/pistick/config.json` with restricted permissions.
 - The installer does not collect or store a GitHub credential.
-- A real `config.json` must never be committed or included in a release.
+- The repository's `config.example.json` contains only placeholders. A real `config.json` must never be committed or included in a release.
 
 This product uses the TMDB API but is not endorsed or certified by TMDB.
+Only use PiStick and third-party playback services for content you are authorized to access.
