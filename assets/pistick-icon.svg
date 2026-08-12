@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">PiStick app icon</title>
+  <desc id="description">A dark streaming stick with an illuminated blue and violet play button.</desc>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#27334b"/>
+      <stop offset="0.48" stop-color="#111827"/>
+      <stop offset="1" stop-color="#050816"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#18d7ff"/>
+      <stop offset="0.52" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#b026ff"/>
+    </linearGradient>
+    <linearGradient id="plug" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff2b0"/>
+      <stop offset="0.45" stop-color="#eab84b"/>
+      <stop offset="1" stop-color="#9b5b16"/>
+    </linearGradient>
+    <radialGradient id="play" cx="38%" cy="30%" r="75%">
+      <stop offset="0" stop-color="#16d9ff"/>
+      <stop offset="0.52" stop-color="#1769ff"/>
+      <stop offset="1" stop-color="#8b20ef"/>
+    </radialGradient>
+  </defs>
+
+  <g transform="rotate(-10 512 512)">
+    <rect x="236" y="257" width="588" height="690" rx="174" fill="#020617" opacity="0.28"/>
+    <path d="M402 105h220c25 0 46 20 46 46v135H356V151c0-26 20-46 46-46z" fill="url(#plug)" stroke="#f9dc86" stroke-width="12"/>
+    <rect x="393" y="126" width="238" height="45" rx="16" fill="#111827"/>
+    <rect x="422" y="138" width="180" height="14" rx="7" fill="#020617"/>
+
+    <rect x="218" y="226" width="588" height="690" rx="174" fill="url(#edge)"/>
+    <rect x="232" y="240" width="560" height="662" rx="160" fill="url(#body)" stroke="#6ca7ff" stroke-opacity="0.38" stroke-width="5"/>
+    <path d="M299 317c52-53 121-77 213-77h117" fill="none" stroke="#ffffff" stroke-opacity="0.16" stroke-linecap="round" stroke-width="20"/>
+
+    <circle cx="512" cy="553" r="188" fill="#050816" stroke="url(#edge)" stroke-width="24"/>
+    <circle cx="512" cy="553" r="154" fill="url(#play)"/>
+    <path d="M467 465c-16-10-36 2-36 21v134c0 19 20 31 36 21l116-67c16-9 16-33 0-42z" fill="#ffffff"/>
+
+    <rect x="432" y="802" width="160" height="27" rx="14" fill="url(#edge)"/>
+  </g>
+</svg>

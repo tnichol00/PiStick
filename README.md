@@ -1,6 +1,8 @@
 # PiStick
 
-PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through [Videasy's documented player API](https://www.videasy.to/docs).
+<img src="assets/pistick-icon.png" alt="PiStick logo" width="128">
+
+PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi and Windows. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through [Videasy's documented player API](https://www.videasy.to/docs).
 
 PiStick is currently an alpha. Browsing, profiles, trailers, watch-state features, and embedded movie and episode playback are implemented. Compatible embed pages report playback time to PiStick, which saves and restores an exact per-profile resume timestamp.
 
@@ -18,9 +20,17 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
 - Autoplaying Videasy and YouTube players with controller subtitle controls
 - Low-memory mode for the original Raspberry Pi Zero W
-- Manual, release-only installation and updates with rollback
+- Manual, published-release-only installation and updates
 
 ## What you need
+
+For either platform:
+
+- Free [TMDB account](https://www.themoviedb.org/signup)
+- Internet connection
+- Optional Bluetooth or USB controller
+
+For Raspberry Pi:
 
 - Raspberry Pi Zero W or a newer Raspberry Pi
 - 8 GB or larger microSD card
@@ -28,8 +38,13 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - Mini-HDMI cable for an original Pi Zero W when connecting it to a TV
 - 2.4 GHz Wi-Fi for an original Pi Zero W
 - A computer with a microSD-card reader for Raspberry Pi Imager
-- Optional Bluetooth controller or USB controller with a micro-USB OTG adapter
-- Free [TMDB account](https://www.themoviedb.org/signup)
+- Micro-USB OTG adapter when using a USB controller with an original Pi Zero W
+
+For Windows:
+
+- 64-bit Windows 10 or Windows 11
+- Microsoft Edge WebView2 Runtime; Windows 11 normally includes it
+- Windows Package Manager (`winget`) only if Python 3.10 or newer is not already installed
 
 The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
 
@@ -103,18 +118,49 @@ Extra block or allow domains can be added privately without changing tracked cod
 
 Add only hostnames, without `https://`, a path, or a query. The installer preserves these fields during updates and rollback. If a legitimate provider or CDN is blocked, add it to `adblock_allow_domains`. Set `adblock_online_lists` to `false` to use only built-in/private rules, or set `adblock_enabled` to `false` to disable all playback filtering.
 
-### Testing playback on Windows
+## Install PiStick
 
-Windows playback requires Python 3.10 or newer, PySide6 6.11 or newer, and the Microsoft Edge WebView2 Runtime. Windows 11 normally includes WebView2. From the PiStick folder, run:
+Both installers download the newest published, non-draft [PiStick Release](https://github.com/tnichol00/PiStick/releases). They do not install unfinished branch code or set up automatic updates.
 
-```powershell
-py -m pip install --upgrade -r requirements-windows.txt
-py main.py
+### Get the required TMDB token
+
+1. Sign in to TMDB.
+2. Open [TMDB API settings](https://www.themoviedb.org/settings/api).
+3. Complete TMDB's API access form if required.
+4. Copy the long **API Read Access Token**.
+
+PiStick uses the long Read Access Token as a Bearer token. Do not use the shorter v3 API key. Both installers ask for this token the first time and preserve it during updates.
+
+### Linux / Raspberry Pi command
+
+PiStick's Linux installer is intended for Raspberry Pi OS or another supported Debian-based Raspberry Pi installation. Paste this command into the Pi's SSH terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-PiStick continues to use Qt WebEngine for YouTube trailers, but uses Edge WebView2 for movies and episodes. If the native player is unavailable, the playback screen shows the missing requirement instead of opening the known codec-limited Qt WebEngine fallback.
+The installer saves private configuration under `/etc/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot.
 
-## Install PiStick
+### Windows command
+
+Open a normal, non-administrator PowerShell window and paste this complete command:
+
+```powershell
+$ErrorActionPreference='Stop'; $installer=Join-Path $env:TEMP 'pistick-install.ps1'; Invoke-WebRequest 'https://raw.githubusercontent.com/tnichol00/PiStick/main/install.ps1' -OutFile $installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+```
+
+The Windows installer:
+
+- Installs PiStick for the current user under `%LOCALAPPDATA%\PiStick` without requiring administrator rights.
+- Installs Python 3.12 through Windows Package Manager if a compatible Python installation is not already available.
+- Creates an isolated Python runtime and installs the Windows dependencies.
+- Creates a **PiStick** Start Menu shortcut with the PiStick logo.
+- Stores configuration, profiles, watch history, and caches outside versioned release folders so they survive updates.
+- Launches PiStick when installation finishes.
+
+Windows movie and episode playback uses Microsoft Edge WebView2 for H.264/AAC HLS support. Windows 11 normally includes the WebView2 Runtime. If it is missing, install Microsoft's current [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) and reopen PiStick from the Start Menu.
+
+### Raspberry Pi OS setup details
 
 PiStick is designed for a fresh **Raspberry Pi OS Lite (32-bit)** installation. It adds only the graphical components needed to run the app, not a normal desktop, taskbar, file manager, or desktop icons.
 
@@ -124,7 +170,7 @@ The finished boot flow is:
 Power on -> Raspberry Pi OS Lite -> minimal X11 session -> PiStick fullscreen
 ```
 
-### 1. Write Raspberry Pi OS to the microSD card
+#### 1. Write Raspberry Pi OS to the microSD card
 
 1. Install [Raspberry Pi Imager](https://www.raspberrypi.com/software/) on your computer.
 2. Insert the microSD card. Everything currently on the selected card will be erased.
@@ -141,7 +187,7 @@ Power on -> Raspberry Pi OS Lite -> minimal X11 session -> PiStick fullscreen
 
 Allow several minutes for the first boot. An original Pi Zero W can connect only to a 2.4 GHz Wi-Fi network. Raspberry Pi's [headless setup guide](https://www.raspberrypi.com/documentation/computers/getting-started.html#headless-remote-setup) also explains the Imager and SSH options.
 
-### 2. Connect to the Pi over SSH
+#### 2. Connect to the Pi over SSH
 
 On Windows, open PowerShell. On macOS or Linux, open Terminal. Run:
 
@@ -159,24 +205,15 @@ ssh pistick@192.168.1.123
 
 Replace `192.168.1.123` with the Pi's actual address.
 
-### 3. Get the required configuration
+#### 3. Run the Linux installer
 
-1. Sign in to TMDB.
-2. Open [TMDB API settings](https://www.themoviedb.org/settings/api).
-3. Complete TMDB's API access form if required.
-4. Copy the long **API Read Access Token**.
-
-PiStick uses the long Read Access Token as a Bearer token. Do not use the shorter v3 API key.
-
-### 4. Run the installer
-
-Paste this complete command into the Pi's SSH terminal:
+After copying the TMDB token, run the Linux command shown above:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-The installer has one PiStick-specific prompt:
+The installer prompts for:
 
 ```text
 Paste your TMDB API Read Access Token:
@@ -188,62 +225,79 @@ The first installation can take a while on an original Pi Zero W because the Pi 
 
 When installation succeeds, PiStick starts immediately and launches automatically after every boot.
 
-## What the installer does
+## What the installers do
 
-The installer automatically:
+Both installers:
+
+- Validate the TMDB API Read Access Token before saving it.
+- Download the newest published PiStick GitHub Release, never an unfinished branch commit.
+- Ignore draft releases while allowing published pre-releases.
+- Validate the release manifest, required files, configuration JSON, and Python syntax.
+- Keep private configuration, profiles, history, and caches outside release folders.
+- Preserve existing user data when the installer is run again.
+- Avoid timers, scheduled tasks, cron jobs, automatic update checks, and `git pull` workflows.
+
+The Linux installer also:
 
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
 - Installs Python, Requests, pygame, PyQt5, Qt WebEngine, minimal X11, Matchbox, fonts, graphics libraries, and Bluetooth support.
-- Validates the TMDB API Read Access Token before saving it.
-- Validates and normalizes the private HTTPS playback base URL before saving it.
-- Downloads the newest published PiStick GitHub Release, never an unfinished branch commit.
-- Ignores draft releases. Published pre-releases are eligible for installation.
-- Validates the release manifest, required files, Bash syntax, and Python syntax.
 - Stores immutable release snapshots under `/opt/pistick/releases/`.
 - Points `/opt/pistick/current` at the active release.
-- Stores configuration, profiles, history, and caches outside the release directory.
 - Creates a minimal fullscreen X11 service with no desktop.
 - Starts PiStick at boot and restarts it if it crashes.
 - Installs the manual `pistick-update` command.
 - Preserves the previous release and rolls back if a new release fails its startup check.
 
-The installer does **not** install a timer, cron job, automatic update checker, or `git pull` workflow.
+The Windows installer also:
+
+- Installs per-user files under `%LOCALAPPDATA%\PiStick`.
+- Uses an isolated virtual environment under the PiStick installation instead of changing system Python packages.
+- Creates a stable hidden-window launcher plus a Start Menu shortcut and multi-resolution icon.
+- Keeps each downloaded app release under `%LOCALAPPDATA%\PiStick\releases` and switches the active release only after validation and dependency installation succeed.
 
 ## Update PiStick
 
-Updates happen only when someone connects over SSH and runs:
+Updates remain manual on both platforms.
+
+On Linux, connect over SSH and run:
 
 ```bash
 sudo pistick-update
 ```
 
-The updater checks the published [PiStick Releases](https://github.com/tnichol00/PiStick/releases), selects the most recently published non-draft release, and does nothing if that release is already installed.
+On Windows, rerun the Windows installation command, or run the saved installer directly:
 
-When a new release exists, the updater:
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\PiStick\install.ps1"
+```
+
+Each updater checks the published [PiStick Releases](https://github.com/tnichol00/PiStick/releases), selects the most recently published non-draft release, and safely reuses private user data.
+
+When a new Linux release exists, the updater:
 
 1. Downloads it without changing the running release.
 2. Validates its required files and syntax.
 3. Stops PiStick only after validation succeeds.
 4. Activates the new release and watches its startup health.
-5. Keeps the user's TMDB token, playback base URL, profiles, watch history, and caches.
+5. Keeps the user's TMDB token, profiles, watch history, and caches.
 6. Automatically returns to the previous release if startup fails.
 
-The updater never installs a normal tag, branch commit, or draft release.
+Neither updater installs a normal tag, branch commit, or draft release.
 
 ## Persistent files
 
 These files survive every update:
 
-| Purpose | Path |
-| --- | --- |
-| Private TMDB and playback configuration | `/etc/pistick/config.json` |
-| Profiles, watch history, and resume timestamps | `/var/lib/pistick/user-data.json` |
-| Installed release record | `/var/lib/pistick/installed-release.json` |
-| Posters, API data, and WebEngine cache | `/var/cache/pistick/` |
+| Purpose | Linux / Raspberry Pi | Windows |
+| --- | --- | --- |
+| Private TMDB and playback configuration | `/etc/pistick/config.json` | `%LOCALAPPDATA%\PiStick\data\config.json` |
+| Profiles, watch history, and resume timestamps | `/var/lib/pistick/user-data.json` | `%LOCALAPPDATA%\PiStick\data\pistick_state.json` |
+| Active release record | `/var/lib/pistick/installed-release.json` | `%LOCALAPPDATA%\PiStick\current-release.txt` |
+| Posters, API data, and browser cache | `/var/cache/pistick/` | `%LOCALAPPDATA%\PiStick\cache\` |
 
-The service passes these locations to the app through `PISTICK_CONFIG_PATH`, `PISTICK_STATE_PATH`, and `PISTICK_CACHE_DIR`.
+The Linux service and Windows launcher pass these locations to the app through `PISTICK_CONFIG_PATH`, `PISTICK_STATE_PATH`, and `PISTICK_CACHE_DIR`.
 
-If an older manual installation exists at `/home/USERNAME/PiStick`, the first installer run attempts to preserve a valid `config.json` and `pistick_state.json` automatically.
+If an older manual installation exists at `/home/USERNAME/PiStick` on Linux or `%USERPROFILE%\PiStick` on Windows, the first installer run attempts to preserve a valid `config.json` and `pistick_state.json` automatically.
 
 ## Service controls and logs
 
@@ -447,15 +501,15 @@ These messages come from the embed page rather than the TMDB request:
 
 PiStick's Qt WebEngine progress bridge follows this model and runs separately inside every frame. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
 
-### The Windows log says `HLS not supported`
+### Windows says `HLS not supported`
 
-Qt WebEngine cannot enable H.264/AAC after it has been built. Update the Windows test dependencies and restart PiStick so movie and episode playback uses Edge WebView2:
+PiStick uses Edge WebView2 on Windows because Qt WebEngine cannot add H.264/AAC support after it has been built. Rerun the installed Windows updater to repair the isolated dependencies:
 
 ```powershell
-py -m pip install --upgrade -r requirements-windows.txt
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\PiStick\install.ps1"
 ```
 
-Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error or source-fetch error is emitted by Videasy or one of its upstream services, not by PiStick's movie/TV URL builder.
+If the message remains, install Microsoft's current [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) and reopen PiStick from the Start Menu. Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error or source-fetch error is emitted by Videasy or one of its upstream services, not by PiStick's movie/TV URL builder.
 
 ## Creating a release
 
@@ -478,6 +532,9 @@ PiStick installs only published GitHub Releases. Maintainers should release from
    - `playback_api.py`
    - `config.example.json`
    - `install.sh`
+   - `install.ps1`
+   - `requirements-windows.txt`
+   - `assets/pistick.ico`
    - `pistick-release.json`
 3. In GitHub, open **Releases** and choose **Draft a new release**.
 4. Create a version tag such as `v0.1.1-alpha` or `v1.0.0` targeting the tested `main` commit.
@@ -491,8 +548,8 @@ GitHub's automatic source archive is enough; no separate ZIP asset is required. 
 - Trailers play through YouTube.
 - Selecting playback sends the TMDB title number—and, for TV, the season and episode numbers—to Videasy. A saved resume timestamp is also sent through Videasy's documented `progress` query parameter.
 - The playback ad blocker refreshes its public OISD hosts list at most once every 24 hours. That request contains no title, playback URL, profile, or watch-history data. The normalized list is cached locally; private block/allow domains stay in the private configuration.
-- Profiles and watch history stay on the Pi.
-- The TMDB token is stored at `/etc/pistick/config.json` with restricted permissions.
+- Profiles and watch history stay on the installed device.
+- The TMDB token is stored in the platform-specific private configuration path listed above.
 - The installer does not collect or store a GitHub credential.
 - The repository's `config.example.json` contains only placeholders. A real `config.json` must never be committed or included in a release.
 

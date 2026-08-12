@@ -10,7 +10,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly INSTALLER_VERSION="1.1.0"
+readonly INSTALLER_VERSION="1.2.0"
 readonly REPOSITORY="tnichol00/PiStick"
 readonly DEFAULT_RELEASES_API="https://api.github.com/repos/${REPOSITORY}/releases?per_page=100"
 readonly SERVICE_NAME="pistick.service"

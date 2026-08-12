@@ -74,7 +74,7 @@ try:
         Signal,
         QUrl,
     )
-    from PySide6.QtGui import QFont, QImage, QKeySequence, QPixmap, QPixmapCache, QShortcut
+    from PySide6.QtGui import QFont, QIcon, QImage, QKeySequence, QPixmap, QPixmapCache, QShortcut
     from PySide6.QtWidgets import (
         QAbstractButton,
         QApplication,
@@ -111,7 +111,7 @@ except (ImportError, OSError):
         pyqtSignal as Signal,
         pyqtSlot as Slot,
     )
-    from PyQt5.QtGui import QFont, QImage, QKeySequence, QPixmap, QPixmapCache  # type: ignore[no-redef]
+    from PyQt5.QtGui import QFont, QIcon, QImage, QKeySequence, QPixmap, QPixmapCache  # type: ignore[no-redef]
     from PyQt5.QtWidgets import (  # type: ignore[no-redef]
         QAbstractButton,
         QApplication,
@@ -168,7 +168,8 @@ def _load_pygame_module():
 
 
 APP_NAME = "PiStick"
-APP_VERSION = "3.8.1-controller-playback-controls"
+APP_VERSION = "3.9.0-windows-installer"
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "pistick.ico"
 TMDB_CACHE_SCHEMA = "compact-v1"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -7509,6 +7510,8 @@ def main() -> int:
         QApplication.setAttribute(share_contexts, True)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    if APP_ICON_PATH.is_file():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
     app.aboutToQuit.connect(_stop_windows_adblock_proxy)

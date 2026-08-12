@@ -66,20 +66,11 @@ EOF
 EOF
     cp "$INSTALLER" "${source_dir}/PiStick-${tag}/install.sh"
     chmod 0755 "${source_dir}/PiStick-${tag}/install.sh"
-    cat >"${source_dir}/PiStick-${tag}/pistick-release.json" <<'EOF'
-{
-  "installer_schema": 1,
-  "entrypoint": "main.py",
-  "updater": "install.sh",
-  "required_files": [
-    "main.py",
-    "adblock.py",
-    "playback_api.py",
-    "config.example.json",
-    "install.sh"
-  ]
-}
-EOF
+    cp "${PROJECT_DIR}/install.ps1" "${source_dir}/PiStick-${tag}/install.ps1"
+    cp "${PROJECT_DIR}/requirements-windows.txt" "${source_dir}/PiStick-${tag}/requirements-windows.txt"
+    mkdir -p "${source_dir}/PiStick-${tag}/assets"
+    cp "${PROJECT_DIR}/assets/pistick.ico" "${source_dir}/PiStick-${tag}/assets/pistick.ico"
+    cp "${PROJECT_DIR}/pistick-release.json" "${source_dir}/PiStick-${tag}/pistick-release.json"
     tar -C "$source_dir" -czf "$archive" "PiStick-${tag}"
     printf '%s' "$archive"
 }
@@ -188,6 +179,9 @@ assert_symlink "${TEST_ROOT}/opt/pistick/current"
 assert_file "${TEST_ROOT}/opt/pistick/current/main.py"
 assert_file "${TEST_ROOT}/opt/pistick/current/adblock.py"
 assert_file "${TEST_ROOT}/opt/pistick/current/playback_api.py"
+assert_file "${TEST_ROOT}/opt/pistick/current/install.ps1"
+assert_file "${TEST_ROOT}/opt/pistick/current/requirements-windows.txt"
+assert_file "${TEST_ROOT}/opt/pistick/current/assets/pistick.ico"
 assert_file "${TEST_ROOT}/etc/pistick/config.json"
 assert_file "${TEST_ROOT}/usr/local/bin/pistick-update"
 assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.0.0"
