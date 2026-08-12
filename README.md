@@ -145,8 +145,7 @@ The installer saves private configuration under `/etc/pistick`, installs PiStick
 
 Open a normal, non-administrator PowerShell window and paste this complete command:
 
-```*(new command here)
-```
+```$ErrorActionPreference="Stop"; $r=Invoke-RestMethod "https://api.github.com/repos/tnichol00/PiStick/releases/latest"; $zip="$env:TEMP\PiStick-release.zip"; $tmp="$env:TEMP\PiStick-release"; $app="$env:LOCALAPPDATA\PiStick"; Remove-Item $zip,$tmp -Recurse -Force -ErrorAction SilentlyContinue; Invoke-WebRequest $r.zipball_url -OutFile $zip; Expand-Archive $zip -DestinationPath $tmp -Force; $src=Get-ChildItem $tmp -Directory | Select-Object -First 1; Remove-Item $app -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Path $app -Force | Out-Null; Copy-Item "$($src.FullName)\*" $app -Recurse -Force; py -m pip install --upgrade -r "$app\requirements-windows.txt"; Set-Location $app; py main.py```
 
 The Windows installer:
 
