@@ -145,8 +145,7 @@ The installer saves private configuration under `/etc/pistick`, installs PiStick
 
 Open a normal, non-administrator PowerShell window and paste this complete command:
 
-```powershell
-$ErrorActionPreference='Stop'; $installer=Join-Path $env:TEMP 'pistick-install.ps1'; Invoke-WebRequest 'https://raw.githubusercontent.com/tnichol00/PiStick/main/install.ps1' -OutFile $installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+```*(new command here)
 ```
 
 The Windows installer:

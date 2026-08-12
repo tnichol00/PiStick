@@ -1,779 +1,606 @@
-#!/usr/bin/env bash
-# PiStick first-time installer and release-only updater.
-#
-# This script is intentionally manual: it installs no timer, cron job, or
-# background updater. Run it over SSH for the first install, then run
-# `sudo pistick-update` over SSH whenever you want to check for a published
-# release.
+#requires -Version 5.1
+<#
+.SYNOPSIS
+Installs or updates PiStick for the current Windows user.
 
-set -Eeuo pipefail
-IFS=$'\n\t'
-umask 027
+.DESCRIPTION
+PiStick is installed under %LOCALAPPDATA%\PiStick. Published GitHub Releases
+are kept as immutable snapshots, while configuration, profiles, history, and
+cache data live outside those snapshots so they survive every update.
 
-readonly INSTALLER_VERSION="1.2.0"
-readonly REPOSITORY="tnichol00/PiStick"
-readonly DEFAULT_RELEASES_API="https://api.github.com/repos/${REPOSITORY}/releases?per_page=100"
-readonly SERVICE_NAME="pistick.service"
+The installer creates a PiStick shortcut in the current user's Start Menu. It
+does not require administrator rights and does not create an automatic updater.
+#>
 
-TEST_MODE="${PISTICK_TEST_MODE:-0}"
-TEST_ROOT="${PISTICK_TEST_ROOT:-}"
-RELEASES_API="${PISTICK_RELEASES_API_URL:-$DEFAULT_RELEASES_API}"
-WORK_DIR=""
-SWITCH_IN_PROGRESS=0
-PREVIOUS_TARGET=""
-
-if [[ -n "$TEST_ROOT" && "$TEST_MODE" != "1" ]]; then
-    printf 'PISTICK_TEST_ROOT is available only with PISTICK_TEST_MODE=1.\n' >&2
-    exit 2
-fi
-if [[ -n "$TEST_ROOT" ]]; then
-    TEST_ROOT="${TEST_ROOT%/}"
-    [[ "$TEST_ROOT" == /* && "$TEST_ROOT" != "/" ]] || {
-        printf 'PISTICK_TEST_ROOT must be an absolute, non-root path.\n' >&2
-        exit 2
-    }
-fi
-
-root_path() {
-    printf '%s%s' "$TEST_ROOT" "$1"
-}
-
-APP_ROOT="$(root_path /opt/pistick)"
-RELEASES_DIR="${APP_ROOT}/releases"
-CURRENT_LINK="${APP_ROOT}/current"
-CONFIG_DIR="$(root_path /etc/pistick)"
-CONFIG_FILE="${CONFIG_DIR}/config.json"
-INSTALL_CONFIG="${CONFIG_DIR}/install.conf"
-DATA_DIR="$(root_path /var/lib/pistick)"
-STATE_FILE="${DATA_DIR}/user-data.json"
-RELEASE_METADATA="${DATA_DIR}/installed-release.json"
-PREVIOUS_METADATA="${DATA_DIR}/previous-release.json"
-CACHE_DIR="$(root_path /var/cache/pistick)"
-SYSTEMD_DIR="$(root_path /etc/systemd/system)"
-X11_DIR="$(root_path /etc/X11)"
-LOCAL_SBIN="$(root_path /usr/local/sbin)"
-LOCAL_BIN="$(root_path /usr/local/bin)"
-LOCAL_LIBEXEC="$(root_path /usr/local/libexec)"
-LOCK_FILE="$(root_path /run/lock/pistick-installer.lock)"
-
-log() {
-    printf '\n[PiStick] %s\n' "$*"
-}
-
-warn() {
-    printf '\n[PiStick warning] %s\n' "$*" >&2
-}
-
-die() {
-    printf '\n[PiStick error] %s\n' "$*" >&2
-    exit 1
-}
-
-cleanup() {
-    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
-        rm -rf -- "$WORK_DIR"
-    fi
-}
-
-is_release_target() {
-    local candidate="${1:-}"
-    [[ -n "$candidate" && "$candidate" == "${RELEASES_DIR}/"* && "$candidate" != "$RELEASES_DIR" ]]
-}
-
-rollback_switch() {
-    (( SWITCH_IN_PROGRESS == 1 )) || return 0
-    SWITCH_IN_PROGRESS=0
-    warn "The new release did not pass its startup check. Rolling back."
-
-    if is_release_target "$PREVIOUS_TARGET" && [[ -d "$PREVIOUS_TARGET" ]]; then
-        ln -sfn "$PREVIOUS_TARGET" "${APP_ROOT}/.current.rollback"
-        mv -Tf "${APP_ROOT}/.current.rollback" "$CURRENT_LINK"
-        if [[ -f "$PREVIOUS_METADATA" ]]; then
-            install -m 0644 "$PREVIOUS_METADATA" "$RELEASE_METADATA"
-        fi
-        if [[ "$TEST_MODE" != "1" ]]; then
-            systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-        fi
-        warn "PiStick was restored to $(basename "$PREVIOUS_TARGET")."
-    else
-        rm -f -- "$CURRENT_LINK"
-        if [[ "$TEST_MODE" != "1" ]]; then
-            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-        fi
-        warn "No earlier release was available. PiStick remains stopped."
-    fi
-}
-
-on_exit() {
-    local status=$?
-    trap - EXIT
-    if (( status != 0 )); then
-        rollback_switch || true
-    fi
-    cleanup
-    exit "$status"
-}
-trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-require_root() {
-    if [[ "$TEST_MODE" != "1" && ${EUID:-$(id -u)} -ne 0 ]]; then
-        die "Run this installer with sudo: sudo bash install.sh"
-    fi
-}
-
-acquire_lock() {
-    install -d -m 0755 "$(dirname "$LOCK_FILE")"
-    exec 9>"$LOCK_FILE"
-    flock -n 9 || die "Another PiStick install or update is already running."
-}
-
-assert_supported_system() {
-    [[ "$TEST_MODE" == "1" ]] && return 0
-    [[ -r /etc/os-release ]] || die "This installer requires Raspberry Pi OS or Debian Linux."
-    command -v apt-get >/dev/null || die "This installer requires Raspberry Pi OS with apt."
-
-    case "$(uname -m)" in
-        armv6l|armv7l|aarch64) ;;
-        *) die "This installer is intended for a Raspberry Pi, not $(uname -m)." ;;
-    esac
-}
-
-valid_username() {
-    [[ "$1" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]
-}
-
-resolve_service_user() {
-    local candidate=""
-
-    if [[ "$TEST_MODE" == "1" ]]; then
-        candidate="$(id -un)"
-    elif [[ -f "$INSTALL_CONFIG" ]]; then
-        candidate="$(sed -n 's/^PISTICK_USER=//p' "$INSTALL_CONFIG" | head -n 1)"
-    elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-        candidate="$SUDO_USER"
-    else
-        candidate="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ { print $1; exit }')"
-    fi
-
-    valid_username "$candidate" || die "Could not safely determine the SSH user that should run PiStick."
-    getent passwd "$candidate" >/dev/null || die "The PiStick user '$candidate' does not exist."
-
-    PISTICK_USER="$candidate"
-    PISTICK_GROUP="$(id -gn "$candidate")"
-    if [[ "$TEST_MODE" == "1" ]]; then
-        USER_HOME="${TEST_ROOT}/home/${candidate}"
-        install -d -o "$candidate" -g "$PISTICK_GROUP" -m 0750 "$USER_HOME"
-    else
-        USER_HOME="$(getent passwd "$candidate" | cut -d: -f6)"
-    fi
-    [[ -n "$USER_HOME" && "$USER_HOME" == /* ]] || die "Could not determine the home directory for '$candidate'."
-}
-
-install_system_packages() {
-    [[ "$TEST_MODE" == "1" ]] && return 0
-    log "Installing the minimal PiStick system packages"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        tar \
-        python3 \
-        python3-requests \
-        python3-pygame \
-        python3-pyqt5 \
-        python3-pyqt5.qtwebengine \
-        xserver-xorg-core \
-        xserver-xorg-input-all \
-        xserver-xorg-legacy \
-        xinit \
-        xauth \
-        matchbox-window-manager \
-        fonts-dejavu-core \
-        dbus-x11 \
-        libgl1-mesa-dri \
-        bluez
-
-    PYGAME_HIDE_SUPPORT_PROMPT=1 python3 -c \
-        "import requests, pygame; from PyQt5.QtWebEngineWidgets import QWebEngineView" \
-        || die "PiStick's Python/Qt dependencies did not load correctly."
-
-    systemctl enable --now bluetooth.service >/dev/null 2>&1 || true
-}
-
-prepare_directories() {
-    install -d -o root -g root -m 0755 "$APP_ROOT" "$RELEASES_DIR"
-    install -d -o root -g "$PISTICK_GROUP" -m 0750 "$CONFIG_DIR"
-    install -d -o "$PISTICK_USER" -g "$PISTICK_GROUP" -m 0750 "$DATA_DIR" "$CACHE_DIR"
-    install -d -o root -g root -m 0755 "$SYSTEMD_DIR" "$X11_DIR" \
-        "$LOCAL_SBIN" "$LOCAL_BIN" "$LOCAL_LIBEXEC"
-    printf 'PISTICK_USER=%s\n' "$PISTICK_USER" >"${INSTALL_CONFIG}.tmp"
-    chown root:"$PISTICK_GROUP" "${INSTALL_CONFIG}.tmp"
-    chmod 0640 "${INSTALL_CONFIG}.tmp"
-    mv -f "${INSTALL_CONFIG}.tmp" "$INSTALL_CONFIG"
-}
-
-install_updater_command() {
-    local source_path
-    source_path="$(readlink -f "${BASH_SOURCE[0]}")"
-    [[ -f "$source_path" && -s "$source_path" ]] || \
-        die "The installer must be downloaded to a file before it is run; do not pipe it directly into bash."
-    if [[ ! -e "${LOCAL_SBIN}/pistick-installer" || \
-          ! "$source_path" -ef "${LOCAL_SBIN}/pistick-installer" ]]; then
-        install -o root -g root -m 0755 "$source_path" "${LOCAL_SBIN}/pistick-installer"
-    fi
-    cat >"${LOCAL_BIN}/pistick-update" <<EOF
-#!/bin/sh
-set -eu
-if [ -f "${CURRENT_LINK}/install.sh" ]; then
-    exec /usr/bin/bash "${CURRENT_LINK}/install.sh" "\$@"
-fi
-exec /usr/bin/bash "${LOCAL_SBIN}/pistick-installer" "\$@"
-EOF
-    chmod 0755 "${LOCAL_BIN}/pistick-update"
-}
-
-configure_permissions() {
-    [[ "$TEST_MODE" == "1" ]] && return 0
-    local group
-    for group in video input render; do
-        if getent group "$group" >/dev/null; then
-            usermod -aG "$group" "$PISTICK_USER"
-        fi
-    done
-
-    cat >"${X11_DIR}/Xwrapper.config" <<'EOF'
-# Managed by the PiStick installer for this dedicated appliance.
-allowed_users=anybody
-needs_root_rights=yes
-EOF
-    chmod 0644 "${X11_DIR}/Xwrapper.config"
-}
-
-write_runtime_files() {
-    cat >"${LOCAL_LIBEXEC}/pistick-session" <<'EOF'
-#!/bin/sh
-set -eu
-/usr/bin/matchbox-window-manager -use_titlebar no &
-exec /usr/bin/python3 /opt/pistick/current/main.py
-EOF
-    chmod 0755 "${LOCAL_LIBEXEC}/pistick-session"
-
-    cat >"${SYSTEMD_DIR}/${SERVICE_NAME}" <<EOF
-[Unit]
-Description=PiStick television interface
-Wants=network-online.target
-After=network-online.target systemd-user-sessions.service
-Conflicts=getty@tty7.service
-StartLimitIntervalSec=60
-StartLimitBurst=4
-
-[Service]
-Type=simple
-User=${PISTICK_USER}
-Group=${PISTICK_GROUP}
-WorkingDirectory=/opt/pistick/current
-Environment="HOME=${USER_HOME}"
-Environment="DISPLAY=:0"
-Environment="XDG_RUNTIME_DIR=/run/pistick"
-Environment="QT_QPA_PLATFORM=xcb"
-Environment="PISTICK_LOW_MEMORY=1"
-Environment="PISTICK_CONFIG_PATH=/etc/pistick/config.json"
-Environment="PISTICK_STATE_PATH=/var/lib/pistick/user-data.json"
-Environment="PISTICK_CACHE_DIR=/var/cache/pistick"
-RuntimeDirectory=pistick
-RuntimeDirectoryMode=0700
-UMask=0027
-ExecStart=/usr/bin/xinit /usr/local/libexec/pistick-session -- :0 vt7 -keeptty -nolisten tcp
-Restart=always
-RestartSec=2
-KillMode=control-group
-TimeoutStopSec=15
-StandardInput=tty
-TTYPath=/dev/tty7
-TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 0644 "${SYSTEMD_DIR}/${SERVICE_NAME}"
-
-    if [[ "$TEST_MODE" != "1" ]]; then
-        systemctl daemon-reload
-        systemctl enable "$SERVICE_NAME" >/dev/null
-    fi
-}
-
-config_token() {
-    local path="$1"
-    [[ -f "$path" ]] || return 1
-    python3 - "$path" <<'PY'
-import json
-import sys
-
-try:
-    payload = json.load(open(sys.argv[1], encoding="utf-8"))
-    token = str(payload.get("tmdb_read_token") or payload.get("tmdb_token") or "").strip()
-except (OSError, ValueError, TypeError, AttributeError):
-    raise SystemExit(1)
-if not token:
-    raise SystemExit(1)
-print(token)
-PY
-}
-
-validate_tmdb_token() {
-    local token="$1"
-    if [[ "$TEST_MODE" == "1" && "${PISTICK_SKIP_TMDB_VALIDATION:-0}" == "1" ]]; then
-        return 0
-    fi
-
-    local result
-    result="$(python3 -c '
-import json
-import sys
-import urllib.error
-import urllib.request
-
-token = sys.stdin.read().strip()
-request = urllib.request.Request(
-    "https://api.themoviedb.org/3/configuration",
-    headers={"Authorization": "Bearer " + token, "User-Agent": "PiStick-Installer/1.0"},
+[CmdletBinding()]
+param(
+    [switch]$NoLaunch
 )
-try:
-    with urllib.request.urlopen(request, timeout=20) as response:
-        json.load(response)
-except urllib.error.HTTPError as error:
-    print("INVALID" if error.code in (401, 403) else "NETWORK")
-except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-    print("NETWORK")
-else:
-    print("VALID")
-' <<<"$token")"
 
-    case "$result" in
-        VALID) return 0 ;;
-        INVALID) return 1 ;;
-        *) die "TMDB could not be reached to validate the API Read Access Token. Check the Pi's internet connection and run the installer again." ;;
-    esac
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$InstallerVersion = '1.0.1'
+$Repository = 'tnichol00/PiStick'
+$ReleasesApi = "https://api.github.com/repos/$Repository/releases?per_page=100"
+$IconFallbackUrl = "https://raw.githubusercontent.com/$Repository/main/assets/pistick.ico"
+
+if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -or [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+    throw 'PiStick requires LOCALAPPDATA and APPDATA for the current Windows user.'
 }
 
-write_config() {
-    local token="$1"
-    local temporary="${CONFIG_DIR}/.config.json.tmp"
-    printf '%s\n' "$token" | python3 -c '
-import json
-import sys
+$InstallRoot = Join-Path $env:LOCALAPPDATA 'PiStick'
+$ReleasesDirectory = Join-Path $InstallRoot 'releases'
+$DataDirectory = Join-Path $InstallRoot 'data'
+$CacheDirectory = Join-Path $InstallRoot 'cache'
+$RuntimesDirectory = Join-Path $InstallRoot 'runtimes'
+$CurrentReleaseFile = Join-Path $InstallRoot 'current-release.txt'
+$ConfigPath = Join-Path $DataDirectory 'config.json'
+$StatePath = Join-Path $DataDirectory 'pistick_state.json'
+$IconPath = Join-Path $InstallRoot 'pistick.ico'
+$LauncherPath = Join-Path $InstallRoot 'PiStick.vbs'
+$InstalledInstallerPath = Join-Path $InstallRoot 'install.ps1'
+$StartMenuDirectory = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+$ShortcutPath = Join-Path $StartMenuDirectory 'PiStick.lnk'
+$TemporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("PiStick-Install-" + [guid]::NewGuid().ToString('N'))
 
-token = sys.stdin.read().strip()
-if not token:
-    raise SystemExit("Invalid PiStick configuration")
-try:
-    payload = json.load(open(sys.argv[2], encoding="utf-8"))
-    if not isinstance(payload, dict):
-        payload = {}
-except (OSError, ValueError, TypeError):
-    payload = {}
-payload["tmdb_read_token"] = token
-payload.pop("playback_base_url", None)
-with open(sys.argv[1], "w", encoding="utf-8") as output:
-    json.dump(payload, output, indent=2)
-    output.write("\n")
-' "$temporary" "$CONFIG_FILE"
-    chown root:"$PISTICK_GROUP" "$temporary"
-    chmod 0640 "$temporary"
-    mv -f "$temporary" "$CONFIG_FILE"
+function Write-PiStickStep {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    Write-Host "`n[PiStick] $Message" -ForegroundColor Cyan
 }
 
-migrate_legacy_data() {
-    local legacy_dir="${USER_HOME}/PiStick"
-
-    if [[ ! -f "$CONFIG_FILE" && -f "${legacy_dir}/config.json" ]]; then
-        if config_token "${legacy_dir}/config.json" >/dev/null 2>&1; then
-            install -o root -g "$PISTICK_GROUP" -m 0640 \
-                "${legacy_dir}/config.json" "$CONFIG_FILE"
-            log "Preserved the existing PiStick configuration"
-        fi
-    fi
-
-    if [[ ! -f "$STATE_FILE" && -f "${legacy_dir}/pistick_state.json" ]]; then
-        if python3 -m json.tool "${legacy_dir}/pistick_state.json" >/dev/null 2>&1; then
-            install -o "$PISTICK_USER" -g "$PISTICK_GROUP" -m 0640 \
-                "${legacy_dir}/pistick_state.json" "$STATE_FILE"
-            log "Preserved the existing profiles and watch history"
-        fi
-    fi
+function Write-Utf8File {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+    $encoding = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
-ensure_runtime_config() {
-    local token=""
-    token="$(config_token "$CONFIG_FILE" 2>/dev/null || true)"
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+    & $FilePath @ArgumentList | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "$FailureMessage (exit code $LASTEXITCODE)."
+    }
+}
 
-    while [[ -z "$token" ]]; do
-        if [[ "$TEST_MODE" == "1" && -n "${PISTICK_TMDB_TOKEN:-}" ]]; then
-            token="$PISTICK_TMDB_TOKEN"
-        else
-            [[ -r /dev/tty ]] || die "An interactive SSH terminal is required to enter the TMDB token."
-            printf '\nPaste your TMDB API Read Access Token: ' >/dev/tty
-            IFS= read -r -s token </dev/tty
-            printf '\n' >/dev/tty
-        fi
-        token="${token//$'\r'/}"
-        [[ -n "$token" ]] || {
-            warn "The token cannot be empty."
+function Get-PythonExecutable {
+    $candidates = @()
+    $candidatePath = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+    if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
+        # This version-specific path is created by the official per-user
+        # Python 3.12 installer, so it cannot accidentally select Python 3.13.
+        return $candidatePath
+    }
+    $launcher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
+    if ($null -ne $launcher) {
+        # Resolve the real interpreter from the launcher's inventory. This also
+        # works immediately after winget installs Python, before PATH refreshes.
+        $launcherInventory = @(& $launcher.Source '-0p' 2>$null)
+        foreach ($inventoryLine in $launcherInventory) {
+            if ($inventoryLine -match '(?i)^\s*-V:3\.12(?:-\d+)?\s+\*?\s*(.+?python(?:w)?\.exe)\s*$') {
+                $candidates += [pscustomobject]@{ Path = $Matches[1].Trim(); Arguments = @() }
+            }
+        }
+        $candidates += [pscustomobject]@{ Path = $launcher.Source; Arguments = @('-3.12') }
+    }
+    $python = Get-Command 'python.exe' -ErrorAction SilentlyContinue
+    if ($null -ne $python) {
+        $candidates += [pscustomobject]@{ Path = $python.Source; Arguments = @() }
+    }
+
+    $pythonMetadataScript = 'import sys; print(sys.executable); print("SUPPORTED" if sys.version_info[:2] == (3, 12) else "UNSUPPORTED")'
+    foreach ($candidate in $candidates) {
+        try {
+            $candidateArguments = @($candidate.Arguments) + @('-c', $pythonMetadataScript)
+            $metadata = @(& $candidate.Path @candidateArguments 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $metadata.Count -ge 2 -and ("$($metadata[-1])").Trim() -eq 'SUPPORTED') {
+                $resolved = $metadata[-2].Trim()
+                if (Test-Path -LiteralPath $resolved -PathType Leaf) {
+                    return $resolved
+                }
+            }
+        }
+        catch {
             continue
         }
-        if ! validate_tmdb_token "$token"; then
-            warn "TMDB rejected that token. Paste the API Read Access Token, not the shorter v3 API key."
-            token=""
-        fi
-    done
-
-    write_config "$token"
-    unset token
-    log "Private TMDB configuration saved at /etc/pistick/config.json"
+    }
+    return $null
 }
 
-fetch_releases_json() {
-    local destination="$1"
+function Ensure-Python {
+    $pythonPath = Get-PythonExecutable
+    if ($null -ne $pythonPath) {
+        return $pythonPath
+    }
 
-    if [[ "$TEST_MODE" == "1" && "$RELEASES_API" == file://* ]]; then
-        cp -- "${RELEASES_API#file://}" "$destination"
-        return 0
-    fi
+    $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
+    if ($null -eq $winget) {
+        throw 'Python 3.12 was not found and Windows Package Manager is unavailable. Install 64-bit Python 3.12 from https://www.python.org/downloads/windows/ and run this command again.'
+    }
 
-    local status
-    status="$(curl -sS -L \
-        -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' \
-        -H 'User-Agent: PiStick-Installer/1.0' \
-        -o "$destination" -w '%{http_code}' "$RELEASES_API" || true)"
+    Write-PiStickStep 'Installing Python 3.12 for the current user'
+    & $winget.Source @(
+        'install', '--id', 'Python.Python.3.12', '--exact', '--scope', 'user',
+        '--silent', '--accept-package-agreements', '--accept-source-agreements',
+        '--disable-interactivity'
+    ) | Out-Host
+    $wingetExitCode = $LASTEXITCODE
 
-    case "$status" in
-        200) ;;
-        404) die "GitHub cannot access ${REPOSITORY} without authentication. The release repository must be public for credential-free installation." ;;
-        403) die "GitHub refused the release check, usually because its anonymous API rate limit was reached. Try again later." ;;
-        *) die "The GitHub release check failed with HTTP ${status:-unknown}." ;;
-    esac
+    $pythonPath = Get-PythonExecutable
+    if ($null -ne $pythonPath) {
+        return $pythonPath
+    }
+    if ($wingetExitCode -ne 0) {
+        throw "Windows Package Manager could not install Python (exit code $wingetExitCode)."
+    }
+    throw 'Python was installed, but its executable could not be located. Open a new PowerShell window and run the PiStick install command again.'
 }
 
-resolve_latest_release() {
-    local releases_json="${WORK_DIR}/releases.json"
-    local selected_json="${WORK_DIR}/selected-release.json"
-    fetch_releases_json "$releases_json"
+function Get-LatestPublishedRelease {
+    Write-PiStickStep 'Checking the published PiStick releases'
+    $headers = @{
+        Accept = 'application/vnd.github+json'
+        'X-GitHub-Api-Version' = '2022-11-28'
+        'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
+    }
+    try {
+        $response = Invoke-RestMethod -Uri $ReleasesApi -Headers $headers -Method Get
+    }
+    catch {
+        $status = $null
+        if ($null -ne $_.Exception.Response) {
+            $status = [int]$_.Exception.Response.StatusCode
+        }
+        if ($status -eq 403) {
+            throw 'GitHub refused the release check, usually because its anonymous API limit was reached. Try again later.'
+        }
+        throw "The GitHub release check failed: $($_.Exception.Message)"
+    }
 
-    python3 - "$releases_json" "$selected_json" <<'PY'
-import json
-import sys
+    $published = @($response | Where-Object {
+        -not $_.draft -and $_.published_at -and $_.tag_name -and $_.zipball_url -and $null -ne $_.id
+    })
+    if ($published.Count -eq 0) {
+        throw 'No published PiStick release exists yet.'
+    }
 
-with open(sys.argv[1], encoding="utf-8") as source:
-    payload = json.load(source)
-if not isinstance(payload, list):
-    raise SystemExit("GitHub returned an invalid releases response")
-
-published = [
-    release for release in payload
-    if isinstance(release, dict)
-    and not release.get("draft", False)
-    and release.get("published_at")
-    and release.get("tag_name")
-    and release.get("tarball_url")
-    and release.get("id") is not None
-]
-if not published:
-    raise SystemExit("No published PiStick release exists yet")
-
-release = max(published, key=lambda item: (str(item["published_at"]), int(item["id"])))
-selected = {
-    "id": int(release["id"]),
-    "tag_name": str(release["tag_name"]),
-    "published_at": str(release["published_at"]),
-    "prerelease": bool(release.get("prerelease", False)),
-    "tarball_url": str(release["tarball_url"]),
-    "html_url": str(release.get("html_url") or ""),
-}
-with open(sys.argv[2], "w", encoding="utf-8") as destination:
-    json.dump(selected, destination, indent=2, sort_keys=True)
-    destination.write("\n")
-PY
-
-    local fields=()
-    mapfile -t fields < <(python3 - "$selected_json" <<'PY'
-import json
-import sys
-release = json.load(open(sys.argv[1], encoding="utf-8"))
-for key in ("id", "tag_name", "tarball_url", "published_at", "html_url"):
-    print(release[key])
-PY
-)
-    (( ${#fields[@]} == 5 )) || die "Could not read the selected GitHub release."
-
-    RELEASE_ID="${fields[0]}"
-    RELEASE_TAG="${fields[1]}"
-    RELEASE_TARBALL="${fields[2]}"
-    RELEASE_PUBLISHED="${fields[3]}"
-    RELEASE_URL="${fields[4]}"
-    SELECTED_RELEASE_JSON="$selected_json"
-
-    [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || die "GitHub returned an invalid release ID."
-    [[ -n "$RELEASE_TAG" && "$RELEASE_TAG" != *$'\n'* ]] || die "GitHub returned an invalid release tag."
+    $sortProperties = @(
+        @{ Expression = { [datetimeoffset]$_.published_at }; Descending = $true }
+        @{ Expression = { [long]$_.id }; Descending = $true }
+    )
+    $sorted = @($published | Sort-Object -Property $sortProperties)
+    return $sorted[0]
 }
 
-installed_tag() {
-    [[ -f "$RELEASE_METADATA" ]] || return 1
-    python3 - "$RELEASE_METADATA" <<'PY'
-import json
-import sys
-try:
-    print(json.load(open(sys.argv[1], encoding="utf-8"))["tag_name"])
-except (OSError, ValueError, KeyError, TypeError):
-    raise SystemExit(1)
-PY
+function Expand-TrustedZip {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    [IO.Directory]::CreateDirectory($Destination) | Out-Null
+    $destinationRoot = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    $destinationPrefix = $destinationRoot + '\'
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            $relative = $entry.FullName.Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($relative)) {
+                continue
+            }
+            $target = [IO.Path]::GetFullPath((Join-Path $destinationRoot $relative))
+            if (-not $target.StartsWith($destinationPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The release archive contains an unsafe path.'
+            }
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                [IO.Directory]::CreateDirectory($target) | Out-Null
+                continue
+            }
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+            $sourceStream = $entry.Open()
+            $targetStream = [IO.File]::Open($target, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try {
+                $sourceStream.CopyTo($targetStream)
+            }
+            finally {
+                $targetStream.Dispose()
+                $sourceStream.Dispose()
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
 }
 
-safe_tag_name() {
-    local safe
-    safe="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)"
-    [[ -n "$safe" ]] || safe="release"
-    printf '%s' "$safe"
+function Test-SafeRelativePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ([IO.Path]::IsPathRooted($Path) -or $Path -match '(^|[\\/])\.\.([\\/]|$)') {
+        return $false
+    }
+    return -not [string]::IsNullOrWhiteSpace($Path)
 }
 
-download_release() {
-    local archive="${WORK_DIR}/release.tar.gz"
-    local staging="${WORK_DIR}/staging"
-    log "Downloading published release ${RELEASE_TAG}"
+function Get-ValidatedReleaseSource {
+    param(
+        [Parameter(Mandatory = $true)]$Release,
+        [Parameter(Mandatory = $true)][string]$PythonPath
+    )
+    $archivePath = Join-Path $TemporaryDirectory 'release.zip'
+    $extractPath = Join-Path $TemporaryDirectory 'release'
+    Write-PiStickStep "Downloading published release $($Release.tag_name)"
+    Invoke-WebRequest -Uri ([string]$Release.zipball_url) -OutFile $archivePath -Headers @{
+        Accept = 'application/vnd.github+json'
+        'X-GitHub-Api-Version' = '2022-11-28'
+        'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
+    }
+    $archiveLength = (Get-Item -LiteralPath $archivePath).Length
+    if ($archiveLength -le 0 -or $archiveLength -gt 104857600) {
+        throw 'The release archive was empty or unexpectedly large.'
+    }
+    Expand-TrustedZip -ArchivePath $archivePath -Destination $extractPath
 
-    if [[ "$TEST_MODE" == "1" && "$RELEASE_TARBALL" == file://* ]]; then
-        cp -- "${RELEASE_TARBALL#file://}" "$archive"
-    else
-        curl -fL --retry 3 --connect-timeout 20 \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            -H 'User-Agent: PiStick-Installer/1.0' \
-            -o "$archive" "$RELEASE_TARBALL"
-    fi
+    $entrypoints = @(Get-ChildItem -LiteralPath $extractPath -Filter 'main.py' -File -Recurse | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'pistick-release.json') -PathType Leaf
+    })
+    if ($entrypoints.Count -ne 1) {
+        throw 'The release archive does not contain one valid PiStick application root.'
+    }
+    $sourceRoot = $entrypoints[0].Directory.FullName
+    $manifestPath = Join-Path $sourceRoot 'pistick-release.json'
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw 'The release manifest is not valid JSON.'
+    }
+    if ($manifest.installer_schema -ne 1 -or $manifest.entrypoint -ne 'main.py' -or $manifest.updater -ne 'install.sh') {
+        throw 'The release manifest is not compatible with this installer.'
+    }
+    foreach ($relativePath in @($manifest.required_files)) {
+        $relativeText = [string]$relativePath
+        if (-not (Test-SafeRelativePath -Path $relativeText)) {
+            throw "The release manifest contains an unsafe required path: $relativeText"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot $relativeText) -PathType Leaf)) {
+            throw "The release is missing required file: $relativeText"
+        }
+    }
+    $windowsRequirements = Join-Path $sourceRoot 'requirements-windows.txt'
+    if (-not (Test-Path -LiteralPath $windowsRequirements -PathType Leaf)) {
+        throw 'The release does not contain requirements-windows.txt.'
+    }
+    Get-Content -LiteralPath (Join-Path $sourceRoot 'config.example.json') -Raw | ConvertFrom-Json | Out-Null
+    Invoke-NativeCommand -FilePath $PythonPath -ArgumentList @(
+        '-m', 'py_compile',
+        (Join-Path $sourceRoot 'main.py'),
+        (Join-Path $sourceRoot 'adblock.py'),
+        (Join-Path $sourceRoot 'playback_api.py')
+    ) -FailureMessage 'The downloaded release failed Python validation'
+    return $sourceRoot
+}
 
-    local archive_size
-    archive_size="$(stat -c '%s' "$archive")"
-    (( archive_size > 0 && archive_size <= 104857600 )) || \
-        die "The release archive was empty or unexpectedly large."
+function Get-PlainText {
+    param([Parameter(Mandatory = $true)][Security.SecureString]$SecureValue)
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureValue)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+    }
+}
 
-    mkdir -p "$staging"
-    python3 - "$archive" "$staging" <<'PY'
-import os
-from pathlib import Path, PurePosixPath
-import shutil
-import sys
-import tarfile
+function Test-TmdbToken {
+    param([Parameter(Mandatory = $true)][string]$Token)
+    if ($env:PISTICK_SKIP_TMDB_VALIDATION -eq '1') {
+        return $true
+    }
+    try {
+        Invoke-RestMethod -Uri 'https://api.themoviedb.org/3/configuration' -Headers @{
+            Authorization = "Bearer $Token"
+            'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
+        } -Method Get | Out-Null
+        return $true
+    }
+    catch {
+        $status = $null
+        if ($null -ne $_.Exception.Response) {
+            $status = [int]$_.Exception.Response.StatusCode
+        }
+        if ($status -eq 401 -or $status -eq 403) {
+            return $false
+        }
+        throw "TMDB could not be reached to validate the API Read Access Token: $($_.Exception.Message)"
+    }
+}
 
-archive = Path(sys.argv[1])
-destination = Path(sys.argv[2]).resolve()
+function Copy-LegacyUserData {
+    $legacyRoot = Join-Path $env:USERPROFILE 'PiStick'
+    if (-not (Test-Path -LiteralPath $ConfigPath) -and (Test-Path -LiteralPath (Join-Path $legacyRoot 'config.json') -PathType Leaf)) {
+        try {
+            Get-Content -LiteralPath (Join-Path $legacyRoot 'config.json') -Raw | ConvertFrom-Json | Out-Null
+            Copy-Item -LiteralPath (Join-Path $legacyRoot 'config.json') -Destination $ConfigPath
+            Write-PiStickStep 'Preserved the existing Windows PiStick configuration'
+        }
+        catch {
+            Write-Warning 'The old PiStick config.json was not valid and was not migrated.'
+        }
+    }
+    if (-not (Test-Path -LiteralPath $StatePath) -and (Test-Path -LiteralPath (Join-Path $legacyRoot 'pistick_state.json') -PathType Leaf)) {
+        try {
+            Get-Content -LiteralPath (Join-Path $legacyRoot 'pistick_state.json') -Raw | ConvertFrom-Json | Out-Null
+            Copy-Item -LiteralPath (Join-Path $legacyRoot 'pistick_state.json') -Destination $StatePath
+            Write-PiStickStep 'Preserved the existing Windows profiles and watch history'
+        }
+        catch {
+            Write-Warning 'The old PiStick state file was not valid and was not migrated.'
+        }
+    }
+}
 
-with tarfile.open(archive, "r:gz") as bundle:
-    members = bundle.getmembers()
-    for member in members:
-        parts = PurePosixPath(member.name).parts
-        if len(parts) < 2:
+function Ensure-PiStickConfig {
+    param([Parameter(Mandatory = $true)][string]$ExampleConfigPath)
+    $config = $null
+    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+        try {
+            $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        }
+        catch {
+            Write-Warning 'The existing PiStick config.json is invalid. It will be replaced only after a valid token is entered.'
+        }
+    }
+    if ($null -eq $config) {
+        $config = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
+    }
+
+    $token = ''
+    if ($null -ne $config.PSObject.Properties['tmdb_read_token']) {
+        $token = [string]$config.tmdb_read_token
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -and $null -ne $config.PSObject.Properties['tmdb_token']) {
+        $token = [string]$config.tmdb_token
+    }
+    if ($token -like 'PASTE_*') {
+        $token = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($token) -and -not [string]::IsNullOrWhiteSpace($env:PISTICK_TMDB_TOKEN)) {
+        $token = $env:PISTICK_TMDB_TOKEN.Trim()
+    }
+
+    while ([string]::IsNullOrWhiteSpace($token)) {
+        $secureToken = Read-Host 'Paste your TMDB API Read Access Token' -AsSecureString
+        $token = (Get-PlainText -SecureValue $secureToken).Trim()
+        if ([string]::IsNullOrWhiteSpace($token)) {
+            Write-Warning 'The token cannot be empty.'
             continue
-        relative_parts = parts[1:]
-        if any(part in ("", ".", "..") for part in relative_parts):
-            raise SystemExit("Release archive contains an unsafe path")
-        target = destination.joinpath(*relative_parts)
-        if os.path.commonpath((str(destination), str(target.resolve()))) != str(destination):
-            raise SystemExit("Release archive escapes the staging directory")
-        if member.isdir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        if not member.isfile():
-            raise SystemExit("Release archive contains an unsupported link or device")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source = bundle.extractfile(member)
-        if source is None:
-            raise SystemExit("Release archive contains an unreadable file")
-        with source, target.open("wb") as output:
-            shutil.copyfileobj(source, output)
-        target.chmod(member.mode & 0o777)
-PY
+        }
+        if (-not (Test-TmdbToken -Token $token)) {
+            Write-Warning 'TMDB rejected that token. Use the long API Read Access Token, not the shorter v3 key.'
+            $token = ''
+        }
+    }
 
-    [[ -f "${staging}/main.py" ]] || die "Release ${RELEASE_TAG} does not contain main.py."
-    [[ -f "${staging}/config.example.json" ]] || die "Release ${RELEASE_TAG} does not contain config.example.json."
-    [[ -f "${staging}/install.sh" ]] || die "Release ${RELEASE_TAG} does not contain install.sh."
-    [[ -f "${staging}/pistick-release.json" ]] || \
-        die "Release ${RELEASE_TAG} predates the release installer and cannot safely separate user data."
+    if ($null -eq $config.PSObject.Properties['tmdb_read_token']) {
+        $config | Add-Member -NotePropertyName 'tmdb_read_token' -NotePropertyValue $token
+    }
+    else {
+        $config.tmdb_read_token = $token
+    }
+    if ($null -ne $config.PSObject.Properties['tmdb_token']) {
+        $config.PSObject.Properties.Remove('tmdb_token')
+    }
+    if ($null -ne $config.PSObject.Properties['playback_base_url']) {
+        $config.PSObject.Properties.Remove('playback_base_url')
+    }
 
-    python3 - "${staging}/pistick-release.json" "$staging" <<'PY'
-import json
-from pathlib import Path, PurePosixPath
-import sys
-
-manifest_path = Path(sys.argv[1])
-release_root = Path(sys.argv[2]).resolve()
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-if (
-    manifest.get("installer_schema") != 1
-    or manifest.get("entrypoint") != "main.py"
-    or manifest.get("updater") != "install.sh"
-):
-    raise SystemExit("Unsupported PiStick release manifest")
-
-required_files = manifest.get("required_files", [])
-if not isinstance(required_files, list) or any(not isinstance(item, str) for item in required_files):
-    raise SystemExit("Invalid required_files in PiStick release manifest")
-for item in required_files:
-    relative = PurePosixPath(item)
-    if relative.is_absolute() or not relative.parts or any(
-        part in ("", ".", "..") for part in relative.parts
-    ):
-        raise SystemExit(f"Unsafe required file path in release manifest: {item}")
-    target = release_root.joinpath(*relative.parts)
-    if not target.is_file():
-        raise SystemExit(f"Release is missing required file: {item}")
-    if target.suffix == ".py":
-        compile(target.read_text(encoding="utf-8"), item, "exec")
-PY
-    bash -n "${staging}/install.sh" || die "Release ${RELEASE_TAG} contains an invalid updater."
-    grep -q 'PISTICK_CONFIG_PATH' "${staging}/main.py" || die "Release does not support external configuration storage."
-    grep -q 'PISTICK_STATE_PATH' "${staging}/main.py" || die "Release does not support external watch-state storage."
-    grep -q 'PISTICK_CACHE_DIR' "${staging}/main.py" || die "Release does not support external cache storage."
-    python3 - "${staging}/main.py" <<'PY'
-from pathlib import Path
-import sys
-source = Path(sys.argv[1]).read_text(encoding="utf-8")
-compile(source, str(Path(sys.argv[1]).name), "exec")
-PY
-
-    STAGING_DIR="$staging"
+    $temporaryConfig = "$ConfigPath.tmp"
+    Write-Utf8File -Path $temporaryConfig -Content (($config | ConvertTo-Json -Depth 20) + [Environment]::NewLine)
+    Move-Item -LiteralPath $temporaryConfig -Destination $ConfigPath -Force
 }
 
-switch_current_release() {
-    local release_dir="$1"
-    local old_target=""
-    if [[ -L "$CURRENT_LINK" ]]; then
-        old_target="$(readlink -f "$CURRENT_LINK" || true)"
-    fi
-    if is_release_target "$old_target" && [[ -d "$old_target" ]]; then
-        PREVIOUS_TARGET="$old_target"
-        if [[ -f "$RELEASE_METADATA" ]]; then
-            install -m 0644 "$RELEASE_METADATA" "$PREVIOUS_METADATA"
-        fi
-    else
-        PREVIOUS_TARGET=""
-        rm -f -- "$PREVIOUS_METADATA"
-    fi
-
-    ln -sfn "$release_dir" "${APP_ROOT}/.current.new"
-    mv -Tf "${APP_ROOT}/.current.new" "$CURRENT_LINK"
-    SWITCH_IN_PROGRESS=1
+function Install-PiStickIcon {
+    param([Parameter(Mandatory = $true)][string]$ReleaseSource)
+    $releaseIcon = Join-Path $ReleaseSource 'assets\pistick.ico'
+    $temporaryIcon = Join-Path $TemporaryDirectory 'pistick.ico'
+    if (Test-Path -LiteralPath $releaseIcon -PathType Leaf) {
+        Copy-Item -LiteralPath $releaseIcon -Destination $temporaryIcon -Force
+    }
+    else {
+        Write-PiStickStep 'Downloading the PiStick Start Menu icon'
+        Invoke-WebRequest -Uri $IconFallbackUrl -OutFile $temporaryIcon -Headers @{
+            'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
+        }
+    }
+    $bytes = [IO.File]::ReadAllBytes($temporaryIcon)
+    if ($bytes.Length -lt 4 -or $bytes[0] -ne 0 -or $bytes[1] -ne 0 -or $bytes[2] -ne 1 -or $bytes[3] -ne 0) {
+        throw 'The PiStick icon is not a valid Windows ICO file.'
+    }
+    Move-Item -LiteralPath $temporaryIcon -Destination $IconPath -Force
 }
 
-service_health_check() {
-    if [[ "$TEST_MODE" == "1" ]]; then
-        [[ "${PISTICK_TEST_HEALTH_FAIL:-0}" != "1" ]]
-        return
-    fi
+function Write-Launcher {
+    $launcherSource = @'
+Option Explicit
+Dim shell, fileSystem, environment, appRoot, pointerFile, pointer, releaseName
+Dim releaseDirectory, runtimeDirectory, runtimePython, pythonw, python, entrypoint, command
 
-    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
-    local restarts_before restarts_after
-    restarts_before="$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null || printf '0')"
-    [[ "$restarts_before" =~ ^[0-9]+$ ]] || restarts_before=0
+Set shell = CreateObject("WScript.Shell")
+Set fileSystem = CreateObject("Scripting.FileSystemObject")
+appRoot = fileSystem.GetParentFolderName(WScript.ScriptFullName)
+pointerFile = fileSystem.BuildPath(appRoot, "current-release.txt")
 
-    systemctl start "$SERVICE_NAME" || return 1
-    sleep 15
-    systemctl is-active --quiet "$SERVICE_NAME" || return 1
+If Not fileSystem.FileExists(pointerFile) Then
+    MsgBox "PiStick's active release could not be found. Run the installer again.", 16, "PiStick"
+    WScript.Quit 2
+End If
 
-    restarts_after="$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null || printf '0')"
-    [[ "$restarts_after" =~ ^[0-9]+$ ]] || restarts_after=0
-    (( restarts_after == restarts_before ))
+Set pointer = fileSystem.OpenTextFile(pointerFile, 1, False)
+releaseName = ""
+If Not pointer.AtEndOfStream Then
+    releaseName = Trim(pointer.ReadLine)
+End If
+pointer.Close
+If Len(releaseName) = 0 Or InStr(releaseName, "\") > 0 Or InStr(releaseName, "/") > 0 Or InStr(releaseName, ":") > 0 Then
+    MsgBox "PiStick's active release record is invalid. Run the installer again.", 16, "PiStick"
+    WScript.Quit 2
+End If
+
+releaseDirectory = fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "releases"), releaseName)
+runtimeDirectory = fileSystem.BuildPath(fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "runtimes"), releaseName), "Scripts")
+pythonw = fileSystem.BuildPath(runtimeDirectory, "pythonw.exe")
+python = fileSystem.BuildPath(runtimeDirectory, "python.exe")
+entrypoint = fileSystem.BuildPath(releaseDirectory, "main.py")
+If fileSystem.FileExists(pythonw) Then
+    runtimePython = pythonw
+ElseIf fileSystem.FileExists(python) Then
+    runtimePython = python
+Else
+    MsgBox "PiStick is incomplete. Run the installer again.", 16, "PiStick"
+    WScript.Quit 2
+End If
+If Not fileSystem.FileExists(entrypoint) Then
+    MsgBox "PiStick is incomplete. Run the installer again.", 16, "PiStick"
+    WScript.Quit 2
+End If
+
+Set environment = shell.Environment("PROCESS")
+environment("PISTICK_CONFIG_PATH") = fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "data"), "config.json")
+environment("PISTICK_STATE_PATH") = fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "data"), "pistick_state.json")
+environment("PISTICK_CACHE_DIR") = fileSystem.BuildPath(appRoot, "cache")
+shell.CurrentDirectory = releaseDirectory
+command = Chr(34) & runtimePython & Chr(34) & " " & Chr(34) & entrypoint & Chr(34)
+shell.Run command, 0, False
+'@
+    $temporaryLauncher = "$LauncherPath.tmp"
+    Write-Utf8File -Path $temporaryLauncher -Content ($launcherSource + [Environment]::NewLine)
+    Move-Item -LiteralPath $temporaryLauncher -Destination $LauncherPath -Force
 }
 
-activate_release() {
-    local safe_tag release_dir
-    safe_tag="$(safe_tag_name "$RELEASE_TAG")"
-    release_dir="${RELEASES_DIR}/${RELEASE_ID}-${safe_tag}"
-    is_release_target "$release_dir" || die "Refusing an unsafe release directory."
-
-    if [[ "$TEST_MODE" != "1" ]]; then
-        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-    fi
-
-    if [[ -e "$release_dir" ]]; then
-        rm -rf -- "$release_dir"
-    fi
-    mv "$STAGING_DIR" "$release_dir"
-    chown -R root:root "$release_dir"
-    chmod -R u=rwX,go=rX "$release_dir"
-
-    switch_current_release "$release_dir"
-    if ! service_health_check; then
-        die "Release ${RELEASE_TAG} failed its startup health check."
-    fi
-
-    install -o "$PISTICK_USER" -g "$PISTICK_GROUP" -m 0644 \
-        "$SELECTED_RELEASE_JSON" "$RELEASE_METADATA"
-    SWITCH_IN_PROGRESS=0
-    log "PiStick ${RELEASE_TAG} is installed and running"
+function Write-StartMenuShortcut {
+    [IO.Directory]::CreateDirectory($StartMenuDirectory) | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $shortcut.Arguments = '"' + $LauncherPath + '"'
+    $shortcut.WorkingDirectory = $InstallRoot
+    $shortcut.IconLocation = "$IconPath,0"
+    $shortcut.Description = 'Open PiStick'
+    $shortcut.Save()
 }
 
-start_existing_release() {
-    [[ "$TEST_MODE" == "1" ]] && return 0
-    systemctl enable "$SERVICE_NAME" >/dev/null
-    systemctl restart "$SERVICE_NAME"
+try {
+    [IO.Directory]::CreateDirectory($TemporaryDirectory) | Out-Null
+    [IO.Directory]::CreateDirectory($InstallRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($ReleasesDirectory) | Out-Null
+    [IO.Directory]::CreateDirectory($RuntimesDirectory) | Out-Null
+    [IO.Directory]::CreateDirectory($DataDirectory) | Out-Null
+    [IO.Directory]::CreateDirectory($CacheDirectory) | Out-Null
+
+    $pythonPath = Ensure-Python
+    $release = Get-LatestPublishedRelease
+    $safeTag = ([string]$release.tag_name -replace '[^A-Za-z0-9._-]', '_').Trim('_')
+    if ([string]::IsNullOrWhiteSpace($safeTag)) {
+        $safeTag = 'release'
+    }
+    if ($safeTag.Length -gt 80) {
+        $safeTag = $safeTag.Substring(0, 80)
+    }
+    $releaseName = "$([long]$release.id)-$safeTag"
+    $releaseDirectory = Join-Path $ReleasesDirectory $releaseName
+
+    if (-not (Test-Path -LiteralPath $releaseDirectory -PathType Container)) {
+        $releaseSource = Get-ValidatedReleaseSource -Release $release -PythonPath $pythonPath
+        $stagingRelease = Join-Path $ReleasesDirectory ('.staging-' + [guid]::NewGuid().ToString('N'))
+        [IO.Directory]::CreateDirectory($stagingRelease) | Out-Null
+        Get-ChildItem -LiteralPath $releaseSource -Force | Copy-Item -Destination $stagingRelease -Recurse -Force
+        Move-Item -LiteralPath $stagingRelease -Destination $releaseDirectory
+    }
+    else {
+        Write-PiStickStep "Published release $($release.tag_name) is already downloaded"
+    }
+
+    Write-PiStickStep 'Installing the private Python runtime and Windows dependencies'
+    $releaseRuntimeDirectory = Join-Path $RuntimesDirectory $releaseName
+    $runtimePython = Join-Path $releaseRuntimeDirectory 'Scripts\python.exe'
+    if (Test-Path -LiteralPath $runtimePython -PathType Leaf) {
+        $runtimeVersionCheck = @('-c', 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)')
+        & $runtimePython @runtimeVersionCheck 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Replacing the existing PiStick runtime with the supported Python 3.12 runtime.'
+            Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force
+        }
+    }
+    if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
+        if (Test-Path -LiteralPath $releaseRuntimeDirectory) {
+            Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force
+        }
+        Invoke-NativeCommand -FilePath $pythonPath -ArgumentList @('-m', 'venv', $releaseRuntimeDirectory) -FailureMessage 'Python could not create the PiStick runtime'
+        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList @(
+            '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', '-r',
+            (Join-Path $releaseDirectory 'requirements-windows.txt')
+        ) -FailureMessage 'PiStick Windows dependencies could not be installed'
+    }
+    $dependencyCheck = @(
+        '-c', 'import pygame, requests; from PySide6.QtWebEngineWidgets import QWebEngineView; from PySide6.QtWebView import QWebView'
+    )
+    try {
+        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList $dependencyCheck -FailureMessage 'PiStick Windows dependencies did not load correctly'
+    }
+    catch {
+        Write-Warning 'The existing PiStick runtime needs repair. Close PiStick if it is currently open.'
+        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList @(
+            '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', '-r',
+            (Join-Path $releaseDirectory 'requirements-windows.txt')
+        ) -FailureMessage 'PiStick Windows dependencies could not be repaired'
+        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList $dependencyCheck -FailureMessage 'PiStick Windows dependencies did not load correctly after repair'
+    }
+
+    Copy-LegacyUserData
+    Ensure-PiStickConfig -ExampleConfigPath (Join-Path $releaseDirectory 'config.example.json')
+    Install-PiStickIcon -ReleaseSource $releaseDirectory
+    Write-Launcher
+
+    $temporaryPointer = "$CurrentReleaseFile.tmp"
+    Write-Utf8File -Path $temporaryPointer -Content ($releaseName + [Environment]::NewLine)
+    Move-Item -LiteralPath $temporaryPointer -Destination $CurrentReleaseFile -Force
+
+    $releaseInstaller = Join-Path $releaseDirectory 'install.ps1'
+    $installerSource = $null
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
+        $installerSource = $PSCommandPath
+    }
+    elseif (Test-Path -LiteralPath $releaseInstaller -PathType Leaf) {
+        $installerSource = $releaseInstaller
+    }
+    if ($null -ne $installerSource) {
+        $sourceFullPath = [IO.Path]::GetFullPath($installerSource)
+        $destinationFullPath = [IO.Path]::GetFullPath($InstalledInstallerPath)
+        if (-not $sourceFullPath.Equals($destinationFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+            Copy-Item -LiteralPath $sourceFullPath -Destination $destinationFullPath -Force
+        }
+    }
+    Write-StartMenuShortcut
+
+    Write-PiStickStep "Installed $($release.tag_name) to $InstallRoot"
+    Write-Host 'PiStick is available from the Start Menu.' -ForegroundColor Green
+    Write-Host 'Run this installer again whenever you want to check for a published update.'
+
+    if (-not $NoLaunch) {
+        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') -ArgumentList ('"' + $LauncherPath + '"')
+    }
 }
-
-prune_old_releases() {
-    local current_target="" keep_previous=""
-    current_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
-    if is_release_target "$PREVIOUS_TARGET"; then
-        keep_previous="$PREVIOUS_TARGET"
-    fi
-
-    local candidate
-    while IFS= read -r -d '' candidate; do
-        if [[ "$candidate" != "$current_target" && "$candidate" != "$keep_previous" ]]; then
-            is_release_target "$candidate" || continue
-            rm -rf -- "$candidate"
-            log "Removed old release snapshot $(basename "$candidate")"
-        fi
-    done < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+finally {
+    if (Test-Path -LiteralPath $TemporaryDirectory -PathType Container) {
+        Remove-Item -LiteralPath $TemporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
-
-main() {
-    require_root
-    acquire_lock
-    assert_supported_system
-    resolve_service_user
-
-    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pistick-installer.XXXXXX")"
-    log "PiStick installer ${INSTALLER_VERSION}"
-
-    install_system_packages
-    prepare_directories
-    install_updater_command
-    configure_permissions
-    write_runtime_files
-    resolve_latest_release
-    migrate_legacy_data
-    ensure_runtime_config
-
-    local current_tag=""
-    current_tag="$(installed_tag 2>/dev/null || true)"
-    if [[ "$current_tag" == "$RELEASE_TAG" && -L "$CURRENT_LINK" && -f "${CURRENT_LINK}/main.py" ]]; then
-        start_existing_release
-        log "PiStick is already up to date at ${RELEASE_TAG}"
-        printf '\nRun sudo pistick-update over SSH whenever you want to check again.\n'
-        return 0
-    fi
-
-    download_release
-    activate_release
-    prune_old_releases
-
-    printf '\nInstallation complete. PiStick will now start automatically at boot.\n'
-    printf 'Future updates are manual: SSH into the Pi and run sudo pistick-update.\n'
-}
-
-main "$@"
