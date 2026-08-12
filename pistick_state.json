@@ -3,17 +3,11 @@
   "profiles": [
     {
       "id": "profile-1",
-      "name": "THOMAS",
+      "name": "Profile 1",
       "avatar": "red"
-    },
-    {
-      "id": "profile-641d4be205",
-      "name": "KAREN",
-      "avatar": "blue"
     }
   ],
   "watch_state": {
     "profile-1": {},
-    "profile-641d4be205": {}
   }
 }
