@@ -159,6 +159,19 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(script.status, 200)
         self.assertIn(b"/api/watch/progress", script.body)
 
+    def test_videasy_outer_frame_is_not_sandboxed(self) -> None:
+        script = self.app.dispatch("GET", "/app.js", {})
+        source = script.body.decode("utf-8")
+        self.assertIn("if (isVideasyPlayer) {", source)
+        self.assertIn(
+            'ui.playerFrame.removeAttribute("sandbox");',
+            source,
+        )
+        self.assertIn(
+            'ui.playerFrame.setAttribute("sandbox",',
+            source,
+        )
+
 
 class LoopbackHTTPTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -181,6 +194,7 @@ class LoopbackHTTPTests(unittest.TestCase):
         with urlopen(self.base + "/health", timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
             self.assertTrue(payload["ok"])
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(response.headers["X-Frame-Options"], "DENY")
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
 

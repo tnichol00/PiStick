@@ -13,6 +13,12 @@ This branch runs PiStick as a private web app at `http://127.0.0.1:8787` instead
 
 The server deliberately binds only to `127.0.0.1`. Other computers on the network cannot connect to it.
 
+Videasy playback uses an unsandboxed outer iframe because its player refuses to
+run when the iframe has a `sandbox` attribute. Only the allow-listed Videasy
+HTTPS player URL can use that path. Normal browser cross-origin isolation keeps
+the player from reading the localhost app, and state-changing server requests
+still require PiStick's private request header.
+
 ## Install on Windows
 
 Open PowerShell and run:

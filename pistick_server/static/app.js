@@ -644,7 +644,10 @@
   }
 
   function openPlayer(title, url, media, episode, trailer) {
-    if (!/^https:\/\/(player\.videasy\.(to|net)|www\.youtube-nocookie\.com)\//.test(String(url))) {
+    var playerUrl = String(url);
+    var isVideasyPlayer = /^https:\/\/player\.videasy\.(to|net)\//.test(playerUrl);
+    var isYouTubePlayer = /^https:\/\/www\.youtube-nocookie\.com\//.test(playerUrl);
+    if (!isVideasyPlayer && !isYouTubePlayer) {
       showToast("The player URL was rejected.");
       return;
     }
@@ -659,8 +662,16 @@
       saving: false
     };
     ui.playerTitle.textContent = title;
-    ui.playerFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock");
-    ui.playerFrame.src = url;
+    if (isVideasyPlayer) {
+      // Videasy rejects playback when its outer iframe has any sandbox
+      // attribute, even when scripts and forms are explicitly allowed.
+      // The URL allowlist above and cross-origin browser isolation still keep
+      // the localhost application and its server-side data separate.
+      ui.playerFrame.removeAttribute("sandbox");
+    } else {
+      ui.playerFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock");
+    }
+    ui.playerFrame.src = playerUrl;
     ui.playerOverlay.classList.remove("hidden");
     document.body.style.overflow = "hidden";
     ui.playerClose.focus();
