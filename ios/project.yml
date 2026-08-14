@@ -18,11 +18,25 @@ targets:
       - path: PiStick
         excludes:
           - Resources
-    resources:
       - path: PiStick/Resources/Assets.xcassets
+        buildPhase: resources
       - path: PiStick/Resources/PrivacyInfo.xcprivacy
-      - path: PiStick/Resources/Web
-        type: folder
+        buildPhase: resources
+      - path: PiStick/Resources/Web/index.html
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: Web
+      - path: PiStick/Resources/Web/app.js
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: Web
+      - path: PiStick/Resources/Web/styles.css
+        buildPhase:
+          copyFiles:
+            destination: resources
+            subpath: Web
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.pistick.PiStick
