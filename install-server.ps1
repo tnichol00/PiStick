@@ -22,20 +22,16 @@ function Test-PiStickPython([string]$Executable) {
     try {
         $ResolvedPath = [System.IO.Path]::GetFullPath($Executable.Trim())
         if (-not (Test-Path -LiteralPath $ResolvedPath -PathType Leaf)) { return $null }
-        $ProbeCode = 'import sys; print(f"{sys.version_info.major}|{sys.version_info.minor}|{sys.version_info.micro}|{sys.executable}")'
-        $Probe = & $ResolvedPath -c $ProbeCode 2>$null | Select-Object -Last 1
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Probe)) { return $null }
-        $Parts = ([string]$Probe).Trim().Split('|')
-        if ($Parts.Count -ne 4) { return $null }
-        $Major = 0
-        $Minor = 0
-        $Micro = 0
-        if (-not [int]::TryParse($Parts[0], [ref]$Major)) { return $null }
-        if (-not [int]::TryParse($Parts[1], [ref]$Minor)) { return $null }
-        if (-not [int]::TryParse($Parts[2], [ref]$Micro)) { return $null }
+        $VersionOutput = & $ResolvedPath --version 2>&1 | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$VersionOutput)) { return $null }
+        $VersionText = ([string]$VersionOutput).Trim()
+        if ($VersionText -notmatch '^Python\s+([0-9]+)\.([0-9]+)\.([0-9]+)') { return $null }
+        [int]$Major = $Matches[1]
+        [int]$Minor = $Matches[2]
+        [int]$Micro = $Matches[3]
         if ($Major -ne 3 -or $Minor -lt 10) { return $null }
         return [PSCustomObject]@{
-            Path = [System.IO.Path]::GetFullPath($Parts[3])
+            Path = $ResolvedPath
             Version = "$Major.$Minor.$Micro"
         }
     }
@@ -128,7 +124,7 @@ function New-Shortcut([string]$Path, [string]$Target, [string]$Arguments, [strin
     $Shortcut.Save()
 }
 
-Write-Host 'Installing PiStick Server…' -ForegroundColor Cyan
+Write-Host 'Installing PiStick Server...' -ForegroundColor Cyan
 $Python = Resolve-PiStickPython $PythonPath
 Write-Host "Using Python $($Python.Version)" -ForegroundColor DarkGray
 

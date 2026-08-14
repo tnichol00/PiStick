@@ -44,6 +44,11 @@ class ServerInstallerTests(unittest.TestCase):
         self.assertIn("[string]$PythonPath", self.installer)
         self.assertIn("Test-PiStickPython $PythonCommand.Source", self.installer)
         self.assertIn("$PyLauncher.Source -3", self.installer)
+        self.assertIn("& $ResolvedPath --version", self.installer)
+        self.assertNotIn("$ProbeCode", self.installer)
+
+    def test_windows_powershell_installer_is_ascii_safe(self) -> None:
+        self.assertTrue(self.installer.isascii())
 
     def test_start_menu_contains_open_and_stop_controls(self) -> None:
         self.assertIn("Open PiStick Server.lnk", self.installer)
