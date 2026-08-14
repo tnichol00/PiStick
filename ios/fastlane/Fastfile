@@ -60,9 +60,11 @@ platform :ios do
 
     archive_path = lane_context[SharedValues::XCODEBUILD_ARCHIVE]
     UI.user_error!("Fastlane did not report an archive path") if archive_path.to_s.empty?
+    verifier_path = File.expand_path("../scripts/verify_app_bundle.sh", __dir__)
+    UI.user_error!("App bundle verifier is missing at #{verifier_path}") unless File.file?(verifier_path)
     sh(
       "bash",
-      "scripts/verify_app_bundle.sh",
+      verifier_path,
       File.join(archive_path, "Products/Applications/PiStick.app")
     )
 

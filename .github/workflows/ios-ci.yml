@@ -79,5 +79,8 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             clean archive \
             | xcbeautify
-          bash scripts/verify_app_bundle.sh \
-            "build/PiStick.xcarchive/Products/Applications/PiStick.app"
+          (
+            cd fastlane
+            bash ../scripts/verify_app_bundle.sh \
+              "../build/PiStick.xcarchive/Products/Applications/PiStick.app"
+          )
