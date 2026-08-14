@@ -6,8 +6,8 @@ final class NativeBridge: NSObject, WKScriptMessageHandler {
     private let api: PiStickAPI
     weak var webView: WKWebView?
 
-    init(api: PiStickAPI = PiStickAPI()) {
-        self.api = api
+    init(api: PiStickAPI? = nil) {
+        self.api = api ?? PiStickAPI()
         super.init()
     }
 

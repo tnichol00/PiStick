@@ -6,9 +6,9 @@ final class PiStickAPI {
     private let state: StateStore
     private let tmdb: TMDBClient
 
-    init(config: ConfigStore = ConfigStore(), state: StateStore = StateStore()) {
+    init(config: ConfigStore = ConfigStore(), state: StateStore? = nil) {
         self.config = config
-        self.state = state
+        self.state = state ?? StateStore()
         self.tmdb = TMDBClient { config.credential }
     }
 
