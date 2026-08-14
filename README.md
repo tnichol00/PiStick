@@ -1,5 +1,7 @@
 # PiStick
 
+> **Windows localhost-server edition:** the `agent/windows-local-server` branch runs PiStick silently in the Windows background and serves the interface at `http://127.0.0.1:8787`. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
+
 <img src="assets/pistick-icon.png" alt="PiStick logo" width="128">
 
 PiStick is a controller-friendly, Netflix-style TV interface for Raspberry Pi and Windows. It uses [TMDB](https://www.themoviedb.org/) for movie and TV metadata, posters, search results, and trailers, then opens movies and episodes through [Videasy's documented player API](https://www.videasy.to/docs).
