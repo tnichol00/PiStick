@@ -38,9 +38,12 @@ class ServerInstallerTests(unittest.TestCase):
         self.assertIn("Imported profiles and watch history", self.installer)
 
     def test_python_is_not_pinned_to_one_minor_version(self) -> None:
-        self.assertIn("version[1] -ge 10", self.installer)
+        self.assertIn("$Minor -lt 10", self.installer)
         self.assertNotIn("-3.12", self.installer)
         self.assertIn("pythonw.exe", self.installer)
+        self.assertIn("[string]$PythonPath", self.installer)
+        self.assertIn("Test-PiStickPython $PythonCommand.Source", self.installer)
+        self.assertIn("$PyLauncher.Source -3", self.installer)
 
     def test_start_menu_contains_open_and_stop_controls(self) -> None:
         self.assertIn("Open PiStick Server.lnk", self.installer)

@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$TmdbToken = '',
+    [string]$PythonPath = '',
     [switch]$NoBrowser
 )
 
@@ -16,32 +17,72 @@ $AppRoot = Join-Path $InstallRoot 'app'
 $TemporaryRoot = Join-Path $env:TEMP ("PiStickServer-" + [Guid]::NewGuid().ToString('N'))
 $PowerShellPath = (Get-Process -Id $PID).Path
 
-function Resolve-PiStickPython {
-    $Candidates = @(
-        @{ Command = 'py.exe'; Arguments = @('-3') },
-        @{ Command = 'python.exe'; Arguments = @() },
-        @{ Command = 'python3.exe'; Arguments = @() }
-    )
-    foreach ($Candidate in $Candidates) {
-        $Resolved = Get-Command $Candidate.Command -ErrorAction SilentlyContinue
-        if (-not $Resolved) { continue }
-        try {
-            $Code = 'import json,sys; print(json.dumps({"path":sys.executable,"version":list(sys.version_info[:3])}))'
-            $CandidateArguments = @($Candidate.Arguments)
-            $Result = & $Resolved.Source $CandidateArguments -c $Code 2>$null | Select-Object -Last 1
-            $Info = $Result | ConvertFrom-Json
-            if ([int]$Info.version[0] -eq 3 -and [int]$Info.version[1] -ge 10) {
-                return [PSCustomObject]@{
-                    Path = [string]$Info.path
-                    Version = "{0}.{1}.{2}" -f $Info.version[0], $Info.version[1], $Info.version[2]
-                }
-            }
-        }
-        catch {
-            continue
+function Test-PiStickPython([string]$Executable) {
+    if ([string]::IsNullOrWhiteSpace($Executable)) { return $null }
+    try {
+        $ResolvedPath = [System.IO.Path]::GetFullPath($Executable.Trim())
+        if (-not (Test-Path -LiteralPath $ResolvedPath -PathType Leaf)) { return $null }
+        $ProbeCode = 'import sys; print(f"{sys.version_info.major}|{sys.version_info.minor}|{sys.version_info.micro}|{sys.executable}")'
+        $Probe = & $ResolvedPath -c $ProbeCode 2>$null | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Probe)) { return $null }
+        $Parts = ([string]$Probe).Trim().Split('|')
+        if ($Parts.Count -ne 4) { return $null }
+        $Major = 0
+        $Minor = 0
+        $Micro = 0
+        if (-not [int]::TryParse($Parts[0], [ref]$Major)) { return $null }
+        if (-not [int]::TryParse($Parts[1], [ref]$Minor)) { return $null }
+        if (-not [int]::TryParse($Parts[2], [ref]$Micro)) { return $null }
+        if ($Major -ne 3 -or $Minor -lt 10) { return $null }
+        return [PSCustomObject]@{
+            Path = [System.IO.Path]::GetFullPath($Parts[3])
+            Version = "$Major.$Minor.$Micro"
         }
     }
-    throw 'Python 3.10 or newer is required. Install Python from python.org, enable Add Python to PATH, and rerun this installer.'
+    catch {
+        return $null
+    }
+}
+
+function Resolve-PiStickPython([string]$PreferredPath) {
+    $Candidate = Test-PiStickPython $PreferredPath
+    if ($Candidate) { return $Candidate }
+
+    $PythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
+    if ($PythonCommand) {
+        $Candidate = Test-PiStickPython $PythonCommand.Source
+        if ($Candidate) { return $Candidate }
+    }
+
+    $PyLauncher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
+    if ($PyLauncher) {
+        try {
+            $LaunchedPath = & $PyLauncher.Source -3 -c 'import sys; print(sys.executable)' 2>$null | Select-Object -Last 1
+            if ($LASTEXITCODE -eq 0) {
+                $Candidate = Test-PiStickPython ([string]$LaunchedPath)
+                if ($Candidate) { return $Candidate }
+            }
+        }
+        catch { }
+    }
+
+    $Python3Command = Get-Command 'python3.exe' -ErrorAction SilentlyContinue
+    if ($Python3Command) {
+        $Candidate = Test-PiStickPython $Python3Command.Source
+        if ($Candidate) { return $Candidate }
+    }
+
+    $LocalPythonRoot = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+    if (Test-Path -LiteralPath $LocalPythonRoot -PathType Container) {
+        $InstalledPythons = Get-ChildItem -Path (Join-Path $LocalPythonRoot 'Python*\python.exe') -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending
+        foreach ($InstalledPython in $InstalledPythons) {
+            $Candidate = Test-PiStickPython $InstalledPython.FullName
+            if ($Candidate) { return $Candidate }
+        }
+    }
+
+    throw 'Python 3.10 or newer could not be started. Run python --version, or rerun this installer with -PythonPath followed by the full path to python.exe.'
 }
 
 function Write-Utf8NoBom([string]$Path, [string]$Value) {
@@ -88,7 +129,7 @@ function New-Shortcut([string]$Path, [string]$Target, [string]$Arguments, [strin
 }
 
 Write-Host 'Installing PiStick Server…' -ForegroundColor Cyan
-$Python = Resolve-PiStickPython
+$Python = Resolve-PiStickPython $PythonPath
 Write-Host "Using Python $($Python.Version)" -ForegroundColor DarkGray
 
 New-Item -ItemType Directory -Path $TemporaryRoot -Force | Out-Null
