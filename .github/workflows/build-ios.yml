@@ -33,7 +33,7 @@ jobs:
       UPLOAD_TO_TESTFLIGHT: ${{ inputs.upload_to_testflight }}
     steps:
       - name: Check out PiStick
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check build settings
         shell: bash
@@ -76,7 +76,7 @@ jobs:
 
       - name: Save signed IPA
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: PiStick-signed-${{ github.run_number }}
           path: ios/build/PiStick.ipa

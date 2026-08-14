@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out PiStick
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -36,6 +36,11 @@ jobs:
 
       - name: Check bundled JavaScript
         run: node --check ios/PiStick/Resources/Web/app.js
+
+      - name: Check Fastlane configuration
+        run: |
+          ruby -c ios/fastlane/Appfile
+          ruby -c ios/fastlane/Fastfile
 
       - name: Build and test iPhone target
         working-directory: ios
