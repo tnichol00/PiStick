@@ -3,6 +3,10 @@ default_platform(:ios)
 platform :ios do
   desc "Sign PiStick and optionally upload it to TestFlight"
   lane :testflight do
+    # Use an unlocked, temporary keychain so codesign never waits for a GUI
+    # key-access prompt on GitHub's headless macOS runner.
+    setup_ci(timeout: 0)
+
     bundle_id = ENV.fetch("PISTICK_BUNDLE_ID")
     team_id = ENV.fetch("APPLE_TEAM_ID")
     build_number = ENV.fetch("PISTICK_BUILD_NUMBER", "1")
