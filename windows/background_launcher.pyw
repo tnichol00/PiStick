@@ -16,4 +16,4 @@ sys.path.insert(0, str(app_dir))
 from pistick_server.app import main  # noqa: E402
 
 
-raise SystemExit(main(["--host", "127.0.0.1", "--data-dir", str(data_dir)]))
+raise SystemExit(main(["--host", "0.0.0.0", "--data-dir", str(data_dir)]))

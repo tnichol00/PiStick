@@ -1,7 +1,7 @@
 """Thread-safe, server-side profile and watch-state storage.
 
 The web client never owns the durable PiStick state.  It sends changes to the
-localhost API and this module writes them atomically to the server data folder.
+server API and this module writes them atomically to the server data folder.
 The JSON schema intentionally remains compatible with the desktop PiStick
 ``pistick_state.json`` file so an existing Windows install can be migrated by
 copying that file into the server edition's data directory.

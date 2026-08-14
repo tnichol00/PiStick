@@ -1,4 +1,4 @@
-"""Private configuration for the localhost server."""
+"""Private configuration for the local-network server."""
 
 from __future__ import annotations
 

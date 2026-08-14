@@ -1,4 +1,4 @@
-"""Loopback-only HTTP application for PiStick's browser edition."""
+"""LAN HTTP application for PiStick's browser edition."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -31,7 +32,6 @@ from .tmdb import TMDBClient, TMDBError
 
 LOGGER = logging.getLogger("pistick-server")
 MAX_JSON_BODY = 1_000_000
-LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
 
 
 @dataclass
@@ -416,7 +416,7 @@ class PiStickApplication:
         )
 
 
-class LoopbackHTTPServer(ThreadingHTTPServer):
+class PiStickHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 32
@@ -430,19 +430,6 @@ class PiStickRequestHandler(BaseHTTPRequestHandler):
     def application(self) -> PiStickApplication:
         return self.server.application  # type: ignore[attr-defined]
 
-    @staticmethod
-    def _host_name(host_header: str) -> str:
-        value = host_header.strip().lower()
-        if value.startswith("[") and "]" in value:
-            return value[1 : value.index("]")]
-        return value.split(":", 1)[0]
-
-    def _trusted_request(self) -> bool:
-        if self.client_address[0] not in {"127.0.0.1", "::1"}:
-            return False
-        host = self._host_name(self.headers.get("Host", ""))
-        return host in LOOPBACK_NAMES
-
     def _read_body(self) -> bytes:
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -453,9 +440,6 @@ class PiStickRequestHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _handle(self, method: str, *, send_body: bool = True) -> None:
-        if not self._trusted_request():
-            self._send(Response.json({"error": "Only localhost requests are allowed."}, 403), send_body)
-            return
         if method in {"POST", "PATCH", "DELETE"} and self.path.startswith("/api/"):
             if self.headers.get("X-PiStick-Request") != "1":
                 self._send(Response.json({"error": "Cross-site request blocked."}, 403), send_body)
@@ -536,23 +520,55 @@ def _configure_logging(data_dir: Path, verbose: bool = False) -> None:
         LOGGER.warning("Could not create the server log file.")
 
 
-def _loopback_host(value: str) -> str:
+def _bind_host(value: str) -> str:
     cleaned = str(value or "").strip().lower()
     if cleaned == "localhost":
         return "127.0.0.1"
     try:
         address = ipaddress.ip_address(cleaned)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("PiStick Server may only bind to localhost.") from exc
-    if not address.is_loopback:
-        raise argparse.ArgumentTypeError("PiStick Server may only bind to localhost.")
+        raise argparse.ArgumentTypeError("--host must be an IPv4 or IPv6 address.") from exc
     return str(address)
+
+
+def _lan_urls(port: int) -> list[str]:
+    """Return usable IPv4 URLs for other devices on the local network."""
+
+    addresses: set[str] = set()
+    try:
+        for result in socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM
+        ):
+            addresses.add(str(result[4][0]))
+    except OSError:
+        pass
+
+    # Ask the operating system which interface it would use for a normal
+    # outbound route. UDP connect does not send a packet.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            addresses.add(str(probe.getsockname()[0]))
+    except OSError:
+        pass
+
+    usable: list[str] = []
+    for candidate in addresses:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.version == 4 and not (
+            address.is_loopback or address.is_link_local or address.is_unspecified
+        ):
+            usable.append(f"http://{address}:{port}/")
+    return sorted(set(usable))
 
 
 def run_server(
     data_dir: Path,
     *,
-    host: str = "127.0.0.1",
+    host: str = "0.0.0.0",
     port: Optional[int] = None,
     open_browser: bool = False,
     verbose: bool = False,
@@ -561,7 +577,7 @@ def run_server(
     _configure_logging(data_dir, verbose)
     application = PiStickApplication(data_dir)
     selected_port = int(port or application.config.port)
-    server = LoopbackHTTPServer((host, selected_port), PiStickRequestHandler)
+    server = PiStickHTTPServer((host, selected_port), PiStickRequestHandler)
     server.application = application  # type: ignore[attr-defined]
     application.shutdown_callback = server.shutdown
 
@@ -585,7 +601,16 @@ def run_server(
                 pass
 
     url = f"http://127.0.0.1:{selected_port}/"
-    LOGGER.info("PiStick Server %s listening at %s", __version__, url)
+    LOGGER.info("PiStick Server %s is available on this PC at %s", __version__, url)
+    if ipaddress.ip_address(host).is_unspecified:
+        lan_urls = _lan_urls(selected_port)
+        if lan_urls:
+            for lan_url in lan_urls:
+                LOGGER.info("Open PiStick on another Wi-Fi device at %s", lan_url)
+        else:
+            LOGGER.info("Run ipconfig to find this PC's Wi-Fi IPv4 address.")
+    elif not ipaddress.ip_address(host).is_loopback:
+        LOGGER.info("Open PiStick on another device at http://%s:%s/", host, selected_port)
     if open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
     try:
@@ -602,8 +627,13 @@ def run_server(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Run PiStick as a Windows localhost server.")
-    parser.add_argument("--host", type=_loopback_host, default="127.0.0.1")
+    parser = argparse.ArgumentParser(description="Run PiStick as a server on your local network.")
+    parser.add_argument(
+        "--host",
+        type=_bind_host,
+        default="0.0.0.0",
+        help="Address to listen on (default: 0.0.0.0, all network interfaces).",
+    )
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--data-dir", type=Path, default=_default_data_dir())
     parser.add_argument("--open", action="store_true", dest="open_browser")

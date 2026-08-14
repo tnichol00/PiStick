@@ -28,10 +28,10 @@ class ServerInstallerTests(unittest.TestCase):
         self.assertIn("background_launcher.pyw", self.hidden_launcher)
         self.assertIn("from pistick_server.app import main", self.launcher)
 
-    def test_server_is_localhost_only(self) -> None:
-        self.assertIn('"--host", "127.0.0.1"', self.launcher)
-        self.assertIn("PiStick Server may only bind to localhost", self.server)
-        self.assertNotIn('host="0.0.0.0"', self.server)
+    def test_server_is_available_on_the_local_network(self) -> None:
+        self.assertIn('"--host", "0.0.0.0"', self.launcher)
+        self.assertIn('host: str = "0.0.0.0"', self.server)
+        self.assertNotIn("Only localhost requests are allowed.", self.server)
 
     def test_existing_desktop_profiles_are_imported(self) -> None:
         self.assertIn("PiStick\\data\\pistick_state.json", self.installer)

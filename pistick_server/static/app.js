@@ -666,7 +666,7 @@
       // Videasy rejects playback when its outer iframe has any sandbox
       // attribute, even when scripts and forms are explicitly allowed.
       // The URL allowlist above and cross-origin browser isolation still keep
-      // the localhost application and its server-side data separate.
+      // the PiStick application and its server-side data separate.
       ui.playerFrame.removeAttribute("sandbox");
     } else {
       ui.playerFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock");

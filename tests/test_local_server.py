@@ -7,9 +7,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from pistick_server.app import (
-    LoopbackHTTPServer,
+    PiStickHTTPServer,
     PiStickApplication,
     PiStickRequestHandler,
+    _bind_host,
 )
 
 
@@ -173,11 +174,11 @@ class ApplicationTests(unittest.TestCase):
         )
 
 
-class LoopbackHTTPTests(unittest.TestCase):
+class HTTPServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         app = PiStickApplication(Path(self.temporary.name) / "data", tmdb=FakeTMDB())
-        self.server = LoopbackHTTPServer(("127.0.0.1", 0), PiStickRequestHandler)
+        self.server = PiStickHTTPServer(("127.0.0.1", 0), PiStickRequestHandler)
         self.server.application = app
         app.shutdown_callback = self.server.shutdown
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -208,6 +209,10 @@ class LoopbackHTTPTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as captured:
             urlopen(request, timeout=3)
         self.assertEqual(captured.exception.code, 403)
+
+    def test_lan_bind_address_is_allowed(self) -> None:
+        self.assertEqual(_bind_host("0.0.0.0"), "0.0.0.0")
+        self.assertEqual(_bind_host("192.168.1.25"), "192.168.1.25")
 
 
 if __name__ == "__main__":

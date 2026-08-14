@@ -1,6 +1,6 @@
 # PiStick
 
-> **Windows localhost-server edition:** the `agent/windows-local-server` branch runs PiStick silently in the Windows background and serves the interface at `http://127.0.0.1:8787`. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
+> **Windows local-network server edition:** the `agent/windows-local-server` branch runs PiStick in the background and makes the interface available to devices on the same Wi-Fi. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
 
 <img src="assets/pistick-icon.png" alt="PiStick logo" width="128">
 
