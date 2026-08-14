@@ -58,6 +58,14 @@ platform :ios do
       }
     )
 
+    archive_path = lane_context[SharedValues::XCODEBUILD_ARCHIVE]
+    UI.user_error!("Fastlane did not report an archive path") if archive_path.to_s.empty?
+    sh(
+      "bash",
+      "scripts/verify_app_bundle.sh",
+      File.join(archive_path, "Products/Applications/PiStick.app")
+    )
+
     if ENV.fetch("UPLOAD_TO_TESTFLIGHT", "true") == "true"
       upload_to_testflight(
         api_key: api_key,

@@ -65,3 +65,19 @@ jobs:
           CODE_SIGNING_ALLOWED=NO
           build
           | xcbeautify
+
+      - name: Archive and verify bundled resources
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project PiStick.xcodeproj \
+            -scheme PiStick \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/PiStick.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            clean archive \
+            | xcbeautify
+          bash scripts/verify_app_bundle.sh \
+            "build/PiStick.xcarchive/Products/Applications/PiStick.app"
