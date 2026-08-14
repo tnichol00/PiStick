@@ -1,0 +1,84 @@
+name: Build PiStick for iPhone and iPad
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: Upload the signed build to TestFlight
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pistick-testflight
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      PISTICK_BUNDLE_ID: ${{ vars.PISTICK_BUNDLE_ID }}
+      MATCH_REPOSITORY: ${{ vars.MATCH_REPOSITORY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      PISTICK_BUILD_NUMBER: ${{ github.run_number }}
+      UPLOAD_TO_TESTFLIGHT: ${{ inputs.upload_to_testflight }}
+    steps:
+      - name: Check out PiStick
+        uses: actions/checkout@v4
+
+      - name: Check build settings
+        shell: bash
+        run: |
+          missing=()
+          for name in PISTICK_BUNDLE_ID MATCH_REPOSITORY APPLE_TEAM_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_PRIVATE_KEY MATCH_PASSWORD GH_PAT; do
+            if [[ -z "${!name}" ]]; then missing+=("$name"); fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "Missing GitHub Actions settings: ${missing[*]}"
+            echo "Follow ios/README.md, then run this workflow again."
+            exit 1
+          fi
+
+      - name: Prepare signing-repository access
+        shell: bash
+        run: |
+          authorization="$(printf 'x-access-token:%s' "$GH_PAT" | base64)"
+          echo "::add-mask::$authorization"
+          echo "MATCH_GIT_BASIC_AUTHORIZATION=$authorization" >> "$GITHUB_ENV"
+          echo "MATCH_REPOSITORY_URL=https://github.com/${MATCH_REPOSITORY}.git" >> "$GITHUB_ENV"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: ios
+
+      - name: Build, sign, and upload
+        working-directory: ios
+        run: bundle exec fastlane ios testflight
+
+      - name: Save signed IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PiStick-signed-${{ github.run_number }}
+          path: ios/build/PiStick.ipa
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,62 @@
+name: iOS checks
+
+on:
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios-*.yml"
+  push:
+    branches:
+      - agent/ios-standalone
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios-*.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out PiStick
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Check bundled JavaScript
+        run: node --check ios/PiStick/Resources/Web/app.js
+
+      - name: Build and test iPhone target
+        working-directory: ios
+        run: >-
+          set -o pipefail &&
+          xcodebuild
+          -project PiStick.xcodeproj
+          -scheme PiStick
+          -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
+          CODE_SIGNING_ALLOWED=NO
+          clean test
+          | xcbeautify
+
+      - name: Build iPad target
+        working-directory: ios
+        run: >-
+          set -o pipefail &&
+          xcodebuild
+          -project PiStick.xcodeproj
+          -scheme PiStick
+          -destination 'platform=iOS Simulator,name=iPad Pro 13-inch (M5),OS=latest'
+          CODE_SIGNING_ALLOWED=NO
+          build
+          | xcbeautify
