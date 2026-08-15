@@ -9,7 +9,10 @@
   --red: #e50914;
   --red-2: #ff3b44;
   --focus: #ffffff;
-  --header-height: calc(72px + env(safe-area-inset-top));
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
+  --header-height: calc(72px + var(--safe-area-top));
   font-family: "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
   background: var(--bg);
   color: var(--text);
@@ -57,6 +60,7 @@ select:focus-visible,
 }
 
 .site-header {
+  --header-side-padding: clamp(18px, 4vw, 64px);
   position: sticky;
   z-index: 50;
   top: 0;
@@ -64,8 +68,10 @@ select:focus-visible,
   display: flex;
   align-items: center;
   gap: 18px;
-  padding: 0 clamp(18px, 4vw, 64px);
-  padding-top: env(safe-area-inset-top);
+  padding: var(--safe-area-top)
+    max(var(--header-side-padding), var(--safe-area-right))
+    0
+    max(var(--header-side-padding), var(--safe-area-left));
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(9, 9, 11, 0.94);
   backdrop-filter: blur(18px);
@@ -617,7 +623,7 @@ textarea::placeholder { color: #85858d; }
 }
 
 @media (max-width: 850px) {
-  .site-header { gap: 8px; padding-inline: 13px; }
+  .site-header { --header-side-padding: 13px; gap: 8px; }
   .brand { font-size: 19px; }
   .main-nav { display: none; }
   .search-form { width: auto; flex: 1; margin-left: 3px; }
