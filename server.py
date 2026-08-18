@@ -1,4 +1,4 @@
-"""Convenient entry point for the PiStick localhost server."""
+"""Convenient entry point for the PiStick web server."""
 
 from pistick_server.app import main
 

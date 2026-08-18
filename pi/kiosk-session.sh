@@ -9,7 +9,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-run-session >/dev
     exec dbus-run-session -- "$0"
 fi
 
-PISTICK_URL="${PISTICK_URL:-http://127.0.0.1:8787/?platform=pi-zero-w}"
+PISTICK_URL="${PISTICK_URL:-http://127.0.0.1/?platform=pi-zero-w}"
 PROFILE_DIR="${PISTICK_BROWSER_PROFILE:-/var/cache/pistick/chromium}"
 
 xset -dpms >/dev/null 2>&1 || true
@@ -31,12 +31,12 @@ if command -v unclutter >/dev/null 2>&1; then
 fi
 
 for _attempt in $(seq 1 45); do
-    if curl -fsS --max-time 2 http://127.0.0.1:8787/health >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
         break
     fi
     sleep 1
 done
-curl -fsS --max-time 3 http://127.0.0.1:8787/health >/dev/null \
+curl -fsS --max-time 3 http://127.0.0.1/health >/dev/null \
     || { printf 'PiStick server did not become ready.\n' >&2; exit 1; }
 
 if command -v chromium-browser >/dev/null 2>&1; then

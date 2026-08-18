@@ -1,4 +1,4 @@
-"""Loopback-only HTTP application for PiStick's browser edition."""
+"""HTTP application for PiStick's local screen and optional home-LAN clients."""
 
 from __future__ import annotations
 
@@ -26,12 +26,14 @@ from playback_api import PlaybackAPIError, getmovie, getshow
 from . import __version__
 from .config import ConfigStore
 from .state import StateError, WatchStateStore
+from .system_control import SystemControlError, SystemController
 from .tmdb import TMDBClient, TMDBError
 
 
 LOGGER = logging.getLogger("pistick-server")
 MAX_JSON_BODY = 1_000_000
 LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
+LAN_NAMES = {"pistick", "pistick.local"}
 
 
 def _low_memory_enabled() -> bool:
@@ -111,10 +113,12 @@ class PiStickApplication:
         *,
         static_dir: Optional[Path] = None,
         tmdb: Optional[TMDBClient] = None,
+        system_controller: Optional[SystemController] = None,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config = ConfigStore(self.data_dir / "config.json")
+        self.advertised_port = self.config.port
         self.state = WatchStateStore(self.data_dir / "state.json")
         self.static_dir = Path(static_dir or Path(__file__).with_name("static")).resolve()
         self.low_memory = _low_memory_enabled()
@@ -122,7 +126,13 @@ class PiStickApplication:
             lambda: self.config.tmdb_read_token,
             self.data_dir / "cache" / "tmdb",
         )
+        self.system_controller = system_controller or SystemController()
         self.shutdown_callback: Optional[Callable[[], None]] = None
+
+    @property
+    def lan_url(self) -> str:
+        suffix = "" if self.advertised_port == 80 else f":{self.advertised_port}"
+        return f"http://pistick.local{suffix}"
 
     @staticmethod
     def _json_body(body: bytes) -> dict[str, Any]:
@@ -185,6 +195,8 @@ class PiStickApplication:
         raw_target: str,
         headers: Mapping[str, str],
         body: bytes = b"",
+        *,
+        local_request: bool = True,
     ) -> Response:
         method = method.upper()
         parsed = urlsplit(raw_target)
@@ -200,7 +212,12 @@ class PiStickApplication:
                         "name": "PiStick Server",
                         "version": __version__,
                         "low_memory": self.low_memory,
+                        "local_control": bool(
+                            local_request and self.system_controller.available
+                        ),
+                        "lan_url": self.lan_url,
                         **self.config.public_payload(),
+                        "port": self.advertised_port,
                     }
                 )
 
@@ -226,14 +243,54 @@ class PiStickApplication:
                 profile = self.state.activate_profile(match.group(1))
                 return Response.json({"profile": profile})
 
-            if path == "/api/settings/tmdb" and method == "POST":
-                payload = self._json_body(body)
-                token = str(payload.get("token") or "").strip()
-                if not ConfigStore.usable_token(token):
-                    raise ValueError("Paste the long TMDB API Read Access Token.")
-                self.tmdb.validate_token(token)
-                self.config.set_tmdb_read_token(token)
-                return Response.json({"ok": True, "tmdb_configured": True})
+            if path == "/api/settings/tmdb":
+                return Response.json(
+                    {"error": "The TMDB token can only be changed over SSH."}, 403
+                )
+
+            if path.startswith("/api/system/"):
+                if not local_request:
+                    return Response.json(
+                        {"error": "System settings are available only on the Pi HDMI screen."},
+                        403,
+                    )
+                if not self.system_controller.available:
+                    return Response.json(
+                        {"error": "System controls are not installed on this device."}, 503
+                    )
+                if path == "/api/system/status" and method == "GET":
+                    result = self.system_controller.run("status")
+                    result.update(
+                        {
+                            "lan_enabled": self.config.lan_enabled,
+                            "lan_url": self.lan_url,
+                        }
+                    )
+                    return Response.json(result)
+                if path == "/api/system/lan" and method == "POST":
+                    payload = self._json_body(body)
+                    enabled = payload.get("enabled")
+                    if not isinstance(enabled, bool):
+                        raise ValueError("LAN access must be turned on or off.")
+                    self.config.set_lan_enabled(enabled)
+                    return Response.json(
+                        {
+                            "ok": True,
+                            "lan_enabled": self.config.lan_enabled,
+                            "lan_url": self.lan_url,
+                        }
+                    )
+                actions = {
+                    ("/api/system/wifi/scan", "POST"): "wifi-scan",
+                    ("/api/system/wifi/connect", "POST"): "wifi-connect",
+                    ("/api/system/bluetooth/scan", "POST"): "bluetooth-scan",
+                    ("/api/system/bluetooth/pair", "POST"): "bluetooth-pair",
+                }
+                action = actions.get((path, method))
+                if action:
+                    return Response.json(
+                        self.system_controller.run(action, self._json_body(body))
+                    )
 
             if path == "/api/home" and method == "GET":
                 profile_id = self._profile_id(self._query_value(query, "profile_id"))
@@ -396,6 +453,8 @@ class PiStickApplication:
             return self._static(path)
         except TMDBError as exc:
             return Response.json({"error": str(exc)}, exc.status)
+        except SystemControlError as exc:
+            return Response.json({"error": str(exc)}, 400)
         except PlaybackAPIError as exc:
             return Response.json({"error": str(exc)}, 400)
         except (StateError, ValueError, TypeError) as exc:
@@ -459,10 +518,33 @@ class PiStickRequestHandler(BaseHTTPRequestHandler):
         return value.split(":", 1)[0]
 
     def _trusted_request(self) -> bool:
-        if self.client_address[0] not in {"127.0.0.1", "::1"}:
-            return False
+        local_request = self._local_request()
         host = self._host_name(self.headers.get("Host", ""))
-        return host in LOOPBACK_NAMES
+        if local_request:
+            return host in LOOPBACK_NAMES or host in LAN_NAMES
+        if not self.application.config.lan_enabled:
+            return False
+        try:
+            client = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        if client.is_global or client.is_unspecified or client.is_multicast:
+            return False
+        if host in LAN_NAMES:
+            return True
+        try:
+            requested = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return not (
+            requested.is_global or requested.is_unspecified or requested.is_multicast
+        )
+
+    def _local_request(self) -> bool:
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
 
     def _read_body(self) -> bytes:
         try:
@@ -475,7 +557,13 @@ class PiStickRequestHandler(BaseHTTPRequestHandler):
 
     def _handle(self, method: str, *, send_body: bool = True) -> None:
         if not self._trusted_request():
-            self._send(Response.json({"error": "Only localhost requests are allowed."}, 403), send_body)
+            self._send(
+                Response.json(
+                    {"error": "LAN access is turned off or this device is not on the local network."},
+                    403,
+                ),
+                send_body,
+            )
             return
         if method in {"POST", "PATCH", "DELETE"} and self.path.startswith("/api/"):
             if self.headers.get("X-PiStick-Request") != "1":
@@ -486,7 +574,13 @@ class PiStickRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send(Response.json({"error": str(exc)}, 400), send_body)
             return
-        response = self.application.dispatch(method, self.path, self.headers, body)
+        response = self.application.dispatch(
+            method,
+            self.path,
+            self.headers,
+            body,
+            local_request=self._local_request(),
+        )
         self._send(response, send_body)
 
     def _send(self, response: Response, send_body: bool = True) -> None:
@@ -556,16 +650,26 @@ def _configure_logging(data_dir: Path, verbose: bool = False) -> None:
         LOGGER.warning("Could not create the server log file.")
 
 
-def _loopback_host(value: str) -> str:
+def _server_host(value: str) -> str:
     cleaned = str(value or "").strip().lower()
     if cleaned == "localhost":
         return "127.0.0.1"
     try:
         address = ipaddress.ip_address(cleaned)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("PiStick Server may only bind to localhost.") from exc
-    if not address.is_loopback:
-        raise argparse.ArgumentTypeError("PiStick Server may only bind to localhost.")
+        raise argparse.ArgumentTypeError("PiStick Server needs a valid bind address.") from exc
+    if address.is_loopback:
+        return str(address)
+    allow_lan = os.getenv("PISTICK_ALLOW_LAN_BIND", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not allow_lan or not address.is_unspecified:
+        raise argparse.ArgumentTypeError(
+            "PiStick Server may bind to the LAN only in the Pi appliance service."
+        )
     return str(address)
 
 
@@ -581,6 +685,7 @@ def run_server(
     _configure_logging(data_dir, verbose)
     application = PiStickApplication(data_dir)
     selected_port = int(port or application.config.port)
+    application.advertised_port = selected_port
     server = LoopbackHTTPServer((host, selected_port), PiStickRequestHandler)
     server.application = application  # type: ignore[attr-defined]
     application.shutdown_callback = server.shutdown
@@ -622,15 +727,21 @@ def run_server(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Run PiStick as a Windows localhost server.")
-    parser.add_argument("--host", type=_loopback_host, default="127.0.0.1")
+    parser = argparse.ArgumentParser(description="Run PiStick's local web server.")
+    parser.add_argument("--host", type=_server_host, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--data-dir", type=Path, default=_default_data_dir())
     parser.add_argument("--open", action="store_true", dest="open_browser")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
-    if args.port is not None and not 1024 <= args.port <= 65535:
-        parser.error("--port must be between 1024 and 65535.")
+    if args.port is not None:
+        allow_http_port = (
+            args.port == 80
+            and os.getenv("PISTICK_ALLOW_HTTP_PORT", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if not (1024 <= args.port <= 65535 or allow_http_port):
+            parser.error("--port must be between 1024 and 65535 (or the Pi appliance's port 80).")
     try:
         run_server(
             args.data_dir,

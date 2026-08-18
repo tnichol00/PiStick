@@ -55,14 +55,22 @@ CURRENT="$TEST_ROOT/opt/pistick/current"
 assert_file "$CURRENT/server.py"
 assert_file "$CURRENT/playback_api.py"
 assert_file "$CURRENT/pistick_server/static/app.js"
+assert_file "$CURRENT/pistick_server/system_control.py"
 assert_file "$CURRENT/pi/launch-kiosk.sh"
 assert_file "$CURRENT/pi/kiosk-session.sh"
+assert_file "$CURRENT/pi/pistick-system-helper.py"
+assert_file "$CURRENT/pi/configure-tmdb.sh"
 assert_file "$CURRENT/PI_ZERO_W_README.md"
 assert_file "$TEST_ROOT/var/lib/pistick/data/config.json"
 assert_file "$TEST_ROOT/etc/systemd/system/pistick-server.service"
 assert_file "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service"
 assert_file "$TEST_ROOT/etc/X11/Xwrapper.config"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-update"
+assert_file "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb"
+assert_file "$TEST_ROOT/usr/local/libexec/pistick-system-helper"
+assert_file "$TEST_ROOT/etc/sudoers.d/pistick-system"
+[[ "$(stat -c '%a' "$TEST_ROOT/var/lib/pistick/data/config.json")" == "600" ]] \
+    || fail "The TMDB configuration file must be owner-only"
 
 python3 - "$TEST_ROOT/var/lib/pistick/data/config.json" <<'PY'
 import json
@@ -73,11 +81,26 @@ with open(sys.argv[1], encoding="utf-8") as source:
 assert config["tmdb_read_token"] == "test-tmdb-read-token-value"
 assert config["port"] == 8787
 assert len(config["shutdown_token"]) >= 24
+assert config["lan_enabled"] is True
 PY
 
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_LOW_MEMORY=1"
-assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "--host 127.0.0.1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_ALLOW_LAN_BIND=1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_ALLOW_HTTP_PORT=1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_DEFAULT_LAN=1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "--host 0.0.0.0"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "--port 80"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "AmbientCapabilities=CAP_NET_BIND_SERVICE"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "PISTICK_SYSTEM_HELPER=/usr/local/libexec/pistick-system-helper"
+if grep -Fq "NoNewPrivileges=true" "$TEST_ROOT/etc/systemd/system/pistick-server.service"; then
+    fail "The server service prevents its allowlisted sudo helper from running"
+fi
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "?platform=pi-zero-w"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w"
+assert_contains "$TEST_ROOT/etc/sudoers.d/pistick-system" "pistick-system-helper wifi-connect"
+assert_contains "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" "TMDB token updated"
+assert_contains "$PROJECT_DIR/install.sh" "avahi-daemon"
+assert_contains "$PROJECT_DIR/install.sh" "hostnamectl set-hostname pistick"
 assert_contains "$CURRENT/pi/kiosk-session.sh" "--renderer-process-limit=2"
 assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
 assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
@@ -89,8 +112,11 @@ fi
 
 # Confirm the installed copy starts as a real loopback HTTP server.
 PORT=18787
+PISTICK_ALLOW_LAN_BIND=1 \
+PISTICK_DEFAULT_LAN=1 \
+PISTICK_SYSTEM_HELPER="$TEST_ROOT/usr/local/libexec/pistick-system-helper" \
 python3 "$CURRENT/server.py" \
-    --host 127.0.0.1 \
+    --host 0.0.0.0 \
     --port "$PORT" \
     --data-dir "$TEST_ROOT/var/lib/pistick/data" \
     >"$TEST_DIR/server.log" 2>&1 &

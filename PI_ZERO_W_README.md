@@ -8,7 +8,7 @@ The finished boot flow is:
 Power on → Raspberry Pi OS Lite → PiStick server → fullscreen Chromium
 ```
 
-There is no normal desktop, taskbar, or file manager. PiStick opens automatically and can be controlled with a Bluetooth or USB game controller.
+There is no normal desktop, taskbar, or file manager. PiStick opens automatically on HDMI, can be controlled with a Bluetooth or USB game controller, and can optionally serve the same interface to other devices on your Wi-Fi.
 
 ## Before you begin
 
@@ -87,12 +87,13 @@ sudo bash /tmp/pistick-install.sh
 
 The installer will:
 
-- Install Python, Chromium, minimal X11 components, Openbox, and Bluetooth tools.
+- Install Python, Chromium, minimal X11 components, Openbox, NetworkManager, mDNS, and Bluetooth tools.
 - Download only the `agent/pi-zero-w` branch.
 - Ask for and validate the TMDB Read Access Token.
 - Store the token and watch data outside the application files.
 - Add the Pi user to the controller, video, audio, and graphics groups.
 - Create separate server and fullscreen-kiosk services.
+- Make the Pi discoverable at `pistick.local`.
 - Start PiStick automatically after every boot.
 
 When it asks for the TMDB token, paste it and press Enter. Nothing appears while you paste or type; this is intentional.
@@ -107,11 +108,77 @@ sudo reboot
 
 The SSH connection will close. PiStick should appear on the connected display after the Pi boots. The first browser launch is slower than later launches.
 
-## Part 4: Pair a controller
+## Part 4: Use the HDMI settings screen
+
+On the **Who's watching?** screen, select **Settings** beside **Manage Profiles**. This button appears only on the browser running directly on the Pi's HDMI screen. It is deliberately hidden from phones, tablets, and computers.
+
+The settings screen can:
+
+- Turn access for other Wi-Fi devices on or off.
+- Scan for and connect to a different 2.4 GHz Wi-Fi network.
+- Scan for, pair, trust, and connect a Bluetooth controller.
+- Show whether Linux detects a wired USB controller.
+
+Network and Bluetooth actions are rejected unless the request comes from the Pi itself. They cannot be triggered from another device on the LAN.
+
+### Open PiStick on another device
+
+LAN access is on after a new installation. Connect a phone, tablet, or computer to the same Wi-Fi, then open:
+
+```text
+http://pistick.local
+```
+
+There is no username or password, as requested. Devices share the Pi's profiles, watch history, and TMDB-backed library. Anyone connected to the same Wi-Fi who opens that address can use PiStick and change ordinary profile or watch-state data.
+
+To stop other devices from connecting while keeping HDMI PiStick running:
+
+1. Return to **Who's watching?** on the HDMI screen.
+2. Open **Settings**.
+3. Under **Other devices**, choose **Turn off**.
+
+The Pi's HDMI interface continues using `http://127.0.0.1` regardless of that switch.
+
+### Connect to a different Wi-Fi network
+
+1. Open **Settings** on the HDMI screen.
+2. Under **Wi-Fi**, choose **Scan networks**.
+3. Select a network.
+4. Enter its password with the controller keyboard and select **Connect**.
+
+The original Pi Zero W supports only 2.4 GHz networks. Changing networks disconnects the Pi from its previous Wi-Fi, but the HDMI interface stays open. Reconnect SSH and other devices through `pistick.local` after the Pi joins the new network.
+
+### Change the TMDB token
+
+The TMDB token cannot be entered or changed through any browser, including the HDMI browser. Connect over SSH and run:
+
+```bash
+sudo pistick-configure-tmdb
+```
+
+Paste the new long API Read Access Token. The command validates it, saves it privately, and restarts only the PiStick server.
+
+## Part 5: Pair a controller
 
 ### Bluetooth controller
 
-Reconnect over SSH:
+The easiest method is the HDMI settings screen:
+
+1. Put the controller into pairing mode:
+   - **Xbox Wireless Controller:** hold the small Pair button until the Xbox light flashes quickly.
+   - **DualShock 4:** hold **PS + Share** until the light bar flashes.
+   - **DualSense:** hold **PS + Create** until the lights flash.
+   - **Nintendo Switch Pro Controller:** hold the Sync button near the USB port.
+2. On **Who's watching?**, open **Settings**.
+3. Choose **Pair new controller**.
+4. Wait about 10 seconds, select the controller, then choose **Pair**.
+5. Press any controller button once after it connects.
+
+Chromium does not reveal a controller to a website until the controller has produced input.
+
+#### SSH pairing fallback
+
+If a controller does not appear in the HDMI scan, reconnect over SSH:
 
 ```bash
 ssh pistick@pistick.local
@@ -132,13 +199,6 @@ default-agent
 scan on
 ```
 
-Put the controller into pairing mode:
-
-- **Xbox Wireless Controller:** hold the small Pair button until the Xbox light flashes quickly.
-- **DualShock 4:** hold **PS + Share** until the light bar flashes.
-- **DualSense:** hold **PS + Create** until the lights flash.
-- **Nintendo Switch Pro Controller:** hold the Sync button near the USB port.
-
 Wait for a line showing the controller name and an address like `AA:BB:CC:DD:EE:FF`. Then enter:
 
 ```text
@@ -158,7 +218,7 @@ Restart only the fullscreen interface so Chromium sees the controller:
 sudo systemctl restart pistick-kiosk.service
 ```
 
-Press any controller button once after PiStick appears. Chromium does not reveal a controller to a website until the controller has produced input.
+Press any controller button once after PiStick appears.
 
 ### USB controller
 
@@ -172,7 +232,7 @@ Press any controller button once after PiStick appears. Chromium does not reveal
 3. Power the Pi back on.
 4. Press any controller button when PiStick appears.
 
-The Zero W has limited USB power. Use a powered USB hub if the controller repeatedly disconnects.
+The Zero W has limited USB power. Use a powered USB hub if the controller repeatedly disconnects. Open the HDMI **Settings** screen and choose **Refresh** under **Wired controllers** to confirm it is detected.
 
 ### Confirm Linux can see the controller
 
@@ -269,13 +329,13 @@ sudo systemctl status pistick-server.service pistick-kiosk.service
 Then confirm the local page responds:
 
 ```bash
-curl http://127.0.0.1:8787/health
+curl http://127.0.0.1/health
 ```
 
 Expected output contains:
 
 ```json
-{"ok":true,"version":"0.1.0"}
+{"ok":true,"version":"0.2.0"}
 ```
 
 If health works, inspect the kiosk log. If health fails, inspect the server log.
@@ -323,5 +383,6 @@ The updater downloads the newest commit from `agent/pi-zero-w`, keeps the TMDB t
 | TMDB token and watch state | `/var/lib/pistick/data` |
 | Chromium profile and cache | `/var/cache/pistick/chromium` |
 | Boot services | `/etc/systemd/system/pistick-*.service` |
+| Root-owned system helper | `/usr/local/libexec/pistick-system-helper` |
 
-The Python server binds only to `127.0.0.1`, so other devices on the Wi-Fi network cannot open or change this PiStick installation.
+The server listens for local-network connections, but accepts them only while **Other devices** is enabled and only from private/link-local source addresses using `pistick.local` or the Pi's private IP. Cross-origin requests remain blocked. Wi-Fi, Bluetooth, LAN-toggle, and TMDB-token changes are never available to remote browsers.

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 # PiStick appliance installer for the original Raspberry Pi Zero W.
-# This branch intentionally uses the lightweight localhost server and the
+# This branch intentionally uses the lightweight PiStick server and the
 # Raspberry Pi OS Chromium package instead of Qt WebEngine.
 
 REPOSITORY="tnichol00/PiStick"
@@ -21,6 +21,8 @@ CACHE_ROOT="$(root_path /var/cache/pistick)"
 SYSTEMD_ROOT="$(root_path /etc/systemd/system)"
 XWRAPPER_PATH="$(root_path /etc/X11/Xwrapper.config)"
 LOCAL_BIN="$(root_path /usr/local/bin)"
+LOCAL_LIBEXEC="$(root_path /usr/local/libexec)"
+SUDOERS_PATH="$(root_path /etc/sudoers.d/pistick-system)"
 CONFIG_PATH="${DATA_ROOT}/data/config.json"
 
 TEMP_DIR=""
@@ -137,6 +139,9 @@ install_packages() {
         fonts-liberation
         bluez
         rfkill
+        network-manager
+        avahi-daemon
+        sudo
     )
 
     if package_available chromium-browser; then
@@ -181,11 +186,14 @@ check_source() {
         pistick_server/config.py
         pistick_server/state.py
         pistick_server/tmdb.py
+        pistick_server/system_control.py
         pistick_server/static/index.html
         pistick_server/static/app.js
         pistick_server/static/styles.css
         pi/launch-kiosk.sh
         pi/kiosk-session.sh
+        pi/pistick-system-helper.py
+        pi/configure-tmdb.sh
         PI_ZERO_W_README.md
     )
     local path
@@ -194,13 +202,16 @@ check_source() {
     done
     bash -n "${SOURCE_DIR}/pi/launch-kiosk.sh"
     bash -n "${SOURCE_DIR}/pi/kiosk-session.sh"
+    bash -n "${SOURCE_DIR}/pi/configure-tmdb.sh"
     python3 -m py_compile \
         "${SOURCE_DIR}/server.py" \
         "${SOURCE_DIR}/playback_api.py" \
         "${SOURCE_DIR}/pistick_server/app.py" \
         "${SOURCE_DIR}/pistick_server/config.py" \
         "${SOURCE_DIR}/pistick_server/state.py" \
-        "${SOURCE_DIR}/pistick_server/tmdb.py"
+        "${SOURCE_DIR}/pistick_server/tmdb.py" \
+        "${SOURCE_DIR}/pistick_server/system_control.py" \
+        "${SOURCE_DIR}/pi/pistick-system-helper.py"
 }
 
 install_release() {
@@ -334,6 +345,7 @@ except (TypeError, ValueError):
     port = 8787
 data["port"] = port if 1024 <= port <= 65535 else 8787
 data["shutdown_token"] = str(data.get("shutdown_token") or secrets.token_urlsafe(32))
+data["lan_enabled"] = bool(data.get("lan_enabled", True))
 temporary = path + ".tmp"
 with open(temporary, "w", encoding="utf-8") as destination:
     json.dump(data, destination, indent=2)
@@ -352,7 +364,7 @@ configure_user_access() {
         return
     fi
     local groups=() group
-    for group in input video render audio bluetooth; do
+    for group in input video render audio bluetooth netdev; do
         if getent group "$group" >/dev/null; then
             groups+=("$group")
         fi
@@ -374,6 +386,53 @@ EOF
     chmod 0644 "$XWRAPPER_PATH"
 }
 
+install_system_helpers() {
+    step "Installing HDMI-only network and controller controls"
+    install -d -m 0755 "$LOCAL_LIBEXEC" "$LOCAL_BIN" "$(dirname "$SUDOERS_PATH")"
+    install -m 0755 \
+        "${INSTALL_ROOT}/current/pi/pistick-system-helper.py" \
+        "${LOCAL_LIBEXEC}/pistick-system-helper"
+    install -m 0755 \
+        "${INSTALL_ROOT}/current/pi/configure-tmdb.sh" \
+        "${LOCAL_BIN}/pistick-configure-tmdb"
+    cat >"$SUDOERS_PATH" <<EOF
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper status
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper wifi-scan
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper wifi-connect
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper bluetooth-scan
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper bluetooth-pair
+EOF
+    chmod 0440 "$SUDOERS_PATH"
+    if [[ "$TEST_MODE" != "1" ]]; then
+        visudo -cf "$SUDOERS_PATH" >/dev/null || fail "The PiStick system-control permission file is invalid."
+        hostnamectl set-hostname pistick
+        python3 - /etc/hosts <<'PY'
+from pathlib import Path
+import os
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+replacement = "127.0.1.1\tpistick"
+updated = []
+replaced = False
+for line in lines:
+    fields = line.split("#", 1)[0].split()
+    if fields and fields[0] == "127.0.1.1":
+        if not replaced:
+            updated.append(replacement)
+            replaced = True
+    else:
+        updated.append(line)
+if not replaced:
+    updated.append(replacement)
+temporary = path.with_name(".hosts.pistick.tmp")
+temporary.write_text("\n".join(updated) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+    fi
+}
+
 write_services() {
     step "Creating the boot services"
     install -d -m 0755 "$SYSTEMD_ROOT"
@@ -391,10 +450,14 @@ Group=${TARGET_GROUP}
 WorkingDirectory=/opt/pistick/current
 Environment=PYTHONUNBUFFERED=1
 Environment=PISTICK_LOW_MEMORY=1
-ExecStart=/usr/bin/python3 /opt/pistick/current/server.py --host 127.0.0.1 --port 8787 --data-dir /var/lib/pistick/data
+Environment=PISTICK_ALLOW_LAN_BIND=1
+Environment=PISTICK_ALLOW_HTTP_PORT=1
+Environment=PISTICK_DEFAULT_LAN=1
+Environment=PISTICK_SYSTEM_HELPER=/usr/local/libexec/pistick-system-helper
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/bin/python3 /opt/pistick/current/server.py --host 0.0.0.0 --port 80 --data-dir /var/lib/pistick/data
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
@@ -417,7 +480,7 @@ WorkingDirectory=/opt/pistick/current
 Environment=HOME=${TARGET_HOME}
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=${TARGET_HOME}/.Xauthority
-Environment=PISTICK_URL=http://127.0.0.1:8787/?platform=pi-zero-w
+Environment=PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w
 Environment=PISTICK_BROWSER_PROFILE=/var/cache/pistick/chromium
 TTYPath=/dev/tty1
 StandardInput=tty
@@ -464,18 +527,20 @@ start_services() {
     systemctl daemon-reload
     systemctl enable bluetooth.service >/dev/null 2>&1 || true
     systemctl restart bluetooth.service >/dev/null 2>&1 || true
+    systemctl enable avahi-daemon.service >/dev/null 2>&1 || true
+    systemctl restart avahi-daemon.service >/dev/null 2>&1 || true
     systemctl disable --now getty@tty1.service >/dev/null 2>&1 || true
     systemctl enable pistick-server.service pistick-kiosk.service >/dev/null
     systemctl restart pistick-server.service
 
     local attempt
     for attempt in $(seq 1 30); do
-        if curl -fsS --max-time 2 http://127.0.0.1:8787/health >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
             break
         fi
         sleep 1
     done
-    curl -fsS --max-time 3 http://127.0.0.1:8787/health >/dev/null \
+    curl -fsS --max-time 3 http://127.0.0.1/health >/dev/null \
         || fail "The local PiStick server did not pass its health check. Run: journalctl -u pistick-server -n 100"
     systemctl restart pistick-kiosk.service
 }
@@ -488,6 +553,8 @@ print_summary() {
     if [[ "$TEST_MODE" != "1" ]]; then
         printf '\nReboot once so the new controller/input groups apply:\n  sudo reboot\n'
         printf '\nPair a Bluetooth controller over SSH with:\n  bluetoothctl\n'
+        printf '\nOther devices on this Wi-Fi can open:\n  http://pistick.local\n'
+        printf '\nChange the TMDB token over SSH with:\n  sudo pistick-configure-tmdb\n'
     fi
 }
 
@@ -503,6 +570,7 @@ main() {
     write_config
     configure_user_access
     write_xwrapper
+    install_system_helpers
     write_services
     write_update_command
     start_services

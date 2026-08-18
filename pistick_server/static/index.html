@@ -20,7 +20,6 @@
       <input id="search-input" type="search" maxlength="120" autocomplete="off" placeholder="Search">
     </form>
     <button id="profile-button" class="profile-button" type="button">Profiles</button>
-    <button id="settings-button" class="icon-button" type="button" aria-label="Settings" title="Settings">⚙</button>
   </header>
 
   <main id="app" tabindex="-1" aria-live="polite"></main>
@@ -30,21 +29,61 @@
     <div id="details-content"></div>
   </dialog>
 
-  <dialog id="settings-dialog" class="settings-dialog">
-    <form id="settings-form" method="dialog">
-      <div class="dialog-heading-row">
-        <div>
-          <p class="eyebrow">SERVER SETTINGS</p>
-          <h2>TMDB connection</h2>
-        </div>
-        <button id="settings-close" class="round-close static-close" type="button" aria-label="Close settings">×</button>
+  <dialog id="settings-dialog" class="settings-dialog system-settings-dialog">
+    <div class="dialog-heading-row">
+      <div>
+        <p class="eyebrow">HDMI-ONLY CONTROLS</p>
+        <h2>PiStick settings</h2>
       </div>
-      <p class="muted">Your TMDB Read Access Token stays in PiStick Server's private data folder. It is never sent to this browser after being saved.</p>
-      <label class="field-label" for="tmdb-token">TMDB API Read Access Token</label>
-      <textarea id="tmdb-token" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste the long token beginning with eyJ..."></textarea>
-      <p id="settings-message" class="form-message" role="status"></p>
-      <button id="save-settings" class="primary-button full-button" type="submit">Validate and save</button>
-    </form>
+      <button id="settings-close" class="round-close static-close" type="button" aria-label="Close settings">×</button>
+    </div>
+    <p id="settings-message" class="form-message" role="status"></p>
+
+    <section class="system-setting-section">
+      <div class="system-setting-heading">
+        <div>
+          <h3>Other devices</h3>
+          <p id="lan-status" class="muted">Checking LAN access…</p>
+        </div>
+        <button id="lan-toggle" class="secondary-button" type="button">Loading…</button>
+      </div>
+      <p class="setting-detail">When enabled, devices on this Wi-Fi can open <strong id="lan-url">http://pistick.local</strong> without a password.</p>
+    </section>
+
+    <section class="system-setting-section">
+      <div class="system-setting-heading">
+        <div>
+          <h3>Wi-Fi</h3>
+          <p id="wifi-status" class="muted">Checking connection…</p>
+        </div>
+        <button id="wifi-scan" class="secondary-button" type="button">Scan networks</button>
+      </div>
+      <div id="wifi-list" class="device-list"></div>
+    </section>
+
+    <section class="system-setting-section">
+      <div class="system-setting-heading">
+        <div>
+          <h3>Bluetooth controllers</h3>
+          <p id="bluetooth-status" class="muted">Checking Bluetooth…</p>
+        </div>
+        <button id="bluetooth-scan" class="secondary-button" type="button">Pair new controller</button>
+      </div>
+      <div id="bluetooth-list" class="device-list"></div>
+    </section>
+
+    <section class="system-setting-section">
+      <div class="system-setting-heading">
+        <div>
+          <h3>Wired controllers</h3>
+          <p class="muted">Plug a controller into the Zero W USB/data port using an OTG adapter.</p>
+        </div>
+        <button id="wired-refresh" class="secondary-button" type="button">Refresh</button>
+      </div>
+      <div id="wired-list" class="device-list"></div>
+    </section>
+
+    <p class="settings-footnote">The TMDB token is intentionally not available here. Change it over SSH with <code>sudo pistick-configure-tmdb</code>.</p>
   </dialog>
 
   <dialog id="keyboard-dialog" class="keyboard-dialog">

@@ -1,6 +1,6 @@
 # PiStick
 
-> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch replaces the broken Linux installer with a real Raspberry Pi OS Legacy Lite (32-bit Bookworm) appliance setup. It runs the lightweight PiStick server in fullscreen Chromium, starts at boot, includes low-memory tuning and a controller on-screen keyboard, and does not require Qt. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
+> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch replaces the broken Linux installer with a real Raspberry Pi OS Legacy Lite (32-bit Bookworm) appliance setup. It runs the lightweight PiStick server in fullscreen Chromium, starts at boot, includes low-memory tuning, HDMI-only Wi-Fi/controller settings, and optional unauthenticated access at `http://pistick.local`. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
 
 > **Windows localhost-server edition:** the `agent/windows-local-server` branch runs PiStick silently in the Windows background and serves the interface at `http://127.0.0.1:8787`. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
 
@@ -26,6 +26,8 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
 - Autoplaying Videasy and YouTube players with controller subtitle controls
 - Low-memory mode for the original Raspberry Pi Zero W
+- Optional access from other devices on the same Wi-Fi
+- HDMI-only Wi-Fi, Bluetooth, wired-controller, and LAN controls
 - Manual installation with branch-scoped Pi updates and release-scoped Windows updates
 
 ## What you need
@@ -75,7 +77,7 @@ Videasy's docs currently show `player.videasy.net`, which redirects to `player.v
 
 On this Pi Zero W branch, PiStick loads the player inside the fullscreen Raspberry Pi OS Chromium package. This avoids Qt WebEngine and uses the browser's normal media-codec and Gamepad API support. Movies open from **Watch Movie**; TV shows first open the season and episode picker. Controller A toggles playback, X requests English subtitles, Left/Right seeks, and B closes the player.
 
-Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. The localhost interface accepts those documented messages with origin checks and saves the reported position per profile.
+Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. The PiStick web interface accepts those documented messages with origin checks and saves the reported position per profile.
 
 The native Windows WebView2 path can directly read a top-level HTML5 `<video>` element and accepts the same `pistick-playback-progress` messages. If a Windows embed keeps its video inside a different-origin nested iframe, that frame must post progress itself; PiStick does not disable browser security or read through the origin boundary.
 
@@ -120,7 +122,7 @@ This branch's installer is intended for the original Pi Zero W on **Raspberry Pi
 curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-The installer saves private configuration under `/var/lib/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot.
+The installer saves private configuration under `/var/lib/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot. Other devices on the same Wi-Fi can open `http://pistick.local` while LAN access is enabled.
 
 ### Windows Donwload:
 Go to releases and download PiStick.exe
@@ -202,13 +204,14 @@ Both installers:
 The Linux installer also:
 
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
-- Installs Python, Chromium, minimal X11, Openbox, fonts, and Bluetooth support.
+- Installs Python, Chromium, minimal X11, Openbox, fonts, NetworkManager, mDNS, and Bluetooth support.
 - Downloads the dedicated `agent/pi-zero-w` branch and validates its required files and syntax.
 - Stores immutable release snapshots under `/opt/pistick/releases/`.
 - Points `/opt/pistick/current` at the active release.
 - Creates a minimal fullscreen X11 service with no desktop.
 - Starts PiStick at boot and restarts it if it crashes.
 - Installs the manual `pistick-update` command.
+- Installs HDMI-only Wi-Fi and controller controls plus the SSH-only `pistick-configure-tmdb` command.
 - Keeps application releases separate from private configuration and watch data.
 
 The Windows installer also:
@@ -288,9 +291,29 @@ sudo systemctl restart pistick-server.service pistick-kiosk.service
 sudo systemctl stop pistick-kiosk.service
 ```
 
+## HDMI settings and LAN access
+
+On the Pi's **Who's watching?** screen, **Settings** appears beside **Manage Profiles**. It can connect to a new 2.4 GHz Wi-Fi network, pair a Bluetooth controller, show wired controllers, and turn access for other devices on or off.
+
+While LAN access is enabled, phones, tablets, and computers on the same Wi-Fi can open:
+
+```text
+http://pistick.local
+```
+
+There is no login. Remote devices can use the ordinary PiStick interface and share its profiles and watch history, but they cannot open or call the system settings. The server verifies that Wi-Fi, Bluetooth, and LAN-toggle requests originate from the Pi itself.
+
+The TMDB token is also unavailable through the browser. Change it over SSH with:
+
+```bash
+sudo pistick-configure-tmdb
+```
+
 ## Controller setup
 
-A USB controller can be connected through a micro-USB OTG adapter. To pair a Bluetooth controller, connect over SSH and run:
+A USB controller can be connected through a micro-USB OTG adapter. To pair Bluetooth from HDMI, put the controller in pairing mode, open **Settings**, select **Pair new controller**, then select the controller and choose **Pair**.
+
+If the HDMI scan cannot find it, connect over SSH and run:
 
 ```bash
 bluetoothctl
@@ -395,7 +418,7 @@ python3 -c "import pistick_server; print('Server OK')"
 command -v chromium-browser || command -v chromium
 ```
 
-### The TMDB setup screen remains visible
+### The TMDB setup message remains visible
 
 Validate the private configuration file:
 
@@ -409,11 +432,10 @@ Then restart PiStick:
 sudo systemctl restart pistick-server.service pistick-kiosk.service
 ```
 
-If the token was rejected or copied incorrectly, remove only the saved configuration and rerun the installer:
+If the token was rejected or copied incorrectly, replace it through the SSH-only configuration command:
 
 ```bash
-sudo rm /var/lib/pistick/data/config.json
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+sudo pistick-configure-tmdb
 ```
 
 This does not remove profiles or watch history.
@@ -515,6 +537,7 @@ GitHub's automatic source archive is enough; no separate ZIP asset is required. 
 - The playback ad blocker refreshes its public OISD hosts list at most once every 24 hours. That request contains no title, playback URL, profile, or watch-history data. The normalized list is cached locally; private block/allow domains stay in the private configuration.
 - Profiles and watch history stay on the installed device.
 - The TMDB token is stored in the platform-specific private configuration path listed above.
+- Pi LAN access has no authentication. Anyone on the same Wi-Fi who opens the PiStick address can use its profiles and alter ordinary watch state, but system settings and TMDB-token changes remain local/SSH-only.
 - The installer does not collect or store a GitHub credential.
 - The repository's `config.example.json` contains only placeholders. A real `config.json` must never be committed or included in a release.
 

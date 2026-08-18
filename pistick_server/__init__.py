@@ -1,3 +1,3 @@
-"""PiStick's localhost web-server edition."""
+"""PiStick's lightweight web-server edition."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

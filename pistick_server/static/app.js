@@ -19,7 +19,12 @@
     gamepadCooldown: 0,
     lowMemory: requestedPiMode,
     keyboardSubmit: null,
-    keyboardReturnFocus: null
+    keyboardReturnFocus: null,
+    keyboardLayout: "letters",
+    keyboardUpper: false,
+    keyboardTrim: true,
+    keyboardSubmitLabel: "Done",
+    systemStatus: null
   };
 
   var ui = {};
@@ -136,7 +141,9 @@
     card.append(element("p", "muted", error.message || String(error)));
     var row = element("div", "button-row");
     if (retry) row.append(button("Try again", "primary-button", retry));
-    row.append(button("Settings", "secondary-button", function () { openSettings(false); }));
+    if (state.status && state.status.local_control) {
+      row.append(button("System Settings", "secondary-button", openSettings));
+    }
     card.append(row);
     page.append(card);
     ui.app.replaceChildren(page);
@@ -231,7 +238,7 @@
     var panel = element("div", "profiles-panel");
     panel.append(element("p", "eyebrow", "PISTICK SERVER"));
     panel.append(element("h1", "", manage ? "Manage profiles" : "Who's watching?"));
-    panel.append(element("p", "profiles-subtitle", manage ? "Names and watch histories are saved on this PC." : "Choose a server-side profile to continue."));
+    panel.append(element("p", "profiles-subtitle", manage ? "Names and watch histories are saved on this Pi." : "Choose a profile to continue."));
 
     if (manage) {
       var list = element("div", "manage-list");
@@ -246,12 +253,13 @@
       state.profiles.forEach(function (profile) { grid.append(profileCard(profile)); });
       if (state.profiles.length < 8) grid.append(addProfileCard());
       panel.append(grid);
-      panel.append(button("Manage Profiles", "secondary-button", function () { renderProfiles(true); }));
+      var profileActions = element("div", "profile-actions");
+      profileActions.append(button("Manage Profiles", "secondary-button", function () { renderProfiles(true); }));
+      if (state.status && state.status.local_control) {
+        profileActions.append(button("Settings", "secondary-button", openSettings));
+      }
+      panel.append(profileActions);
     }
-
-    var settings = button("Server Settings", "nav-button", function () { openSettings(false); });
-    settings.style.marginTop = "18px";
-    panel.append(settings);
     page.append(panel);
     ui.app.replaceChildren(page);
     window.setTimeout(focusFirst, 50);
@@ -332,6 +340,10 @@
       return;
     }
     state.currentView = "home";
+    if (state.status && !state.status.tmdb_configured) {
+      renderSshSetupPage();
+      return;
+    }
     setHeader(true);
     setActiveNav("home");
     var token = ++state.loadToken;
@@ -350,8 +362,33 @@
     } catch (error) {
       if (token !== state.loadToken) return;
       errorPage(error, renderHome);
-      if (!state.status.tmdb_configured) openSettings(true);
     }
+  }
+
+  function renderSshSetupPage() {
+    state.currentView = "setup";
+    setHeader(false);
+    var page = element("section", "profiles-page");
+    var panel = element("div", "profiles-panel setup-panel");
+    panel.append(element("p", "eyebrow", "ONE SSH STEP REQUIRED"));
+    panel.append(element("h1", "", "Add your TMDB token"));
+    panel.append(element("p", "profiles-subtitle", "For security, the token cannot be entered or changed in a web browser."));
+    var command = element("code", "setup-command", "sudo pistick-configure-tmdb");
+    panel.append(command);
+    var actions = element("div", "profile-actions");
+    actions.append(button("Check again", "primary-button", async function () {
+      state.status = await api("/api/status");
+      if (state.status.tmdb_configured) renderHome();
+      else showToast("The TMDB token is not configured yet.");
+    }));
+    actions.append(button("Profiles", "secondary-button", function () { renderProfiles(false); }));
+    if (state.status && state.status.local_control) {
+      actions.append(button("Settings", "secondary-button", openSettings));
+    }
+    panel.append(actions);
+    page.append(panel);
+    ui.app.replaceChildren(page);
+    window.setTimeout(focusFirst, 40);
   }
 
   function resultPage(title, subtitle, items) {
@@ -739,17 +776,190 @@
     try { ui.playerFrame.contentWindow.postMessage(message, "*"); } catch (error) { /* cross-origin-safe best effort */ }
   }
 
-  function openSettings(required) {
-    ui.settingsMessage.textContent = state.status && state.status.tmdb_configured ? "A token is already saved. Paste a new one only to replace it." : "A TMDB token is required before titles can load.";
-    ui.settingsMessage.classList.remove("success");
-    ui.settingsToken.value = "";
-    ui.settingsDialog.dataset.required = required ? "1" : "0";
+  function settingsMessage(message, success) {
+    ui.settingsMessage.textContent = String(message || "");
+    ui.settingsMessage.classList.toggle("success", Boolean(success));
+  }
+
+  function emptyDeviceMessage(message) {
+    return element("div", "device-empty", message);
+  }
+
+  function deviceRow(title, detail, actionLabel, onAction) {
+    var row = element("div", "device-row");
+    var copy = element("div", "device-copy");
+    copy.append(element("strong", "", title), element("span", "muted", detail));
+    row.append(copy);
+    if (actionLabel && onAction) row.append(button(actionLabel, "secondary-button", onAction));
+    return row;
+  }
+
+  function renderWiredControllers(controllers) {
+    ui.wiredList.replaceChildren();
+    if (!controllers || !controllers.length) {
+      ui.wiredList.append(emptyDeviceMessage("No wired controller detected."));
+      return;
+    }
+    controllers.forEach(function (controller) {
+      ui.wiredList.append(deviceRow(controller.name || "USB controller", controller.handlers || "Connected"));
+    });
+  }
+
+  function renderBluetoothDevices(devices) {
+    ui.bluetoothList.replaceChildren();
+    if (!devices || !devices.length) {
+      ui.bluetoothList.append(emptyDeviceMessage("No paired Bluetooth controllers found."));
+      return;
+    }
+    devices.forEach(function (device) {
+      var status = device.connected ? "Connected" : (device.paired ? "Paired" : device.address);
+      var action = device.connected ? "" : (device.paired ? "Connect" : "Pair");
+      ui.bluetoothList.append(deviceRow(device.name || device.address, status, action, action ? function () {
+        pairBluetoothController(device);
+      } : null));
+    });
+  }
+
+  function renderSystemStatus(payload) {
+    state.systemStatus = payload;
+    ui.lanUrl.textContent = payload.lan_url || "http://pistick.local";
+    ui.lanStatus.textContent = payload.lan_enabled ? "Available to devices on this Wi-Fi." : "Only the HDMI screen can connect.";
+    ui.lanToggle.textContent = payload.lan_enabled ? "Turn off" : "Turn on";
+    ui.lanToggle.dataset.enabled = payload.lan_enabled ? "1" : "0";
+
+    var wifi = payload.wifi || {};
+    if (!wifi.available) ui.wifiStatus.textContent = "Wi-Fi controls are unavailable.";
+    else if (wifi.connected) {
+      ui.wifiStatus.textContent = "Connected to " + wifi.ssid + (wifi.ipv4 ? " · " + wifi.ipv4 : "");
+    } else ui.wifiStatus.textContent = "Not connected.";
+
+    var bluetooth = payload.bluetooth || {};
+    ui.bluetoothStatus.textContent = bluetooth.powered ? "Bluetooth is on." : "Bluetooth is off or unavailable.";
+    renderBluetoothDevices(bluetooth.devices || []);
+    renderWiredControllers(payload.wired_controllers || []);
+  }
+
+  async function refreshSystemStatus() {
+    settingsMessage("Refreshing device status…", false);
+    try {
+      var payload = await api("/api/system/status");
+      renderSystemStatus(payload);
+      settingsMessage("", false);
+    } catch (error) {
+      settingsMessage(error.message, false);
+    }
+  }
+
+  async function openSettings() {
+    if (!state.status || !state.status.local_control) {
+      showToast("System settings are available only on the Pi HDMI screen.");
+      return;
+    }
     if (!ui.settingsDialog.open) ui.settingsDialog.showModal();
-    window.setTimeout(function () { ui.settingsToken.focus(); }, 40);
+    await refreshSystemStatus();
   }
 
   function closeSettings() {
     if (ui.settingsDialog.open) ui.settingsDialog.close();
+  }
+
+  async function toggleLanAccess() {
+    var enabled = !(state.systemStatus && state.systemStatus.lan_enabled);
+    ui.lanToggle.disabled = true;
+    settingsMessage((enabled ? "Turning on" : "Turning off") + " access for other devices…", false);
+    try {
+      var payload = await api("/api/system/lan", { method: "POST", body: { enabled: enabled } });
+      state.systemStatus.lan_enabled = payload.lan_enabled;
+      state.status.lan_enabled = payload.lan_enabled;
+      renderSystemStatus(state.systemStatus);
+      settingsMessage(payload.lan_enabled ? "Other devices can now open PiStick." : "LAN access is now off.", true);
+    } catch (error) {
+      settingsMessage(error.message, false);
+    } finally {
+      ui.lanToggle.disabled = false;
+    }
+  }
+
+  async function scanWifiNetworks() {
+    ui.wifiScan.disabled = true;
+    ui.wifiList.replaceChildren(emptyDeviceMessage("Scanning nearby Wi-Fi networks…"));
+    settingsMessage("Wi-Fi scan can take several seconds.", false);
+    try {
+      var payload = await api("/api/system/wifi/scan", { method: "POST", body: {} });
+      ui.wifiList.replaceChildren();
+      var networks = payload.networks || [];
+      if (!networks.length) ui.wifiList.append(emptyDeviceMessage("No Wi-Fi networks found."));
+      networks.forEach(function (network) {
+        var detail = network.signal + "% · " + network.security + (network.connected ? " · Connected" : "");
+        ui.wifiList.append(deviceRow(network.ssid, detail, network.connected ? "" : "Connect", network.connected ? null : function () {
+          connectWifiNetwork(network);
+        }));
+      });
+      settingsMessage("Choose a Wi-Fi network to connect.", true);
+    } catch (error) {
+      ui.wifiList.replaceChildren();
+      settingsMessage(error.message, false);
+    } finally {
+      ui.wifiScan.disabled = false;
+    }
+  }
+
+  function connectWifiNetwork(network) {
+    var connect = async function (password) {
+      closeControllerKeyboard();
+      settingsMessage("Connecting to " + network.ssid + "…", false);
+      try {
+        await api("/api/system/wifi/connect", {
+          method: "POST",
+          body: { ssid: network.ssid, password: password || "" }
+        });
+        settingsMessage("Connected to " + network.ssid + ".", true);
+        await refreshSystemStatus();
+      } catch (error) {
+        settingsMessage(error.message + " Check the password and try again.", false);
+      }
+    };
+    if (network.security === "Open") {
+      connect("");
+      return;
+    }
+    openControllerKeyboard(
+      "Password for " + network.ssid,
+      "",
+      "Connect",
+      connect,
+      { password: true, trim: false }
+    );
+  }
+
+  async function scanBluetoothControllers() {
+    ui.bluetoothScan.disabled = true;
+    ui.bluetoothList.replaceChildren(emptyDeviceMessage("Put the controller in pairing mode. Scanning…"));
+    settingsMessage("Bluetooth scan can take about 10 seconds.", false);
+    try {
+      var payload = await api("/api/system/bluetooth/scan", { method: "POST", body: {} });
+      renderBluetoothDevices(payload.devices || []);
+      settingsMessage("Choose your controller, then select Pair.", true);
+    } catch (error) {
+      ui.bluetoothList.replaceChildren();
+      settingsMessage(error.message, false);
+    } finally {
+      ui.bluetoothScan.disabled = false;
+    }
+  }
+
+  async function pairBluetoothController(device) {
+    settingsMessage("Pairing " + (device.name || device.address) + "…", false);
+    try {
+      await api("/api/system/bluetooth/pair", {
+        method: "POST",
+        body: { address: device.address }
+      });
+      settingsMessage("Controller paired and connected.", true);
+      await refreshSystemStatus();
+    } catch (error) {
+      settingsMessage(error.message, false);
+    }
   }
 
   function closeControllerKeyboard() {
@@ -769,7 +979,8 @@
   }
 
   function submitControllerKeyboard() {
-    var value = String(ui.keyboardValue.value || "").trim();
+    var rawValue = String(ui.keyboardValue.value || "");
+    var value = state.keyboardTrim ? rawValue.trim() : rawValue;
     if (!value) {
       showToast("Enter at least one character.");
       return;
@@ -781,23 +992,54 @@
     if (callback) Promise.resolve(callback(value)).catch(function (error) { showToast(error.message || error); });
   }
 
-  function openControllerKeyboard(title, initialValue, submitLabel, onSubmit) {
-    state.keyboardReturnFocus = document.activeElement;
-    state.keyboardSubmit = onSubmit;
-    ui.keyboardTitle.textContent = title || "Enter text";
-    ui.keyboardValue.value = String(initialValue || "").slice(0, 120);
+  function renderControllerKeyboardKeys() {
     ui.keyboardGrid.replaceChildren();
-
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split("").forEach(function (character) {
+    var characters;
+    if (state.keyboardLayout === "symbols") {
+      characters = ["!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "-", "_", "=", "+", "[", "]", "{", "}", ";", ":", "'", "\"", ",", ".", "<", ">", "/", "?", "\\", "|", "`", "~"];
+    } else {
+      var alphabet = state.keyboardUpper ? "ABCDEFGHIJKLMNOPQRSTUVWXYZ" : "abcdefghijklmnopqrstuvwxyz";
+      characters = (alphabet + "0123456789").split("");
+    }
+    characters.forEach(function (character) {
       ui.keyboardGrid.append(button(character, "keyboard-key", function () { appendKeyboardText(character); }));
     });
+    if (state.keyboardLayout === "letters") {
+      ui.keyboardGrid.append(button(state.keyboardUpper ? "lowercase" : "UPPERCASE", "keyboard-key keyboard-wide", function () {
+        state.keyboardUpper = !state.keyboardUpper;
+        renderControllerKeyboardKeys();
+      }));
+      ui.keyboardGrid.append(button("#+=", "keyboard-key keyboard-action", function () {
+        state.keyboardLayout = "symbols";
+        renderControllerKeyboardKeys();
+      }));
+    } else {
+      ui.keyboardGrid.append(button("ABC", "keyboard-key keyboard-wide", function () {
+        state.keyboardLayout = "letters";
+        renderControllerKeyboardKeys();
+      }));
+    }
     ui.keyboardGrid.append(button("Space", "keyboard-key keyboard-wide", function () { appendKeyboardText(" "); }));
     ui.keyboardGrid.append(button("⌫ Backspace", "keyboard-key keyboard-wide", function () {
       ui.keyboardValue.value = ui.keyboardValue.value.slice(0, -1);
     }));
     ui.keyboardGrid.append(button("Clear", "keyboard-key keyboard-action", function () { ui.keyboardValue.value = ""; }));
     ui.keyboardGrid.append(button("Cancel", "keyboard-key keyboard-action", closeControllerKeyboard));
-    ui.keyboardGrid.append(button(submitLabel || "Done", "keyboard-key keyboard-submit", submitControllerKeyboard));
+    ui.keyboardGrid.append(button(state.keyboardSubmitLabel, "keyboard-key keyboard-submit", submitControllerKeyboard));
+  }
+
+  function openControllerKeyboard(title, initialValue, submitLabel, onSubmit, options) {
+    var keyboardOptions = options || {};
+    state.keyboardReturnFocus = document.activeElement;
+    state.keyboardSubmit = onSubmit;
+    state.keyboardLayout = "letters";
+    state.keyboardUpper = false;
+    state.keyboardTrim = keyboardOptions.trim !== false;
+    state.keyboardSubmitLabel = submitLabel || "Done";
+    ui.keyboardTitle.textContent = title || "Enter text";
+    ui.keyboardValue.type = keyboardOptions.password ? "password" : "text";
+    ui.keyboardValue.value = String(initialValue || "").slice(0, 120);
+    renderControllerKeyboardKeys();
 
     if (!ui.keyboardDialog.open) ui.keyboardDialog.showModal();
     window.setTimeout(function () {
@@ -984,15 +1226,23 @@
     ui.searchForm = document.getElementById("search-form");
     ui.searchInput = document.getElementById("search-input");
     ui.profileButton = document.getElementById("profile-button");
-    ui.settingsButton = document.getElementById("settings-button");
     ui.detailsDialog = document.getElementById("details-dialog");
     ui.detailsContent = document.getElementById("details-content");
     ui.detailsClose = document.getElementById("details-close");
     ui.settingsDialog = document.getElementById("settings-dialog");
-    ui.settingsForm = document.getElementById("settings-form");
-    ui.settingsToken = document.getElementById("tmdb-token");
     ui.settingsMessage = document.getElementById("settings-message");
     ui.settingsClose = document.getElementById("settings-close");
+    ui.lanStatus = document.getElementById("lan-status");
+    ui.lanToggle = document.getElementById("lan-toggle");
+    ui.lanUrl = document.getElementById("lan-url");
+    ui.wifiStatus = document.getElementById("wifi-status");
+    ui.wifiScan = document.getElementById("wifi-scan");
+    ui.wifiList = document.getElementById("wifi-list");
+    ui.bluetoothStatus = document.getElementById("bluetooth-status");
+    ui.bluetoothScan = document.getElementById("bluetooth-scan");
+    ui.bluetoothList = document.getElementById("bluetooth-list");
+    ui.wiredRefresh = document.getElementById("wired-refresh");
+    ui.wiredList = document.getElementById("wired-list");
     ui.keyboardDialog = document.getElementById("keyboard-dialog");
     ui.keyboardTitle = document.getElementById("keyboard-title");
     ui.keyboardValue = document.getElementById("keyboard-value");
@@ -1017,9 +1267,12 @@
       renderSearch(ui.searchInput.value);
     });
     ui.profileButton.addEventListener("click", function () { renderProfiles(false); });
-    ui.settingsButton.addEventListener("click", function () { openSettings(false); });
     ui.detailsClose.addEventListener("click", closeDetails);
     ui.settingsClose.addEventListener("click", closeSettings);
+    ui.lanToggle.addEventListener("click", toggleLanAccess);
+    ui.wifiScan.addEventListener("click", scanWifiNetworks);
+    ui.bluetoothScan.addEventListener("click", scanBluetoothControllers);
+    ui.wiredRefresh.addEventListener("click", refreshSystemStatus);
     ui.keyboardClose.addEventListener("click", closeControllerKeyboard);
     ui.playerClose.addEventListener("click", closePlayer);
     ui.playerFullscreen.addEventListener("click", function () {
@@ -1045,26 +1298,6 @@
       event.preventDefault();
       closeControllerKeyboard();
     });
-    ui.settingsForm.addEventListener("submit", async function (event) {
-      event.preventDefault();
-      var token = ui.settingsToken.value.trim();
-      ui.settingsMessage.textContent = "Validating with TMDB…";
-      ui.settingsMessage.classList.remove("success");
-      try {
-        await api("/api/settings/tmdb", { method: "POST", body: { token: token } });
-        state.status = await api("/api/status");
-        ui.settingsToken.value = "";
-        ui.settingsMessage.textContent = "Token saved on the server.";
-        ui.settingsMessage.classList.add("success");
-        window.setTimeout(function () {
-          closeSettings();
-          if (state.activeProfile) renderHome();
-        }, 650);
-      } catch (error) {
-        ui.settingsMessage.textContent = error.message;
-      }
-    });
-
     window.addEventListener("message", function (event) {
       if (!state.player || state.player.trailer) return;
       if (event.origin !== "https://player.videasy.to" && event.origin !== "https://player.videasy.net") return;
@@ -1090,7 +1323,6 @@
       state.lowMemory = state.lowMemory || Boolean(state.status.low_memory);
       document.documentElement.classList.toggle("pi-zero-w", state.lowMemory);
       await refreshProfiles();
-      if (!state.status.tmdb_configured) openSettings(true);
       if (state.activeProfile) await renderHome();
       else renderProfiles(false);
     } catch (error) {

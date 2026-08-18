@@ -9,8 +9,7 @@ on:
       - "pistick_server/**"
       - "playback_api.py"
       - "server.py"
-      - "tests/test_installer.sh"
-      - "tests/test_local_server.py"
+      - "tests/**"
       - ".github/workflows/pi-zero-w-ci.yml"
   push:
     branches:
@@ -22,8 +21,7 @@ on:
       - "pistick_server/**"
       - "playback_api.py"
       - "server.py"
-      - "tests/test_installer.sh"
-      - "tests/test_local_server.py"
+      - "tests/**"
       - ".github/workflows/pi-zero-w-ci.yml"
 
 permissions:
