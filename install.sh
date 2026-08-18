@@ -388,6 +388,7 @@ EOF
 
 install_system_helpers() {
     step "Installing HDMI-only network and controller controls"
+    local sudoers_temporary="${SUDOERS_PATH}.tmp"
     install -d -m 0755 "$LOCAL_LIBEXEC" "$LOCAL_BIN" "$(dirname "$SUDOERS_PATH")"
     install -m 0755 \
         "${INSTALL_ROOT}/current/pi/pistick-system-helper.py" \
@@ -395,16 +396,20 @@ install_system_helpers() {
     install -m 0755 \
         "${INSTALL_ROOT}/current/pi/configure-tmdb.sh" \
         "${LOCAL_BIN}/pistick-configure-tmdb"
-    cat >"$SUDOERS_PATH" <<EOF
+    cat >"$sudoers_temporary" <<EOF
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper status
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper wifi-scan
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper wifi-connect
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper bluetooth-scan
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper bluetooth-pair
 EOF
-    chmod 0440 "$SUDOERS_PATH"
+    chmod 0440 "$sudoers_temporary"
     if [[ "$TEST_MODE" != "1" ]]; then
-        visudo -cf "$SUDOERS_PATH" >/dev/null || fail "The PiStick system-control permission file is invalid."
+        visudo -cf "$sudoers_temporary" >/dev/null \
+            || fail "The PiStick system-control permission file is invalid."
+    fi
+    mv -f "$sudoers_temporary" "$SUDOERS_PATH"
+    if [[ "$TEST_MODE" != "1" ]]; then
         hostnamectl set-hostname pistick
         python3 - /etc/hosts <<'PY'
 from pathlib import Path
