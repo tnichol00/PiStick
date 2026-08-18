@@ -34,6 +34,15 @@ MAX_JSON_BODY = 1_000_000
 LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
 
 
+def _low_memory_enabled() -> bool:
+    return os.getenv("PISTICK_LOW_MEMORY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 @dataclass
 class Response:
     status: int
@@ -108,6 +117,7 @@ class PiStickApplication:
         self.config = ConfigStore(self.data_dir / "config.json")
         self.state = WatchStateStore(self.data_dir / "state.json")
         self.static_dir = Path(static_dir or Path(__file__).with_name("static")).resolve()
+        self.low_memory = _low_memory_enabled()
         self.tmdb = tmdb or TMDBClient(
             lambda: self.config.tmdb_read_token,
             self.data_dir / "cache" / "tmdb",
@@ -147,13 +157,19 @@ class PiStickApplication:
 
     def _decorate_home(self, profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         continue_items = self.state.continue_watching(profile_id)
+        item_limit = 12 if self.low_memory else None
+        if item_limit is not None:
+            continue_items = continue_items[:item_limit]
         rows = []
         if continue_items:
             rows.append({"title": "Continue Watching", "items": continue_items})
         for row in payload.get("rows", []):
+            source_items = row.get("items", [])
+            if item_limit is not None:
+                source_items = source_items[:item_limit]
             items = [
                 self.state.decorate(profile_id, media)
-                for media in row.get("items", [])
+                for media in source_items
                 if isinstance(media, dict)
             ]
             rows.append({"title": row.get("title", "Explore"), "items": items})
@@ -183,6 +199,7 @@ class PiStickApplication:
                     {
                         "name": "PiStick Server",
                         "version": __version__,
+                        "low_memory": self.low_memory,
                         **self.config.public_payload(),
                     }
                 )
@@ -227,6 +244,8 @@ class PiStickApplication:
                 page = _integer(self._query_value(query, "page", "1"), "Page", 1, 500)
                 profile_id = self._profile_id(self._query_value(query, "profile_id"))
                 payload = self.tmdb.discover(match.group(1), page)
+                if self.low_memory:
+                    payload["items"] = payload["items"][:12]
                 payload["items"] = [
                     self.state.decorate(profile_id, item) for item in payload["items"]
                 ]
@@ -236,6 +255,8 @@ class PiStickApplication:
                 profile_id = self._profile_id(self._query_value(query, "profile_id"))
                 page = _integer(self._query_value(query, "page", "1"), "Page", 1, 500)
                 payload = self.tmdb.search(self._query_value(query, "q"), page)
+                if self.low_memory:
+                    payload["items"] = payload["items"][:12]
                 payload["items"] = [
                     self.state.decorate(profile_id, item) for item in payload["items"]
                 ]

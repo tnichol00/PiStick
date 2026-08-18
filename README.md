@@ -1,5 +1,7 @@
 # PiStick
 
+> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch replaces the broken Linux installer with a real Raspberry Pi OS Legacy Lite (32-bit Bookworm) appliance setup. It runs the lightweight PiStick server in fullscreen Chromium, starts at boot, includes low-memory tuning and a controller on-screen keyboard, and does not require Qt. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
+
 > **Windows localhost-server edition:** the `agent/windows-local-server` branch runs PiStick silently in the Windows background and serves the interface at `http://127.0.0.1:8787`. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
 
 > **Standalone iPhone and iPad edition:** the `agent/ios-standalone` branch contains a universal on-device app with no Python process or PiStick server. It includes a Loop-style GitHub Actions/TestFlight build. See [ios/README.md](ios/README.md) for setup and installation.
@@ -24,7 +26,7 @@ PiStick is currently an alpha. Browsing, profiles, trailers, watch-state feature
 - Strong playback-only ad, tracker, adult-site, pop-up, and redirect blocking
 - Autoplaying Videasy and YouTube players with controller subtitle controls
 - Low-memory mode for the original Raspberry Pi Zero W
-- Manual, published-release-only installation and updates
+- Manual installation with branch-scoped Pi updates and release-scoped Windows updates
 
 ## What you need
 
@@ -71,9 +73,9 @@ https://player.videasy.to/tv/1399/1/3
 
 Videasy's docs currently show `player.videasy.net`, which redirects to `player.videasy.to`. PiStick uses the final HTTPS origin directly so its anti-popup navigation lock does not reject that redirect. When saved progress exists, PiStick appends only Videasy's documented `progress` parameter, such as `?progress=120`.
 
-On Raspberry Pi, PiStick loads the resulting page in Qt WebEngine. On a Windows test PC, movie and episode playback uses Windows' Edge WebView2 engine so H.264/AAC HLS streams are not limited by Qt WebEngine's build-time codec selection. Movies open and autoplay from **Watch Movie**. TV shows first open the season and episode picker, then the selected episode opens and autoplays in the same player. The player expands fullscreen after opening. Subtitles begin off; controller X toggles the available English track. Controller A toggles play/pause and reveals the timeline, timestamps, volume, and player buttons; Left/Right seeks backward/forward 10 seconds, and B or keyboard Escape closes playback directly back to the title details screen.
+On this Pi Zero W branch, PiStick loads the player inside the fullscreen Raspberry Pi OS Chromium package. This avoids Qt WebEngine and uses the browser's normal media-codec and Gamepad API support. Movies open from **Watch Movie**; TV shows first open the season and episode picker. Controller A toggles playback, X requests English subtitles, Left/Right seeks, and B closes the player.
 
-Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. PiStick accepts those documented messages and also keeps its HTML5-video bridge as a fallback. Qt WebEngine on the Pi injects the bridge into the top page and every nested frame. An ordinary HTML5 `<video>` element is detected in whichever frame owns it, receives the resume position locally, and relays its progress to the top page with `window.postMessage()`—PiStick never reads a cross-origin frame's DOM from its parent.
+Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. The localhost interface accepts those documented messages with origin checks and saves the reported position per profile.
 
 The native Windows WebView2 path can directly read a top-level HTML5 `<video>` element and accepts the same `pistick-playback-progress` messages. If a Windows embed keeps its video inside a different-origin nested iframe, that frame must post progress itself; PiStick does not disable browser security or read through the origin boundary.
 
@@ -93,37 +95,13 @@ An in-progress TV show exposes separate **Mark Episode as Finished** and **Mark 
 
 Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
 
-### Playback ad blocker
+### Playback sandbox
 
-Ad blocking is enabled by default only for movie and episode playback. YouTube trailers keep their separate, unfiltered browser profile so a playback rule cannot break trailers.
-
-PiStick combines its built-in rules with the maintained [oisd big blocklist](https://oisd.nl/). The list is downloaded directly over HTTPS, validated, normalized, cached locally, and refreshed in the background when it is more than 24 hours old. If the first download or a later refresh fails, playback continues with the last cache and built-in rules. Videasy's player and core source/subtitle API hosts are explicitly allowed so a broad public list cannot block the player itself.
-
-On Raspberry Pi, the Qt WebEngine profile blocks matching hosts before requests reach Chromium, rejects pop-up windows and off-origin top-level redirects, and injects cosmetic filtering into every frame. On Windows, all playback WebView2 requests—including requests from cross-origin nested frames—pass through a random-port proxy bound only to `127.0.0.1`. The proxy checks the destination hostname and then tunnels allowed HTTPS bytes unchanged; it does not decrypt, inspect, or modify the video stream. If `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` already contains a different proxy, PiStick preserves it and falls back to browser/in-page filtering.
-
-On both engines, nested playback frames are sandboxed with only the permissions needed for scripts, autoplay, encrypted media, and fullscreen playback. Pop-ups, downloads, payment requests, and attempts to navigate the top-level PiStick player are not permitted. PiStick blocks dynamic scripts from known ad hosts synchronously, before their requests can race the DOM observer. It does not disable browser security or broadly block URL paths that might contain video, HLS, or subtitle data.
-
-Extra block or allow domains can be added privately without changing tracked code:
-
-```json
-{
-  "adblock_enabled": true,
-  "adblock_online_lists": true,
-  "adblock_domains": [
-    "ads.example",
-    "*.popups.example"
-  ],
-  "adblock_allow_domains": [
-    "video-cdn.example"
-  ]
-}
-```
-
-Add only hostnames, without `https://`, a path, or a query. The installer preserves these fields during updates and rollback. If a legitimate provider or CDN is blocked, add it to `adblock_allow_domains`. Set `adblock_online_lists` to `false` to use only built-in/private rules, or set `adblock_enabled` to `false` to disable all playback filtering.
+On this Pi branch, every third-party player is placed in a restricted cross-origin iframe. Pop-up windows, downloads, payment requests, and top-level navigation are not granted. The full desktop and Windows editions have additional engine-specific host filtering; those filters are not claimed by this lightweight Chromium edition.
 
 ## Install PiStick
 
-Both installers download the newest published, non-draft [PiStick Release](https://github.com/tnichol00/PiStick/releases). They do not install unfinished branch code or set up automatic updates.
+The Pi installer follows only `agent/pi-zero-w`. The Windows installer uses its separate Windows release process.
 
 ### Get the required TMDB token
 
@@ -136,20 +114,20 @@ PiStick uses the long Read Access Token as a Bearer token. Do not use the shorte
 
 ### Linux / Raspberry Pi command
 
-PiStick's Linux installer is intended for Raspberry Pi OS or another supported Debian-based Raspberry Pi installation. Paste this command into the Pi's SSH terminal:
+This branch's installer is intended for the original Pi Zero W on **Raspberry Pi OS Legacy Lite (32-bit, Bookworm)**. Follow the separate [Pi Zero W installation and controller guide](PI_ZERO_W_README.md). The installation command is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
-The installer saves private configuration under `/etc/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot.
+The installer saves private configuration under `/var/lib/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot.
 
 ### Windows Donwload:
 Go to releases and download PiStick.exe
 
 ### Raspberry Pi OS setup details
 
-PiStick is designed for a fresh **Raspberry Pi OS Lite (32-bit)** installation. It adds only the graphical components needed to run the app, not a normal desktop, taskbar, file manager, or desktop icons.
+PiStick is designed for a fresh **Raspberry Pi OS Legacy Lite (32-bit, Bookworm)** installation. It adds only the graphical components needed to run the app, not a normal desktop, taskbar, file manager, or desktop icons.
 
 The finished boot flow is:
 
@@ -162,7 +140,7 @@ Power on -> Raspberry Pi OS Lite -> minimal X11 session -> PiStick fullscreen
 1. Install [Raspberry Pi Imager](https://www.raspberrypi.com/software/) on your computer.
 2. Insert the microSD card. Everything currently on the selected card will be erased.
 3. In Imager, choose your Raspberry Pi model.
-4. Choose **Raspberry Pi OS Lite (32-bit)**. Do not choose a 64-bit image for an original Pi Zero W.
+4. Under **Raspberry Pi OS (other)**, choose **Raspberry Pi OS (Legacy) Lite (32-bit)** and confirm it says Debian Bookworm. Do not choose Trixie or a 64-bit image for an original Pi Zero W.
 5. Open OS customization and set:
    - Hostname: `pistick`
    - Username: `pistick`
@@ -197,7 +175,7 @@ Replace `192.168.1.123` with the Pi's actual address.
 After copying the TMDB token, run the Linux command shown above:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
 The installer prompts for:
@@ -206,9 +184,9 @@ The installer prompts for:
 Paste your TMDB API Read Access Token:
 ```
 
-Paste the token and press Enter. The prompt is hidden, so the value does not appear while it is pasted or typed. It is stored only in `/etc/pistick/config.json` on the Pi.
+Paste the token and press Enter. The prompt is hidden, so the value does not appear while it is pasted or typed. It is stored only in `/var/lib/pistick/data/config.json` on the Pi.
 
-The first installation can take a while on an original Pi Zero W because the Pi must download and install Qt WebEngine and the other system packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again; completed package work and configuration are reused.
+The first installation can take a while on an original Pi Zero W because the Pi must download Chromium and the minimal display packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again.
 
 When installation succeeds, PiStick starts immediately and launches automatically after every boot.
 
@@ -217,9 +195,6 @@ When installation succeeds, PiStick starts immediately and launches automaticall
 Both installers:
 
 - Validate the TMDB API Read Access Token before saving it.
-- Download the newest published PiStick GitHub Release, never an unfinished branch commit.
-- Ignore draft releases while allowing published pre-releases.
-- Validate the release manifest, required files, configuration JSON, and Python syntax.
 - Keep private configuration, profiles, history, and caches outside release folders.
 - Preserve existing user data when the installer is run again.
 - Avoid timers, scheduled tasks, cron jobs, automatic update checks, and `git pull` workflows.
@@ -227,13 +202,14 @@ Both installers:
 The Linux installer also:
 
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
-- Installs Python, Requests, pygame, PyQt5, Qt WebEngine, minimal X11, Matchbox, fonts, graphics libraries, and Bluetooth support.
+- Installs Python, Chromium, minimal X11, Openbox, fonts, and Bluetooth support.
+- Downloads the dedicated `agent/pi-zero-w` branch and validates its required files and syntax.
 - Stores immutable release snapshots under `/opt/pistick/releases/`.
 - Points `/opt/pistick/current` at the active release.
 - Creates a minimal fullscreen X11 service with no desktop.
 - Starts PiStick at boot and restarts it if it crashes.
 - Installs the manual `pistick-update` command.
-- Preserves the previous release and rolls back if a new release fails its startup check.
+- Keeps application releases separate from private configuration and watch data.
 
 The Windows installer also:
 
@@ -258,18 +234,17 @@ On Windows, rerun the Windows installation command, or run the saved installer d
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\PiStick\install.ps1"
 ```
 
-Each updater checks the published [PiStick Releases](https://github.com/tnichol00/PiStick/releases), selects the most recently published non-draft release, and safely reuses private user data.
+The Pi updater downloads the newest `agent/pi-zero-w` commit and safely reuses private user data. The Windows updater continues to use the Windows release process.
 
-When a new Linux release exists, the updater:
+When a new Pi branch commit exists, the updater:
 
-1. Downloads it without changing the running release.
+1. Downloads the branch installer and source without changing private data.
 2. Validates its required files and syntax.
-3. Stops PiStick only after validation succeeds.
-4. Activates the new release and watches its startup health.
+3. Activates a new versioned application snapshot.
+4. Restarts the services and checks the local server's health.
 5. Keeps the user's TMDB token, profiles, watch history, and caches.
-6. Automatically returns to the previous release if startup fails.
 
-Neither updater installs a normal tag, branch commit, or draft release.
+The Pi updater intentionally follows only the dedicated Pi Zero W branch.
 
 ## Persistent files
 
@@ -277,10 +252,10 @@ These files survive every update:
 
 | Purpose | Linux / Raspberry Pi | Windows |
 | --- | --- | --- |
-| Private TMDB and playback configuration | `/etc/pistick/config.json` | `%LOCALAPPDATA%\PiStick\data\config.json` |
-| Profiles, watch history, and resume timestamps | `/var/lib/pistick/user-data.json` | `%LOCALAPPDATA%\PiStick\data\pistick_state.json` |
-| Active release record | `/var/lib/pistick/installed-release.json` | `%LOCALAPPDATA%\PiStick\current-release.txt` |
-| Posters, API data, and browser cache | `/var/cache/pistick/` | `%LOCALAPPDATA%\PiStick\cache\` |
+| Private TMDB configuration | `/var/lib/pistick/data/config.json` | `%LOCALAPPDATA%\PiStick\data\config.json` |
+| Profiles, watch history, and resume timestamps | `/var/lib/pistick/data/state.json` | `%LOCALAPPDATA%\PiStick\data\pistick_state.json` |
+| Application releases | `/opt/pistick/releases/` | `%LOCALAPPDATA%\PiStick\releases\` |
+| Posters, API data, and browser cache | `/var/lib/pistick/data/cache/` and `/var/cache/pistick/` | `%LOCALAPPDATA%\PiStick\cache\` |
 
 The Linux service and Windows launcher pass these locations to the app through `PISTICK_CONFIG_PATH`, `PISTICK_STATE_PATH`, and `PISTICK_CACHE_DIR`.
 
@@ -291,26 +266,26 @@ If an older manual installation exists at `/home/USERNAME/PiStick` on Linux or `
 Check whether PiStick is running:
 
 ```bash
-sudo systemctl status pistick.service
+sudo systemctl status pistick-server.service pistick-kiosk.service
 ```
 
 Follow live logs:
 
 ```bash
-journalctl -u pistick.service -f
+journalctl -u pistick-server.service -u pistick-kiosk.service -f
 ```
 
 Show logs from the current boot:
 
 ```bash
-journalctl -u pistick.service -b --no-pager
+journalctl -u pistick-server.service -u pistick-kiosk.service -b --no-pager
 ```
 
 Restart or stop PiStick:
 
 ```bash
-sudo systemctl restart pistick.service
-sudo systemctl stop pistick.service
+sudo systemctl restart pistick-server.service pistick-kiosk.service
+sudo systemctl stop pistick-kiosk.service
 ```
 
 ## Controller setup
@@ -342,7 +317,7 @@ quit
 Restart PiStick after pairing:
 
 ```bash
-sudo systemctl restart pistick.service
+sudo systemctl restart pistick-kiosk.service
 ```
 
 Controller playback controls:
@@ -395,28 +370,29 @@ Confirm that the original Pi Zero W is using a 2.4 GHz network.
 
 ### GitHub returns HTTP `403`
 
-GitHub may have temporarily rate-limited anonymous release checks. Wait and run the installer again later. PiStick does not request or store a GitHub credential.
+GitHub may have temporarily rate-limited an anonymous branch download. Wait and run the installer again later. PiStick does not request or store a GitHub credential.
 
-### `No published PiStick release exists yet`
+### The Pi branch cannot be downloaded
 
-The installer found no non-draft GitHub Release. A tag or branch by itself is intentionally not installable. Check the [Releases page](https://github.com/tnichol00/PiStick/releases) and try again once a release is published.
+Confirm the branch URL in [PI_ZERO_W_README.md](PI_ZERO_W_README.md), then check that the Pi can reach GitHub with `ping -c 3 github.com`.
 
 ### `pistick-update: command not found`
 
 Rerun the full installation command. It safely reuses the existing private configuration and release data while restoring the updater command.
 
-### `pistick.service` repeatedly restarts or stays failed
+### A PiStick service repeatedly restarts or stays failed
 
 Read the latest error:
 
 ```bash
-journalctl -u pistick.service -b -n 100 --no-pager
+journalctl -u pistick-server.service -u pistick-kiosk.service -b -n 150 --no-pager
 ```
 
-Then check the installed dependencies:
+Then check the installed server and browser:
 
 ```bash
-python3 -c "import requests, pygame; from PyQt5.QtWebEngineWidgets import QWebEngineView; print('Dependencies OK')"
+python3 -c "import pistick_server; print('Server OK')"
+command -v chromium-browser || command -v chromium
 ```
 
 ### The TMDB setup screen remains visible
@@ -424,20 +400,20 @@ python3 -c "import requests, pygame; from PyQt5.QtWebEngineWidgets import QWebEn
 Validate the private configuration file:
 
 ```bash
-sudo python3 -m json.tool /etc/pistick/config.json
+sudo python3 -m json.tool /var/lib/pistick/data/config.json
 ```
 
 Then restart PiStick:
 
 ```bash
-sudo systemctl restart pistick.service
+sudo systemctl restart pistick-server.service pistick-kiosk.service
 ```
 
 If the token was rejected or copied incorrectly, remove only the saved configuration and rerun the installer:
 
 ```bash
-sudo rm /etc/pistick/config.json
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/main/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+sudo rm /var/lib/pistick/data/config.json
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
 ```
 
 This does not remove profiles or watch history.
@@ -454,14 +430,14 @@ If no device appears, reconnect or pair the controller again. If a device appear
 
 ### Trailer playback is slow
 
-The trailer screen uses Qt WebEngine and Chromium, making it the heaviest part of PiStick. It is created only after **Watch Trailer** is selected and destroyed after closing. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
+The trailer screen uses Chromium and is the heaviest part of this Pi edition. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
 
 ### A movie or episode does not load
 
 First validate the local configuration and confirm the TMDB token file is valid JSON:
 
 ```bash
-sudo python3 -m json.tool /etc/pistick/config.json
+sudo python3 -m json.tool /var/lib/pistick/data/config.json
 ```
 
 Then test Videasy's player from the Pi:
@@ -473,7 +449,7 @@ curl -I https://player.videasy.to/movie/550
 The player needs JavaScript and media playback support from the browser engine. Check the PiStick logs for Chromium, network, or certificate errors:
 
 ```bash
-journalctl -u pistick.service -b -n 100 --no-pager
+journalctl -u pistick-kiosk.service -b -n 100 --no-pager
 ```
 
 No Videasy API key is required. The TMDB token is used only for title metadata; Videasy movie or episode paths are built from the selected TMDB number, season, and episode.
@@ -486,7 +462,7 @@ These messages come from the embed page rather than the TMDB request:
 - `Allow attribute will take precedence over 'allowfullscreen'` means an iframe contains both attributes. Use `allow="autoplay; encrypted-media; fullscreen"` and remove the separate `allowfullscreen` attribute.
 - `Blocked a frame ... Protocols, domains, and ports must match` means code is directly accessing a parent or child frame from a different origin. Use `postMessage()`; matching only the domain name is insufficient when the scheme, subdomain, or port differs.
 
-PiStick's Qt WebEngine progress bridge follows this model and runs separately inside every frame. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
+PiStick's browser interface uses origin-checked `postMessage()` events. If third-party player code prints one of these messages, that provider code must be corrected for the warning itself to disappear.
 
 ### Windows says `HLS not supported`
 
@@ -498,9 +474,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\PiSti
 
 If the message remains, install Microsoft's current [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) and reopen PiStick from the Start Menu. Do not add `--disable-web-security`: that does not add missing codecs and would weaken origin protections. A subtitle CORS error or source-fetch error is emitted by Videasy or one of its upstream services, not by PiStick's movie/TV URL builder.
 
-## Creating a release
+## Creating a Windows release
 
-PiStick installs only published GitHub Releases. Maintainers should release from a tested `main` commit:
+The Windows installer uses published GitHub Releases. The Pi Zero W updater follows
+`agent/pi-zero-w` directly. Maintainers should create Windows releases from a tested
+`main` commit:
 
 1. Run the repository checks:
 

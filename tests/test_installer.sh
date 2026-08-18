@@ -3,23 +3,16 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALLER="${PROJECT_DIR}/install.sh"
-if [[ -n "${PISTICK_TEST_OUTPUT_DIR:-}" ]]; then
-    TEST_DIR="$PISTICK_TEST_OUTPUT_DIR"
-    mkdir -p "$TEST_DIR"
-    KEEP_TEST_DIR=1
-else
-    TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pistick-installer-test.XXXXXX")"
-    KEEP_TEST_DIR=0
-fi
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pistick-pi-installer.XXXXXX")"
 TEST_ROOT="${TEST_DIR}/root"
-FIXTURES="${TEST_DIR}/fixtures"
-RELEASES_JSON="${TEST_DIR}/releases.json"
+SERVER_PID=""
 
 cleanup() {
-    if [[ "$KEEP_TEST_DIR" == "0" ]]; then
-        rm -rf -- "$TEST_DIR"
+    if [[ -n "$SERVER_PID" ]]; then
+        kill "$SERVER_PID" >/dev/null 2>&1 || true
+        wait "$SERVER_PID" >/dev/null 2>&1 || true
     fi
+    rm -rf -- "$TEST_DIR"
 }
 trap cleanup EXIT
 
@@ -32,221 +25,102 @@ assert_file() {
     [[ -f "$1" ]] || fail "Expected file: $1"
 }
 
-assert_symlink() {
-    [[ -L "$1" ]] || fail "Expected symlink: $1"
-}
-
-assert_equals() {
-    [[ "$1" == "$2" ]] || fail "Expected '$2', got '$1'"
-}
-
-make_release() {
-    local id="$1"
-    local tag="$2"
-    local marker="$3"
-    local source_dir="${FIXTURES}/source-${id}"
-    local archive="${FIXTURES}/release-${id}.tar.gz"
-    mkdir -p "${source_dir}/PiStick-${tag}"
-
-    cat >"${source_dir}/PiStick-${tag}/main.py" <<EOF
-import os
-PISTICK_CONFIG_PATH = os.getenv("PISTICK_CONFIG_PATH", "config.json")
-PISTICK_STATE_PATH = os.getenv("PISTICK_STATE_PATH", "pistick_state.json")
-PISTICK_CACHE_DIR = os.getenv("PISTICK_CACHE_DIR", ".cache")
-MARKER = "${marker}"
-EOF
-    cp "${PROJECT_DIR}/playback_api.py" "${source_dir}/PiStick-${tag}/playback_api.py"
-    cp "${PROJECT_DIR}/adblock.py" "${source_dir}/PiStick-${tag}/adblock.py"
-    cat >"${source_dir}/PiStick-${tag}/config.example.json" <<'EOF'
-{
-  "tmdb_read_token": "PASTE_YOUR_TMDB_API_READ_ACCESS_TOKEN_HERE",
-  "adblock_enabled": true,
-  "adblock_domains": []
-}
-EOF
-    cp "$INSTALLER" "${source_dir}/PiStick-${tag}/install.sh"
-    chmod 0755 "${source_dir}/PiStick-${tag}/install.sh"
-    cp "${PROJECT_DIR}/install.ps1" "${source_dir}/PiStick-${tag}/install.ps1"
-    cp "${PROJECT_DIR}/requirements-windows.txt" "${source_dir}/PiStick-${tag}/requirements-windows.txt"
-    mkdir -p "${source_dir}/PiStick-${tag}/assets"
-    cp "${PROJECT_DIR}/assets/pistick.ico" "${source_dir}/PiStick-${tag}/assets/pistick.ico"
-    cp "${PROJECT_DIR}/pistick-release.json" "${source_dir}/PiStick-${tag}/pistick-release.json"
-    tar -C "$source_dir" -czf "$archive" "PiStick-${tag}"
-    printf '%s' "$archive"
-}
-
-write_release_index() {
-    local newest_id="$1"
-    local newest_tag="$2"
-    local newest_archive="$3"
-    local newest_date="$4"
-    local older_id="${5:-}"
-    local older_tag="${6:-}"
-    local older_archive="${7:-}"
-    local older_date="${8:-}"
-
-    python3 - "$RELEASES_JSON" "$newest_id" "$newest_tag" "$newest_archive" "$newest_date" \
-        "$older_id" "$older_tag" "$older_archive" "$older_date" <<'PY'
-import json
-import sys
-
-output, newest_id, newest_tag, newest_archive, newest_date, older_id, older_tag, older_archive, older_date = sys.argv[1:]
-releases = [{
-    "id": int(newest_id),
-    "tag_name": newest_tag,
-    "published_at": newest_date,
-    "draft": False,
-    "prerelease": "alpha" in newest_tag,
-    "tarball_url": "file://" + newest_archive,
-    "html_url": "https://example.invalid/" + newest_tag,
-}]
-if older_id:
-    releases.append({
-        "id": int(older_id),
-        "tag_name": older_tag,
-        "published_at": older_date,
-        "draft": False,
-        "prerelease": "alpha" in older_tag,
-        "tarball_url": "file://" + older_archive,
-        "html_url": "https://example.invalid/" + older_tag,
-    })
-releases.append({
-    "id": 9999,
-    "tag_name": "v999-draft",
-    "published_at": "2099-01-01T00:00:00Z",
-    "draft": True,
-    "prerelease": False,
-    "tarball_url": "file:///must-not-be-used",
-})
-with open(output, "w", encoding="utf-8") as destination:
-    json.dump(releases, destination)
-PY
+assert_contains() {
+    grep -Fq -- "$2" "$1" || fail "Expected '$2' in $1"
 }
 
 run_installer() {
     env \
         PISTICK_TEST_MODE=1 \
         PISTICK_TEST_ROOT="$TEST_ROOT" \
-        PISTICK_RELEASES_API_URL="file://${RELEASES_JSON}" \
-        PISTICK_TMDB_TOKEN="test-tmdb-read-token" \
+        PISTICK_SOURCE_DIR="$PROJECT_DIR" \
+        PISTICK_USER=pistick \
+        PISTICK_GROUP=pistick \
+        PISTICK_HOME=/home/pistick \
+        PISTICK_UID=1000 \
         PISTICK_SKIP_TMDB_VALIDATION=1 \
         "$@" \
-        bash "$INSTALLER"
+        bash "$PROJECT_DIR/install.sh"
 }
 
-run_installed_updater() {
-    env \
-        PISTICK_TEST_MODE=1 \
-        PISTICK_TEST_ROOT="$TEST_ROOT" \
-        PISTICK_RELEASES_API_URL="file://${RELEASES_JSON}" \
-        PISTICK_TMDB_TOKEN="test-tmdb-read-token" \
-        PISTICK_SKIP_TMDB_VALIDATION=1 \
-        "$@" \
-        bash "${TEST_ROOT}/usr/local/bin/pistick-update"
-}
+mkdir -p "$TEST_ROOT"
+bash -n "$PROJECT_DIR/install.sh"
+bash -n "$PROJECT_DIR/pi/launch-kiosk.sh"
+bash -n "$PROJECT_DIR/pi/kiosk-session.sh"
 
-mkdir -p "$TEST_ROOT" "$FIXTURES"
-bash -n "$INSTALLER"
-python3 -m py_compile \
-    "${PROJECT_DIR}/main.py" \
-    "${PROJECT_DIR}/adblock.py" \
-    "${PROJECT_DIR}/playback_api.py"
-python3 -m unittest discover -s "${PROJECT_DIR}/tests" -p 'test_*.py'
+run_installer PISTICK_TMDB_TOKEN=test-tmdb-read-token-value
 
-# Verify main.py's external data paths without importing Qt.
-python3 - "${PROJECT_DIR}/main.py" <<'PY'
-import ast
-import os
-from pathlib import Path
-import sys
+CURRENT="$TEST_ROOT/opt/pistick/current"
+[[ -L "$CURRENT" ]] || fail "Expected the current release symlink"
+assert_file "$CURRENT/server.py"
+assert_file "$CURRENT/playback_api.py"
+assert_file "$CURRENT/pistick_server/static/app.js"
+assert_file "$CURRENT/pi/launch-kiosk.sh"
+assert_file "$CURRENT/pi/kiosk-session.sh"
+assert_file "$CURRENT/PI_ZERO_W_README.md"
+assert_file "$TEST_ROOT/var/lib/pistick/data/config.json"
+assert_file "$TEST_ROOT/etc/systemd/system/pistick-server.service"
+assert_file "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service"
+assert_file "$TEST_ROOT/etc/X11/Xwrapper.config"
+assert_file "$TEST_ROOT/usr/local/bin/pistick-update"
 
-source = Path(sys.argv[1]).read_text(encoding="utf-8")
-tree = ast.parse(source)
-function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_runtime_file")
-namespace = {"os": os, "Path": Path, "__file__": sys.argv[1]}
-exec(compile(ast.Module(body=[function], type_ignores=[]), sys.argv[1], "exec"), namespace)
-os.environ["PISTICK_STATE_PATH"] = "/var/lib/pistick/user-data.json"
-assert namespace["_runtime_file"]("PISTICK_STATE_PATH", "pistick_state.json") == Path("/var/lib/pistick/user-data.json")
-del os.environ["PISTICK_STATE_PATH"]
-assert namespace["_runtime_file"]("PISTICK_STATE_PATH", "pistick_state.json").name == "pistick_state.json"
-PY
-
-release_one="$(make_release 101 v1.0.0 first)"
-write_release_index 101 v1.0.0 "$release_one" 2026-08-10T10:00:00Z
-run_installer
-
-assert_symlink "${TEST_ROOT}/opt/pistick/current"
-assert_file "${TEST_ROOT}/opt/pistick/current/main.py"
-assert_file "${TEST_ROOT}/opt/pistick/current/adblock.py"
-assert_file "${TEST_ROOT}/opt/pistick/current/playback_api.py"
-assert_file "${TEST_ROOT}/opt/pistick/current/install.ps1"
-assert_file "${TEST_ROOT}/opt/pistick/current/requirements-windows.txt"
-assert_file "${TEST_ROOT}/opt/pistick/current/assets/pistick.ico"
-assert_file "${TEST_ROOT}/etc/pistick/config.json"
-assert_file "${TEST_ROOT}/usr/local/bin/pistick-update"
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.0.0"
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmdb_read_token"])' "${TEST_ROOT}/etc/pistick/config.json")" "test-tmdb-read-token"
-python3 -c 'import json,sys; assert "playback_base_url" not in json.load(open(sys.argv[1]))' "${TEST_ROOT}/etc/pistick/config.json"
-
-python3 - "${TEST_ROOT}/etc/pistick/config.json" <<'PY'
+python3 - "$TEST_ROOT/var/lib/pistick/data/config.json" <<'PY'
 import json
-from pathlib import Path
 import sys
 
-path = Path(sys.argv[1])
-payload = json.loads(path.read_text(encoding="utf-8"))
-payload["adblock_enabled"] = True
-payload["adblock_online_lists"] = True
-payload["adblock_domains"] = ["ads.private-example.test"]
-payload["adblock_allow_domains"] = ["video.private-example.test"]
-payload["playback_base_url"] = "https://legacy-provider.example"
-path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+with open(sys.argv[1], encoding="utf-8") as source:
+    config = json.load(source)
+assert config["tmdb_read_token"] == "test-tmdb-read-token-value"
+assert config["port"] == 8787
+assert len(config["shutdown_token"]) >= 24
 PY
-printf '{"profiles":[{"id":"kept"}],"watch_state":{}}\n' >"${TEST_ROOT}/var/lib/pistick/user-data.json"
-state_hash="$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)"
 
-# An update removes the obsolete provider field while preserving private
-# ad-block settings and watch state.
-run_installed_updater
-assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "ads.private-example.test"
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["adblock_allow_domains"][0])' "${TEST_ROOT}/etc/pistick/config.json")" "video.private-example.test"
-python3 -c 'import json,sys; assert "playback_base_url" not in json.load(open(sys.argv[1]))' "${TEST_ROOT}/etc/pistick/config.json"
-config_hash="$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_LOW_MEMORY=1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "--host 127.0.0.1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "?platform=pi-zero-w"
+assert_contains "$CURRENT/pi/kiosk-session.sh" "--renderer-process-limit=2"
+assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
+assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
 
-# A repeated manual run is idempotent after migration.
-run_installed_updater
-assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
-assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
-
-# A newer published pre-release is installed; a newer draft is ignored.
-release_two="$(make_release 202 v1.1.0-alpha second)"
-write_release_index 202 v1.1.0-alpha "$release_two" 2026-08-11T10:00:00Z \
-    101 v1.0.0 "$release_one" 2026-08-10T10:00:00Z
-run_installed_updater
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.1.0-alpha"
-assert_equals "$(python3 -c 'import runpy,sys; print(runpy.run_path(sys.argv[1])["MARKER"])' "${TEST_ROOT}/opt/pistick/current/main.py")" "second"
-assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
-assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
-
-# A startup failure restores the prior release and metadata.
-release_three="$(make_release 303 v1.2.0 third)"
-write_release_index 303 v1.2.0 "$release_three" 2026-08-12T10:00:00Z \
-    202 v1.1.0-alpha "$release_two" 2026-08-11T10:00:00Z
-if run_installed_updater PISTICK_TEST_HEALTH_FAIL=1; then
-    fail "A failed health check unexpectedly succeeded"
-fi
-assert_equals "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "${TEST_ROOT}/var/lib/pistick/installed-release.json")" "v1.1.0-alpha"
-assert_equals "$(python3 -c 'import runpy,sys; print(runpy.run_path(sys.argv[1])["MARKER"])' "${TEST_ROOT}/opt/pistick/current/main.py")" "second"
-assert_equals "$(sha256sum "${TEST_ROOT}/etc/pistick/config.json" | cut -d' ' -f1)" "$config_hash"
-assert_equals "$(sha256sum "${TEST_ROOT}/var/lib/pistick/user-data.json" | cut -d' ' -f1)" "$state_hash"
-
-# There is intentionally no automatic updater.
-if find "$TEST_ROOT" -type f \( -name '*.timer' -o -path '*/cron.*/*' \) | grep -q .; then
-    fail "The installer created an automatic update trigger"
-fi
-if grep -Eq 'git[[:space:]]+(pull|clone|checkout|fetch)' "$INSTALLER"; then
-    fail "The installer contains a branch-based Git update command"
+if grep -Rq "test-tmdb-read-token-value" \
+    "$TEST_ROOT/etc/systemd/system" "$TEST_ROOT/opt/pistick"; then
+    fail "The TMDB token leaked into application or service files"
 fi
 
-printf 'All PiStick installer tests passed.\n'
+# Confirm the installed copy starts as a real loopback HTTP server.
+PORT=18787
+python3 "$CURRENT/server.py" \
+    --host 127.0.0.1 \
+    --port "$PORT" \
+    --data-dir "$TEST_ROOT/var/lib/pistick/data" \
+    >"$TEST_DIR/server.log" 2>&1 &
+SERVER_PID=$!
+for _attempt in $(seq 1 30); do
+    if curl -fsS --max-time 1 "http://127.0.0.1:${PORT}/health" >"$TEST_DIR/health.json" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+python3 - "$TEST_DIR/health.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    health = json.load(source)
+assert health["ok"] is True
+PY
+kill "$SERVER_PID"
+wait "$SERVER_PID"
+SERVER_PID=""
+
+# A reinstall must preserve watch state and the existing secret.
+printf '{"profiles":[],"marker":"keep-me"}\n' >"$TEST_ROOT/var/lib/pistick/data/state.json"
+state_hash="$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)"
+config_hash="$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)"
+run_installer
+[[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)" == "$state_hash" ]] \
+    || fail "A reinstall changed watch state"
+[[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
+    || fail "A reinstall changed the saved configuration"
+
+printf 'All Pi Zero W installer checks passed.\n'

@@ -34,6 +34,12 @@ class TMDBClient:
         self.cache_dir = Path(cache_dir)
         self._memory: dict[str, tuple[float, dict[str, Any]]] = {}
         self._lock = threading.RLock()
+        self.low_memory = os.getenv("PISTICK_LOW_MEMORY", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     @staticmethod
     def _cache_ttl(endpoint: str) -> int:
@@ -55,6 +61,19 @@ class TMDBClient:
     def _cache_path(self, key: str) -> Path:
         return self.cache_dir / f"{key}.json"
 
+    def _remember(
+        self,
+        key: str,
+        payload: dict[str, Any],
+        timestamp: Optional[float] = None,
+    ) -> None:
+        with self._lock:
+            self._memory[key] = (timestamp if timestamp is not None else time.time(), payload)
+            memory_limit = 24 if self.low_memory else 96
+            while len(self._memory) > memory_limit:
+                oldest = min(self._memory, key=lambda candidate: self._memory[candidate][0])
+                self._memory.pop(oldest, None)
+
     def _read_cache(self, key: str, ttl: int) -> Optional[dict[str, Any]]:
         now = time.time()
         with self._lock:
@@ -70,8 +89,7 @@ class TMDBClient:
                 return None
         except (OSError, ValueError, TypeError):
             return None
-        with self._lock:
-            self._memory[key] = (now, payload)
+        self._remember(key, payload, now)
         return payload
 
     def _read_stale_cache(self, key: str) -> Optional[dict[str, Any]]:
@@ -97,8 +115,7 @@ class TMDBClient:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-        with self._lock:
-            self._memory[key] = (time.time(), payload)
+        self._remember(key, payload)
 
     def _request(
         self,
@@ -205,7 +222,8 @@ class TMDBClient:
         )
         rows: dict[int, dict[str, Any]] = {}
         errors: list[str] = []
-        with ThreadPoolExecutor(max_workers=len(definitions)) as pool:
+        worker_count = 2 if self.low_memory else len(definitions)
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {
                 pool.submit(self._request, endpoint, {"page": 1}): (index, title, kind)
                 for index, (title, endpoint, kind) in enumerate(definitions)

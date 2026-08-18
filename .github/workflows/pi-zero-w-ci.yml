@@ -1,0 +1,53 @@
+name: Pi Zero W checks
+
+on:
+  pull_request:
+    paths:
+      - "install.sh"
+      - "PI_ZERO_W_README.md"
+      - "pi/**"
+      - "pistick_server/**"
+      - "playback_api.py"
+      - "server.py"
+      - "tests/test_installer.sh"
+      - "tests/test_local_server.py"
+      - ".github/workflows/pi-zero-w-ci.yml"
+  push:
+    branches:
+      - agent/pi-zero-w
+    paths:
+      - "install.sh"
+      - "PI_ZERO_W_README.md"
+      - "pi/**"
+      - "pistick_server/**"
+      - "playback_api.py"
+      - "server.py"
+      - "tests/test_installer.sh"
+      - "tests/test_local_server.py"
+      - ".github/workflows/pi-zero-w-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-zero-w-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out PiStick
+        uses: actions/checkout@v7
+
+      - name: Check Bash and JavaScript syntax
+        run: |
+          bash -n install.sh pi/launch-kiosk.sh pi/kiosk-session.sh tests/test_installer.sh
+          node --check pistick_server/static/app.js
+
+      - name: Test the appliance installer
+        run: bash tests/test_installer.sh
+
+      - name: Run Python tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

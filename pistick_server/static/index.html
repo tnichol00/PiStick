@@ -47,6 +47,18 @@
     </form>
   </dialog>
 
+  <dialog id="keyboard-dialog" class="keyboard-dialog">
+    <div class="dialog-heading-row">
+      <div>
+        <p class="eyebrow">CONTROLLER KEYBOARD</p>
+        <h2 id="keyboard-title">Enter text</h2>
+      </div>
+      <button id="keyboard-close" class="round-close static-close" type="button" aria-label="Close keyboard">×</button>
+    </div>
+    <input id="keyboard-value" class="keyboard-value" type="text" maxlength="120" readonly aria-label="Entered text">
+    <div id="keyboard-grid" class="keyboard-grid" aria-label="On-screen keyboard"></div>
+  </dialog>
+
   <section id="player-overlay" class="player-overlay hidden" aria-label="Player">
     <div class="player-toolbar">
       <div>

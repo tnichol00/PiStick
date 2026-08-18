@@ -1,6 +1,9 @@
 (function () {
   "use strict";
 
+  var requestedPiMode = new URLSearchParams(window.location.search).get("platform") === "pi-zero-w";
+  document.documentElement.classList.toggle("pi-zero-w", requestedPiMode);
+
   var state = {
     status: null,
     profiles: [],
@@ -13,7 +16,10 @@
     toastTimer: null,
     manageProfiles: false,
     gamepadPrevious: {},
-    gamepadCooldown: 0
+    gamepadCooldown: 0,
+    lowMemory: requestedPiMode,
+    keyboardSubmit: null,
+    keyboardReturnFocus: null
   };
 
   var ui = {};
@@ -40,6 +46,10 @@
     var value = String(path || "");
     if (!/^\/[A-Za-z0-9._/-]+$/.test(value)) return "";
     return "https://image.tmdb.org/t/p/" + size + value;
+  }
+
+  function motionBehavior() {
+    return state.lowMemory ? "auto" : "smooth";
   }
 
   function mediaMeta(media) {
@@ -165,15 +175,15 @@
 
   function addProfileCard() {
     var card = button("", "profile-card", async function () {
-      var name = window.prompt("New profile name:", "");
-      if (name === null) return;
-      try {
-        await api("/api/profiles", { method: "POST", body: { name: name } });
-        await refreshProfiles();
-        renderProfiles(state.manageProfiles);
-      } catch (error) {
-        showToast(error.message);
-      }
+      openControllerKeyboard("New profile name", "", "Add profile", async function (name) {
+        try {
+          await api("/api/profiles", { method: "POST", body: { name: name } });
+          await refreshProfiles();
+          renderProfiles(state.manageProfiles);
+        } catch (error) {
+          showToast(error.message);
+        }
+      });
     });
     card.setAttribute("aria-label", "Add profile");
     card.append(element("div", "profile-avatar add-avatar", "+"), element("p", "", "Add Profile"));
@@ -249,7 +259,7 @@
 
   function poster(media) {
     var wrap = element("div", "poster-wrap");
-    var url = imageUrl(media.poster_path, "w500");
+    var url = imageUrl(media.poster_path, state.lowMemory ? "w342" : "w500");
     if (url) {
       var image = element("img");
       image.src = url;
@@ -297,7 +307,7 @@
 
   function hero(media) {
     var section = element("section", "hero");
-    var backdrop = imageUrl(media.backdrop_path, "original");
+    var backdrop = imageUrl(media.backdrop_path, state.lowMemory ? "w780" : "original");
     if (backdrop) {
       var image = element("img", "hero-backdrop");
       image.src = backdrop;
@@ -336,7 +346,7 @@
       if (!rows.childElementCount) rows.append(element("div", "empty-state", "No titles are available right now."));
       fragment.append(rows);
       ui.app.replaceChildren(fragment);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo({ top: 0, behavior: motionBehavior() });
     } catch (error) {
       if (token !== state.loadToken) return;
       errorPage(error, renderHome);
@@ -374,7 +384,7 @@
       var payload = await api(query("/api/discover/" + kind, { profile_id: activeProfileId() }));
       if (token !== state.loadToken) return;
       resultPage(kind === "movie" ? "Movies" : "TV Shows", "POPULAR RIGHT NOW", payload.items || []);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo({ top: 0, behavior: motionBehavior() });
     } catch (error) {
       if (token === state.loadToken) errorPage(error, function () { renderDiscover(kind); });
     }
@@ -393,7 +403,7 @@
       var payload = await api(query("/api/search", { q: cleaned, profile_id: activeProfileId() }));
       if (token !== state.loadToken) return;
       resultPage("Search results", "RESULTS FOR “" + cleaned.toUpperCase() + "”", payload.items || []);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo({ top: 0, behavior: motionBehavior() });
     } catch (error) {
       if (token === state.loadToken) errorPage(error, function () { renderSearch(cleaned); });
     }
@@ -481,7 +491,7 @@
   function episodeCard(show, episode) {
     var card = button("", "episode-card", function () { startPlayback(show, episode); });
     card.setAttribute("aria-label", "Play episode " + episode.episode_number + ", " + (episode.name || ""));
-    var stillUrl = imageUrl(episode.still_path, "w500");
+    var stillUrl = imageUrl(episode.still_path, state.lowMemory ? "w300" : "w500");
     if (stillUrl) {
       var still = element("img", "episode-still");
       still.src = stillUrl;
@@ -556,7 +566,7 @@
     state.detailsMedia = media;
     var root = element("div");
     var backdrop = element("section", "details-backdrop");
-    var image = imageUrl(media.backdrop_path, "original");
+    var image = imageUrl(media.backdrop_path, state.lowMemory ? "w780" : "original");
     if (image) {
       var picture = element("img");
       picture.src = image;
@@ -742,8 +752,74 @@
     if (ui.settingsDialog.open) ui.settingsDialog.close();
   }
 
+  function closeControllerKeyboard() {
+    if (!ui.keyboardDialog || !ui.keyboardDialog.open) return;
+    ui.keyboardDialog.close();
+    state.keyboardSubmit = null;
+    var returnFocus = state.keyboardReturnFocus;
+    state.keyboardReturnFocus = null;
+    if (returnFocus && document.contains(returnFocus)) {
+      window.setTimeout(function () { returnFocus.focus(); }, 20);
+    }
+  }
+
+  function appendKeyboardText(value) {
+    var current = String(ui.keyboardValue.value || "");
+    ui.keyboardValue.value = (current + String(value || "")).slice(0, 120);
+  }
+
+  function submitControllerKeyboard() {
+    var value = String(ui.keyboardValue.value || "").trim();
+    if (!value) {
+      showToast("Enter at least one character.");
+      return;
+    }
+    var callback = state.keyboardSubmit;
+    state.keyboardSubmit = null;
+    state.keyboardReturnFocus = null;
+    ui.keyboardDialog.close();
+    if (callback) Promise.resolve(callback(value)).catch(function (error) { showToast(error.message || error); });
+  }
+
+  function openControllerKeyboard(title, initialValue, submitLabel, onSubmit) {
+    state.keyboardReturnFocus = document.activeElement;
+    state.keyboardSubmit = onSubmit;
+    ui.keyboardTitle.textContent = title || "Enter text";
+    ui.keyboardValue.value = String(initialValue || "").slice(0, 120);
+    ui.keyboardGrid.replaceChildren();
+
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split("").forEach(function (character) {
+      ui.keyboardGrid.append(button(character, "keyboard-key", function () { appendKeyboardText(character); }));
+    });
+    ui.keyboardGrid.append(button("Space", "keyboard-key keyboard-wide", function () { appendKeyboardText(" "); }));
+    ui.keyboardGrid.append(button("⌫ Backspace", "keyboard-key keyboard-wide", function () {
+      ui.keyboardValue.value = ui.keyboardValue.value.slice(0, -1);
+    }));
+    ui.keyboardGrid.append(button("Clear", "keyboard-key keyboard-action", function () { ui.keyboardValue.value = ""; }));
+    ui.keyboardGrid.append(button("Cancel", "keyboard-key keyboard-action", closeControllerKeyboard));
+    ui.keyboardGrid.append(button(submitLabel || "Done", "keyboard-key keyboard-submit", submitControllerKeyboard));
+
+    if (!ui.keyboardDialog.open) ui.keyboardDialog.showModal();
+    window.setTimeout(function () {
+      var first = ui.keyboardGrid.querySelector("button");
+      if (first) first.focus();
+    }, 30);
+  }
+
+  function openSearchKeyboard() {
+    openControllerKeyboard("Search movies and TV shows", ui.searchInput.value, "Search", function (value) {
+      ui.searchInput.value = value;
+      return renderSearch(value);
+    });
+  }
+
   function visibleFocusable() {
-    return Array.from(document.querySelectorAll("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")).filter(function (node) {
+    var root = document;
+    if (ui.keyboardDialog.open) root = ui.keyboardDialog;
+    else if (ui.settingsDialog.open) root = ui.settingsDialog;
+    else if (ui.detailsDialog.open) root = ui.detailsDialog;
+    else if (state.player) root = ui.playerOverlay;
+    return Array.from(root.querySelectorAll("button:not([disabled]), input:not([disabled]):not([readonly]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")).filter(function (node) {
       var rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== "hidden";
     });
@@ -764,7 +840,7 @@
         if (index >= 0 && cards.length) {
           var next = direction === "right" ? (index + 1) % cards.length : (index - 1 + cards.length) % cards.length;
           cards[next].focus();
-          cards[next].scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+          cards[next].scrollIntoView({ behavior: motionBehavior(), block: "nearest", inline: "center" });
           return;
         }
       }
@@ -799,11 +875,12 @@
     });
     if (best) {
       best.focus();
-      best.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+      best.scrollIntoView({ behavior: motionBehavior(), block: "nearest", inline: "nearest" });
     }
   }
 
   function backAction() {
+    if (ui.keyboardDialog.open) return closeControllerKeyboard();
     if (state.player) return closePlayer();
     if (ui.settingsDialog.open) return closeSettings();
     if (ui.detailsDialog.open) return closeDetails();
@@ -823,6 +900,19 @@
       if (event.key === "Escape") {
         event.preventDefault();
         backAction();
+        return;
+      }
+      if (ui.keyboardDialog.open) {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          submitControllerKeyboard();
+        } else if (event.key === "Backspace") {
+          event.preventDefault();
+          ui.keyboardValue.value = ui.keyboardValue.value.slice(0, -1);
+        } else if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          event.preventDefault();
+          appendKeyboardText(event.key);
+        }
         return;
       }
       if (typing) return;
@@ -857,6 +947,11 @@
     gamepads.forEach(function (gamepad) {
       gamepadEdge(gamepad, "a", gamepadPressed(gamepad, 0), function () {
         if (state.player) postPlayerCommand("toggle");
+        else if (document.activeElement === ui.searchInput) openSearchKeyboard();
+        else if (document.activeElement && document.activeElement.classList.contains("profile-name-input")) {
+          var input = document.activeElement;
+          openControllerKeyboard("Edit profile name", input.value, "Use name", function (value) { input.value = value; });
+        }
         else if (document.activeElement && typeof document.activeElement.click === "function") document.activeElement.click();
         else focusFirst();
       });
@@ -898,6 +993,11 @@
     ui.settingsToken = document.getElementById("tmdb-token");
     ui.settingsMessage = document.getElementById("settings-message");
     ui.settingsClose = document.getElementById("settings-close");
+    ui.keyboardDialog = document.getElementById("keyboard-dialog");
+    ui.keyboardTitle = document.getElementById("keyboard-title");
+    ui.keyboardValue = document.getElementById("keyboard-value");
+    ui.keyboardGrid = document.getElementById("keyboard-grid");
+    ui.keyboardClose = document.getElementById("keyboard-close");
     ui.playerOverlay = document.getElementById("player-overlay");
     ui.playerTitle = document.getElementById("player-title");
     ui.playerFrame = document.getElementById("player-frame");
@@ -920,6 +1020,7 @@
     ui.settingsButton.addEventListener("click", function () { openSettings(false); });
     ui.detailsClose.addEventListener("click", closeDetails);
     ui.settingsClose.addEventListener("click", closeSettings);
+    ui.keyboardClose.addEventListener("click", closeControllerKeyboard);
     ui.playerClose.addEventListener("click", closePlayer);
     ui.playerFullscreen.addEventListener("click", function () {
       var target = ui.playerOverlay;
@@ -939,6 +1040,10 @@
     ui.settingsDialog.addEventListener("cancel", function (event) {
       event.preventDefault();
       closeSettings();
+    });
+    ui.keyboardDialog.addEventListener("cancel", function (event) {
+      event.preventDefault();
+      closeControllerKeyboard();
     });
     ui.settingsForm.addEventListener("submit", async function (event) {
       event.preventDefault();
@@ -982,6 +1087,8 @@
     loadingPage("Connecting to PiStick Server…", false);
     try {
       state.status = await api("/api/status");
+      state.lowMemory = state.lowMemory || Boolean(state.status.low_memory);
+      document.documentElement.classList.toggle("pi-zero-w", state.lowMemory);
       await refreshProfiles();
       if (!state.status.tmdb_configured) openSettings(true);
       if (state.activeProfile) await renderHome();

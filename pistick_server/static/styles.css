@@ -458,7 +458,8 @@ textarea::placeholder { color: #85858d; }
 }
 
 .details-dialog,
-.settings-dialog {
+.settings-dialog,
+.keyboard-dialog {
   width: min(1080px, calc(100vw - 24px));
   max-height: calc(100vh - 24px);
   border: 1px solid #37373e;
@@ -471,7 +472,8 @@ textarea::placeholder { color: #85858d; }
 }
 
 .details-dialog::backdrop,
-.settings-dialog::backdrop { background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(5px); }
+.settings-dialog::backdrop,
+.keyboard-dialog::backdrop { background: rgba(0, 0, 0, 0.78); backdrop-filter: blur(5px); }
 
 .round-close {
   position: absolute;
@@ -573,6 +575,72 @@ textarea::placeholder { color: #85858d; }
 .form-message { min-height: 22px; margin: 10px 0; color: #ff9ca1; }
 .form-message.success { color: #7ce69a; }
 
+.keyboard-dialog {
+  width: min(920px, calc(100vw - 30px));
+  padding: 24px;
+}
+
+.keyboard-dialog h2 { margin: 0; font-size: 28px; }
+
+.keyboard-value {
+  width: 100%;
+  margin: 18px 0 14px;
+  border: 2px solid #3b3b43;
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #09090b;
+  color: white;
+  font-size: 22px;
+}
+
+.keyboard-grid {
+  display: grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.keyboard-key {
+  min-height: 48px;
+  border: 1px solid #3a3a42;
+  border-radius: 9px;
+  padding: 8px;
+  background: #24242a;
+  color: white;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.keyboard-key:hover { background: #33333a; }
+.keyboard-wide { grid-column: span 3; }
+.keyboard-action { grid-column: span 2; }
+.keyboard-submit { grid-column: span 2; background: #f4f4f5; color: #09090b; }
+
+html.pi-zero-w body,
+html.pi-zero-w .profiles-page {
+  background: var(--bg);
+}
+
+html.pi-zero-w .site-header,
+html.pi-zero-w .details-dialog::backdrop,
+html.pi-zero-w .settings-dialog::backdrop,
+html.pi-zero-w .keyboard-dialog::backdrop {
+  backdrop-filter: none;
+}
+
+html.pi-zero-w *,
+html.pi-zero-w *::before,
+html.pi-zero-w *::after {
+  scroll-behavior: auto !important;
+  animation-duration: 0.01ms !important;
+  transition-duration: 0.01ms !important;
+}
+
+html.pi-zero-w .hero { min-height: min(58vh, 600px); }
+html.pi-zero-w .media-card:hover,
+html.pi-zero-w .media-card:focus-visible { transform: none; }
+html.pi-zero-w .content-rows { margin-top: -24px; }
+html.pi-zero-w .media-section { content-visibility: auto; contain-intrinsic-size: 330px; }
+
 .player-overlay {
   position: fixed;
   z-index: 100;
@@ -626,6 +694,7 @@ textarea::placeholder { color: #85858d; }
   .episode-card { grid-template-columns: 130px 1fr; }
   .episode-still { width: 130px; }
   .episode-status { grid-column: 2; padding: 0; }
+  .keyboard-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
 }
 
 @media (max-width: 560px) {

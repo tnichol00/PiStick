@@ -1,8 +1,10 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -158,6 +160,29 @@ class ApplicationTests(unittest.TestCase):
         script = self.app.dispatch("GET", "/app.js", {})
         self.assertEqual(script.status, 200)
         self.assertIn(b"/api/watch/progress", script.body)
+        self.assertIn(b"openSearchKeyboard", script.body)
+
+    def test_pi_low_memory_mode_limits_home_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"PISTICK_LOW_MEMORY": "1"}
+        ):
+            app = PiStickApplication(Path(directory) / "data", tmdb=FakeTMDB())
+            profile_id = app.state.profiles()[0]["id"]
+            app.state.activate_profile(profile_id)
+            items = []
+            for media_id in range(1, 21):
+                item = FakeTMDB.movie()
+                item["id"] = media_id
+                items.append(item)
+            result = app._decorate_home(
+                profile_id,
+                {"hero": items[0], "rows": [{"title": "Many", "items": items}]},
+            )
+            self.assertTrue(app.low_memory)
+            self.assertEqual(len(result["rows"][0]["items"]), 12)
+            response = app.dispatch("GET", "/api/status", {})
+            payload = json.loads(response.body.decode("utf-8"))
+            self.assertTrue(payload["low_memory"])
 
 
 class LoopbackHTTPTests(unittest.TestCase):

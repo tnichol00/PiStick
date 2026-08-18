@@ -1,606 +1,512 @@
-#requires -Version 5.1
-<#
-.SYNOPSIS
-Installs or updates PiStick for the current Windows user.
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-.DESCRIPTION
-PiStick is installed under %LOCALAPPDATA%\PiStick. Published GitHub Releases
-are kept as immutable snapshots, while configuration, profiles, history, and
-cache data live outside those snapshots so they survive every update.
+# PiStick appliance installer for the original Raspberry Pi Zero W.
+# This branch intentionally uses the lightweight localhost server and the
+# Raspberry Pi OS Chromium package instead of Qt WebEngine.
 
-The installer creates a PiStick shortcut in the current user's Start Menu. It
-does not require administrator rights and does not create an automatic updater.
-#>
+REPOSITORY="tnichol00/PiStick"
+SOURCE_BRANCH="agent/pi-zero-w"
+TEST_MODE="${PISTICK_TEST_MODE:-0}"
+TEST_ROOT="${PISTICK_TEST_ROOT:-}"
 
-[CmdletBinding()]
-param(
-    [switch]$NoLaunch
+root_path() {
+    printf '%s%s' "$TEST_ROOT" "$1"
+}
+
+INSTALL_ROOT="$(root_path /opt/pistick)"
+DATA_ROOT="$(root_path /var/lib/pistick)"
+CACHE_ROOT="$(root_path /var/cache/pistick)"
+SYSTEMD_ROOT="$(root_path /etc/systemd/system)"
+XWRAPPER_PATH="$(root_path /etc/X11/Xwrapper.config)"
+LOCAL_BIN="$(root_path /usr/local/bin)"
+CONFIG_PATH="${DATA_ROOT}/data/config.json"
+
+TEMP_DIR=""
+SOURCE_DIR="${PISTICK_SOURCE_DIR:-}"
+TMDB_TOKEN="${PISTICK_TMDB_TOKEN:-}"
+
+cleanup() {
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        rm -rf -- "$TEMP_DIR"
+    fi
+    TMDB_TOKEN=""
+}
+trap cleanup EXIT
+
+fail() {
+    printf '\nPiStick installation failed: %s\n' "$*" >&2
+    exit 1
+}
+
+step() {
+    printf '\n[PiStick] %s\n' "$*"
+}
+
+package_available() {
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
+require_root() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return
+    fi
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Run this installer with sudo."
+}
+
+check_platform() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return
+    fi
+    [[ -r /etc/os-release ]] || fail "Raspberry Pi OS could not be identified."
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in
+        raspbian|debian) ;;
+        *) fail "Use Raspberry Pi OS Legacy Lite (32-bit, Bookworm)." ;;
+    esac
+    local machine
+    machine="$(uname -m)"
+    case "$machine" in
+        armv6l|armv7l|aarch64) ;;
+        *) fail "This installer is for Raspberry Pi hardware, not $machine." ;;
+    esac
+    if [[ "$machine" == "armv6l" ]]; then
+        local debian_major
+        debian_major="${VERSION_ID%%.*}"
+        if [[ "$debian_major" =~ ^[0-9]+$ ]] && ((debian_major >= 13)); then
+            fail "The original Pi Zero W needs Raspberry Pi OS Legacy Lite (32-bit, Bookworm). Trixie's browsers require a newer CPU."
+        fi
+    fi
+    if [[ "$machine" == "aarch64" ]]; then
+        printf 'Warning: the original Pi Zero W should use Raspberry Pi OS Legacy Lite (32-bit, Bookworm).\n' >&2
+    fi
+}
+
+resolve_target_user() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        TARGET_USER="${PISTICK_USER:-pistick}"
+        TARGET_GROUP="${PISTICK_GROUP:-pistick}"
+        TARGET_HOME="${PISTICK_HOME:-/home/pistick}"
+        TARGET_UID="${PISTICK_UID:-1000}"
+        return
+    fi
+
+    TARGET_USER="${PISTICK_USER:-}"
+    if [[ -z "$TARGET_USER" && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        TARGET_USER="$SUDO_USER"
+    fi
+    if [[ -z "$TARGET_USER" ]]; then
+        TARGET_USER="$(getent passwd 1000 | cut -d: -f1 || true)"
+    fi
+    [[ -n "$TARGET_USER" ]] || fail "No regular user was found. Set PISTICK_USER and run again."
+    getent passwd "$TARGET_USER" >/dev/null || fail "User '$TARGET_USER' does not exist."
+    TARGET_UID="$(id -u "$TARGET_USER")"
+    [[ "$TARGET_UID" -ge 1000 ]] || fail "PiStick must run as a regular user, not root."
+    TARGET_GROUP="$(id -gn "$TARGET_USER")"
+    TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    [[ -d "$TARGET_HOME" ]] || fail "Home directory for '$TARGET_USER' does not exist."
+}
+
+install_packages() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        BROWSER_PACKAGE="chromium"
+        return
+    fi
+
+    step "Installing the minimal display, browser, Python, and Bluetooth packages"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+
+    local packages=(
+        ca-certificates
+        curl
+        git
+        python3
+        xserver-xorg-core
+        xserver-xorg-legacy
+        xinit
+        openbox
+        x11-xserver-utils
+        dbus-x11
+        alsa-utils
+        pulseaudio
+        pulseaudio-utils
+        fonts-dejavu-core
+        fonts-liberation
+        bluez
+        rfkill
+    )
+
+    if package_available chromium-browser; then
+        BROWSER_PACKAGE="chromium-browser"
+    elif package_available chromium; then
+        BROWSER_PACKAGE="chromium"
+    else
+        fail "Raspberry Pi OS did not provide Chromium. Update the OS and run the installer again."
+    fi
+    packages+=("$BROWSER_PACKAGE")
+
+    if package_available unclutter-xfixes; then
+        packages+=(unclutter-xfixes)
+    elif package_available unclutter; then
+        packages+=(unclutter)
+    fi
+    if package_available pi-bluetooth; then
+        packages+=(pi-bluetooth)
+    fi
+
+    apt-get install -y --no-install-recommends "${packages[@]}"
+}
+
+prepare_source() {
+    if [[ -n "$SOURCE_DIR" ]]; then
+        SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
+        return
+    fi
+
+    TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pistick-pi.XXXXXX")"
+    SOURCE_DIR="${TEMP_DIR}/source"
+    step "Downloading the Pi Zero W branch"
+    git clone --depth 1 --branch "$SOURCE_BRANCH" \
+        "https://github.com/${REPOSITORY}.git" "$SOURCE_DIR"
+}
+
+check_source() {
+    local required=(
+        server.py
+        playback_api.py
+        pistick_server/app.py
+        pistick_server/config.py
+        pistick_server/state.py
+        pistick_server/tmdb.py
+        pistick_server/static/index.html
+        pistick_server/static/app.js
+        pistick_server/static/styles.css
+        pi/launch-kiosk.sh
+        pi/kiosk-session.sh
+        PI_ZERO_W_README.md
+    )
+    local path
+    for path in "${required[@]}"; do
+        [[ -f "${SOURCE_DIR}/${path}" ]] || fail "The branch is missing $path."
+    done
+    bash -n "${SOURCE_DIR}/pi/launch-kiosk.sh"
+    bash -n "${SOURCE_DIR}/pi/kiosk-session.sh"
+    python3 -m py_compile \
+        "${SOURCE_DIR}/server.py" \
+        "${SOURCE_DIR}/playback_api.py" \
+        "${SOURCE_DIR}/pistick_server/app.py" \
+        "${SOURCE_DIR}/pistick_server/config.py" \
+        "${SOURCE_DIR}/pistick_server/state.py" \
+        "${SOURCE_DIR}/pistick_server/tmdb.py"
+}
+
+install_release() {
+    step "Installing the PiStick application"
+    local revision release_base release_id staging release_dir current_link counter
+    revision="$(git -C "$SOURCE_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'local')"
+    release_base="$(date -u +%Y%m%d%H%M%S)-${revision}"
+    release_id="$release_base"
+    counter=1
+    while [[ -e "${INSTALL_ROOT}/releases/${release_id}" || -e "${INSTALL_ROOT}/releases/.${release_id}.staging" ]]; do
+        release_id="${release_base}-${counter}"
+        counter=$((counter + 1))
+    done
+    release_dir="${INSTALL_ROOT}/releases/${release_id}"
+    staging="${INSTALL_ROOT}/releases/.${release_id}.staging"
+    current_link="${INSTALL_ROOT}/current"
+
+    install -d -m 0755 "${INSTALL_ROOT}/releases"
+    install -d -m 0755 "$staging"
+    install -m 0644 "${SOURCE_DIR}/server.py" "$staging/server.py"
+    install -m 0644 "${SOURCE_DIR}/playback_api.py" "$staging/playback_api.py"
+    cp -a "${SOURCE_DIR}/pistick_server" "$staging/pistick_server"
+    cp -a "${SOURCE_DIR}/pi" "$staging/pi"
+    install -m 0644 "${SOURCE_DIR}/PI_ZERO_W_README.md" "$staging/PI_ZERO_W_README.md"
+    [[ ! -f "${SOURCE_DIR}/LICENSE" ]] || install -m 0644 "${SOURCE_DIR}/LICENSE" "$staging/LICENSE"
+    chmod 0755 "$staging/pi/launch-kiosk.sh" "$staging/pi/kiosk-session.sh"
+    find "$staging" -type d -name __pycache__ -prune -exec rm -rf -- {} +
+
+    mv "$staging" "$release_dir"
+    rm -f -- "${current_link}.new"
+    ln -s "$release_dir" "${current_link}.new"
+    mv -Tf "${current_link}.new" "$current_link"
+}
+
+usable_token() {
+    local value="$1"
+    [[ ${#value} -ge 24 && "$value" != *PASTE_YOUR* && "$value" != *KEEP_THE_QUOTES* ]]
+}
+
+read_existing_token() {
+    [[ -f "$CONFIG_PATH" ]] || return 0
+    python3 -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    print(str(value.get("tmdb_read_token") or value.get("tmdb_token") or "").strip())
+except (OSError, ValueError, TypeError, AttributeError):
+    pass
+' "$CONFIG_PATH" 2>/dev/null || true
+}
+
+validate_token() {
+    local value="$1"
+    if [[ "${PISTICK_SKIP_TMDB_VALIDATION:-0}" == "1" ]]; then
+        return 0
+    fi
+    python3 -c '
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+token = sys.stdin.read().strip()
+request = Request(
+    "https://api.themoviedb.org/3/configuration",
+    headers={"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "PiStick-Pi-Installer/2"},
 )
-
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-$InstallerVersion = '1.0.1'
-$Repository = 'tnichol00/PiStick'
-$ReleasesApi = "https://api.github.com/repos/$Repository/releases?per_page=100"
-$IconFallbackUrl = "https://raw.githubusercontent.com/$Repository/main/assets/pistick.ico"
-
-if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -or [string]::IsNullOrWhiteSpace($env:APPDATA)) {
-    throw 'PiStick requires LOCALAPPDATA and APPDATA for the current Windows user.'
+try:
+    with urlopen(request, timeout=20) as response:
+        if response.status != 200:
+            raise RuntimeError("unexpected response")
+except HTTPError as error:
+    if error.code in (401, 403):
+        print("TMDB rejected that token. Copy the long API Read Access Token.", file=sys.stderr)
+    else:
+        print("TMDB validation failed with HTTP " + str(error.code) + ".", file=sys.stderr)
+    raise SystemExit(1)
+except (URLError, TimeoutError, OSError, RuntimeError) as error:
+    print("TMDB could not be reached: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+' <<<"$value"
 }
 
-$InstallRoot = Join-Path $env:LOCALAPPDATA 'PiStick'
-$ReleasesDirectory = Join-Path $InstallRoot 'releases'
-$DataDirectory = Join-Path $InstallRoot 'data'
-$CacheDirectory = Join-Path $InstallRoot 'cache'
-$RuntimesDirectory = Join-Path $InstallRoot 'runtimes'
-$CurrentReleaseFile = Join-Path $InstallRoot 'current-release.txt'
-$ConfigPath = Join-Path $DataDirectory 'config.json'
-$StatePath = Join-Path $DataDirectory 'pistick_state.json'
-$IconPath = Join-Path $InstallRoot 'pistick.ico'
-$LauncherPath = Join-Path $InstallRoot 'PiStick.vbs'
-$InstalledInstallerPath = Join-Path $InstallRoot 'install.ps1'
-$StartMenuDirectory = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-$ShortcutPath = Join-Path $StartMenuDirectory 'PiStick.lnk'
-$TemporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("PiStick-Install-" + [guid]::NewGuid().ToString('N'))
+collect_token() {
+    local existing
+    existing="$(read_existing_token)"
+    if [[ -z "$TMDB_TOKEN" ]] && usable_token "$existing"; then
+        TMDB_TOKEN="$existing"
+        printf 'Keeping the existing TMDB token.\n'
+        return
+    fi
 
-function Write-PiStickStep {
-    param([Parameter(Mandatory = $true)][string]$Message)
-    Write-Host "`n[PiStick] $Message" -ForegroundColor Cyan
-}
+    if [[ -n "$TMDB_TOKEN" ]]; then
+        usable_token "$TMDB_TOKEN" || fail "PISTICK_TMDB_TOKEN is not a valid-looking Read Access Token."
+        validate_token "$TMDB_TOKEN" || fail "The supplied TMDB token could not be validated."
+        return
+    fi
 
-function Write-Utf8File {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Content
-    )
-    $encoding = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($Path, $Content, $encoding)
-}
-
-function Invoke-NativeCommand {
-    param(
-        [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
-        [Parameter(Mandatory = $true)][string]$FailureMessage
-    )
-    & $FilePath @ArgumentList | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "$FailureMessage (exit code $LASTEXITCODE)."
-    }
-}
-
-function Get-PythonExecutable {
-    $candidates = @()
-    $candidatePath = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
-    if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
-        # This version-specific path is created by the official per-user
-        # Python 3.12 installer, so it cannot accidentally select Python 3.13.
-        return $candidatePath
-    }
-    $launcher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
-    if ($null -ne $launcher) {
-        # Resolve the real interpreter from the launcher's inventory. This also
-        # works immediately after winget installs Python, before PATH refreshes.
-        $launcherInventory = @(& $launcher.Source '-0p' 2>$null)
-        foreach ($inventoryLine in $launcherInventory) {
-            if ($inventoryLine -match '(?i)^\s*-V:3\.12(?:-\d+)?\s+\*?\s*(.+?python(?:w)?\.exe)\s*$') {
-                $candidates += [pscustomobject]@{ Path = $Matches[1].Trim(); Arguments = @() }
-            }
-        }
-        $candidates += [pscustomobject]@{ Path = $launcher.Source; Arguments = @('-3.12') }
-    }
-    $python = Get-Command 'python.exe' -ErrorAction SilentlyContinue
-    if ($null -ne $python) {
-        $candidates += [pscustomobject]@{ Path = $python.Source; Arguments = @() }
-    }
-
-    $pythonMetadataScript = 'import sys; print(sys.executable); print("SUPPORTED" if sys.version_info[:2] == (3, 12) else "UNSUPPORTED")'
-    foreach ($candidate in $candidates) {
-        try {
-            $candidateArguments = @($candidate.Arguments) + @('-c', $pythonMetadataScript)
-            $metadata = @(& $candidate.Path @candidateArguments 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $metadata.Count -ge 2 -and ("$($metadata[-1])").Trim() -eq 'SUPPORTED') {
-                $resolved = $metadata[-2].Trim()
-                if (Test-Path -LiteralPath $resolved -PathType Leaf) {
-                    return $resolved
-                }
-            }
-        }
-        catch {
+    [[ -t 0 ]] || fail "A TMDB token is required. Run the installer interactively or set PISTICK_TMDB_TOKEN."
+    while true; do
+        printf '\nPaste your long TMDB API Read Access Token (typing is hidden): '
+        IFS= read -r -s TMDB_TOKEN
+        printf '\n'
+        if ! usable_token "$TMDB_TOKEN"; then
+            printf 'That does not look like the long TMDB Read Access Token. Try again.\n' >&2
             continue
-        }
-    }
-    return $null
+        fi
+        if validate_token "$TMDB_TOKEN"; then
+            break
+        fi
+    done
 }
 
-function Ensure-Python {
-    $pythonPath = Get-PythonExecutable
-    if ($null -ne $pythonPath) {
-        return $pythonPath
-    }
+write_config() {
+    install -d -m 0750 "${DATA_ROOT}/data" "${DATA_ROOT}/logs" "$CACHE_ROOT/chromium"
+    python3 -c '
+import json, os, secrets, sys
+path = sys.argv[1]
+token = sys.stdin.read().strip()
+try:
+    with open(path, encoding="utf-8-sig") as source:
+        data = json.load(source)
+except (OSError, ValueError, TypeError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+data["tmdb_read_token"] = token
+data.pop("tmdb_token", None)
+try:
+    port = int(data.get("port", 8787))
+except (TypeError, ValueError):
+    port = 8787
+data["port"] = port if 1024 <= port <= 65535 else 8787
+data["shutdown_token"] = str(data.get("shutdown_token") or secrets.token_urlsafe(32))
+temporary = path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as destination:
+    json.dump(data, destination, indent=2)
+    destination.write("\n")
+os.replace(temporary, path)
+' "$CONFIG_PATH" <<<"$TMDB_TOKEN"
+    chmod 0600 "$CONFIG_PATH"
 
-    $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
-    if ($null -eq $winget) {
-        throw 'Python 3.12 was not found and Windows Package Manager is unavailable. Install 64-bit Python 3.12 from https://www.python.org/downloads/windows/ and run this command again.'
-    }
-
-    Write-PiStickStep 'Installing Python 3.12 for the current user'
-    & $winget.Source @(
-        'install', '--id', 'Python.Python.3.12', '--exact', '--scope', 'user',
-        '--silent', '--accept-package-agreements', '--accept-source-agreements',
-        '--disable-interactivity'
-    ) | Out-Host
-    $wingetExitCode = $LASTEXITCODE
-
-    $pythonPath = Get-PythonExecutable
-    if ($null -ne $pythonPath) {
-        return $pythonPath
-    }
-    if ($wingetExitCode -ne 0) {
-        throw "Windows Package Manager could not install Python (exit code $wingetExitCode)."
-    }
-    throw 'Python was installed, but its executable could not be located. Open a new PowerShell window and run the PiStick install command again.'
+    if [[ "$TEST_MODE" != "1" ]]; then
+        chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_ROOT" "$CACHE_ROOT"
+    fi
 }
 
-function Get-LatestPublishedRelease {
-    Write-PiStickStep 'Checking the published PiStick releases'
-    $headers = @{
-        Accept = 'application/vnd.github+json'
-        'X-GitHub-Api-Version' = '2022-11-28'
-        'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
-    }
-    try {
-        $response = Invoke-RestMethod -Uri $ReleasesApi -Headers $headers -Method Get
-    }
-    catch {
-        $status = $null
-        if ($null -ne $_.Exception.Response) {
-            $status = [int]$_.Exception.Response.StatusCode
-        }
-        if ($status -eq 403) {
-            throw 'GitHub refused the release check, usually because its anonymous API limit was reached. Try again later.'
-        }
-        throw "The GitHub release check failed: $($_.Exception.Message)"
-    }
-
-    $published = @($response | Where-Object {
-        -not $_.draft -and $_.published_at -and $_.tag_name -and $_.zipball_url -and $null -ne $_.id
-    })
-    if ($published.Count -eq 0) {
-        throw 'No published PiStick release exists yet.'
-    }
-
-    $sortProperties = @(
-        @{ Expression = { [datetimeoffset]$_.published_at }; Descending = $true }
-        @{ Expression = { [long]$_.id }; Descending = $true }
-    )
-    $sorted = @($published | Sort-Object -Property $sortProperties)
-    return $sorted[0]
+configure_user_access() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return
+    fi
+    local groups=() group
+    for group in input video render audio bluetooth; do
+        if getent group "$group" >/dev/null; then
+            groups+=("$group")
+        fi
+    done
+    if ((${#groups[@]})); then
+        local joined
+        joined="$(IFS=,; printf '%s' "${groups[*]}")"
+        usermod -aG "$joined" "$TARGET_USER"
+    fi
+    rfkill unblock bluetooth 2>/dev/null || true
 }
 
-function Expand-TrustedZip {
-    param(
-        [Parameter(Mandatory = $true)][string]$ArchivePath,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
-    [IO.Directory]::CreateDirectory($Destination) | Out-Null
-    $destinationRoot = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
-    $destinationPrefix = $destinationRoot + '\'
-    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
-    try {
-        foreach ($entry in $archive.Entries) {
-            $relative = $entry.FullName.Replace('/', '\')
-            if ([string]::IsNullOrWhiteSpace($relative)) {
-                continue
-            }
-            $target = [IO.Path]::GetFullPath((Join-Path $destinationRoot $relative))
-            if (-not $target.StartsWith($destinationPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-                throw 'The release archive contains an unsafe path.'
-            }
-            if ([string]::IsNullOrEmpty($entry.Name)) {
-                [IO.Directory]::CreateDirectory($target) | Out-Null
-                continue
-            }
-            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
-            $sourceStream = $entry.Open()
-            $targetStream = [IO.File]::Open($target, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try {
-                $sourceStream.CopyTo($targetStream)
-            }
-            finally {
-                $targetStream.Dispose()
-                $sourceStream.Dispose()
-            }
-        }
-    }
-    finally {
-        $archive.Dispose()
-    }
+write_xwrapper() {
+    install -d -m 0755 "$(dirname "$XWRAPPER_PATH")"
+    cat >"$XWRAPPER_PATH" <<'EOF'
+allowed_users=anybody
+needs_root_rights=yes
+EOF
+    chmod 0644 "$XWRAPPER_PATH"
 }
 
-function Test-SafeRelativePath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if ([IO.Path]::IsPathRooted($Path) -or $Path -match '(^|[\\/])\.\.([\\/]|$)') {
-        return $false
-    }
-    return -not [string]::IsNullOrWhiteSpace($Path)
+write_services() {
+    step "Creating the boot services"
+    install -d -m 0755 "$SYSTEMD_ROOT"
+
+    cat >"${SYSTEMD_ROOT}/pistick-server.service" <<EOF
+[Unit]
+Description=PiStick local application server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=${TARGET_USER}
+Group=${TARGET_GROUP}
+WorkingDirectory=/opt/pistick/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PISTICK_LOW_MEMORY=1
+ExecStart=/usr/bin/python3 /opt/pistick/current/server.py --host 127.0.0.1 --port 8787 --data-dir /var/lib/pistick/data
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat >"${SYSTEMD_ROOT}/pistick-kiosk.service" <<EOF
+[Unit]
+Description=PiStick fullscreen television interface
+Requires=pistick-server.service
+After=pistick-server.service network-online.target systemd-user-sessions.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=${TARGET_USER}
+Group=${TARGET_GROUP}
+PAMName=login
+WorkingDirectory=/opt/pistick/current
+Environment=HOME=${TARGET_HOME}
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=${TARGET_HOME}/.Xauthority
+Environment=PISTICK_URL=http://127.0.0.1:8787/?platform=pi-zero-w
+Environment=PISTICK_BROWSER_PROFILE=/var/cache/pistick/chromium
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty1
+ExecStart=/opt/pistick/current/pi/launch-kiosk.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "${SYSTEMD_ROOT}/pistick-server.service" "${SYSTEMD_ROOT}/pistick-kiosk.service"
 }
 
-function Get-ValidatedReleaseSource {
-    param(
-        [Parameter(Mandatory = $true)]$Release,
-        [Parameter(Mandatory = $true)][string]$PythonPath
-    )
-    $archivePath = Join-Path $TemporaryDirectory 'release.zip'
-    $extractPath = Join-Path $TemporaryDirectory 'release'
-    Write-PiStickStep "Downloading published release $($Release.tag_name)"
-    Invoke-WebRequest -Uri ([string]$Release.zipball_url) -OutFile $archivePath -Headers @{
-        Accept = 'application/vnd.github+json'
-        'X-GitHub-Api-Version' = '2022-11-28'
-        'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
-    }
-    $archiveLength = (Get-Item -LiteralPath $archivePath).Length
-    if ($archiveLength -le 0 -or $archiveLength -gt 104857600) {
-        throw 'The release archive was empty or unexpectedly large.'
-    }
-    Expand-TrustedZip -ArchivePath $archivePath -Destination $extractPath
-
-    $entrypoints = @(Get-ChildItem -LiteralPath $extractPath -Filter 'main.py' -File -Recurse | Where-Object {
-        Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'pistick-release.json') -PathType Leaf
-    })
-    if ($entrypoints.Count -ne 1) {
-        throw 'The release archive does not contain one valid PiStick application root.'
-    }
-    $sourceRoot = $entrypoints[0].Directory.FullName
-    $manifestPath = Join-Path $sourceRoot 'pistick-release.json'
-    try {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    }
-    catch {
-        throw 'The release manifest is not valid JSON.'
-    }
-    if ($manifest.installer_schema -ne 1 -or $manifest.entrypoint -ne 'main.py' -or $manifest.updater -ne 'install.sh') {
-        throw 'The release manifest is not compatible with this installer.'
-    }
-    foreach ($relativePath in @($manifest.required_files)) {
-        $relativeText = [string]$relativePath
-        if (-not (Test-SafeRelativePath -Path $relativeText)) {
-            throw "The release manifest contains an unsafe required path: $relativeText"
-        }
-        if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot $relativeText) -PathType Leaf)) {
-            throw "The release is missing required file: $relativeText"
-        }
-    }
-    $windowsRequirements = Join-Path $sourceRoot 'requirements-windows.txt'
-    if (-not (Test-Path -LiteralPath $windowsRequirements -PathType Leaf)) {
-        throw 'The release does not contain requirements-windows.txt.'
-    }
-    Get-Content -LiteralPath (Join-Path $sourceRoot 'config.example.json') -Raw | ConvertFrom-Json | Out-Null
-    Invoke-NativeCommand -FilePath $PythonPath -ArgumentList @(
-        '-m', 'py_compile',
-        (Join-Path $sourceRoot 'main.py'),
-        (Join-Path $sourceRoot 'adblock.py'),
-        (Join-Path $sourceRoot 'playback_api.py')
-    ) -FailureMessage 'The downloaded release failed Python validation'
-    return $sourceRoot
+write_update_command() {
+    install -d -m 0755 "$LOCAL_BIN"
+    cat >"${LOCAL_BIN}/pistick-update" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+temporary="\$(mktemp \"\${TMPDIR:-/tmp}/pistick-update.XXXXXX.sh\")"
+trap 'rm -f -- "\$temporary"' EXIT
+curl -fsSL "https://raw.githubusercontent.com/${REPOSITORY}/refs/heads/${SOURCE_BRANCH}/install.sh" -o "\$temporary"
+if [[ \${EUID:-\$(id -u)} -eq 0 ]]; then
+    bash "\$temporary"
+else
+    sudo bash "\$temporary"
+fi
+EOF
+    chmod 0755 "${LOCAL_BIN}/pistick-update"
 }
 
-function Get-PlainText {
-    param([Parameter(Mandatory = $true)][Security.SecureString]$SecureValue)
-    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureValue)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-    }
+start_services() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return
+    fi
+    step "Starting PiStick"
+    systemctl daemon-reload
+    systemctl enable bluetooth.service >/dev/null 2>&1 || true
+    systemctl restart bluetooth.service >/dev/null 2>&1 || true
+    systemctl disable --now getty@tty1.service >/dev/null 2>&1 || true
+    systemctl enable pistick-server.service pistick-kiosk.service >/dev/null
+    systemctl restart pistick-server.service
+
+    local attempt
+    for attempt in $(seq 1 30); do
+        if curl -fsS --max-time 2 http://127.0.0.1:8787/health >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    curl -fsS --max-time 3 http://127.0.0.1:8787/health >/dev/null \
+        || fail "The local PiStick server did not pass its health check. Run: journalctl -u pistick-server -n 100"
+    systemctl restart pistick-kiosk.service
 }
 
-function Test-TmdbToken {
-    param([Parameter(Mandatory = $true)][string]$Token)
-    if ($env:PISTICK_SKIP_TMDB_VALIDATION -eq '1') {
-        return $true
-    }
-    try {
-        Invoke-RestMethod -Uri 'https://api.themoviedb.org/3/configuration' -Headers @{
-            Authorization = "Bearer $Token"
-            'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
-        } -Method Get | Out-Null
-        return $true
-    }
-    catch {
-        $status = $null
-        if ($null -ne $_.Exception.Response) {
-            $status = [int]$_.Exception.Response.StatusCode
-        }
-        if ($status -eq 401 -or $status -eq 403) {
-            return $false
-        }
-        throw "TMDB could not be reached to validate the API Read Access Token: $($_.Exception.Message)"
-    }
+print_summary() {
+    printf '\nPiStick for Pi Zero W is installed.\n'
+    printf '  Application: /opt/pistick/current\n'
+    printf '  Private data: /var/lib/pistick/data\n'
+    printf '  Guide: /opt/pistick/current/PI_ZERO_W_README.md\n'
+    if [[ "$TEST_MODE" != "1" ]]; then
+        printf '\nReboot once so the new controller/input groups apply:\n  sudo reboot\n'
+        printf '\nPair a Bluetooth controller over SSH with:\n  bluetoothctl\n'
+    fi
 }
 
-function Copy-LegacyUserData {
-    $legacyRoot = Join-Path $env:USERPROFILE 'PiStick'
-    if (-not (Test-Path -LiteralPath $ConfigPath) -and (Test-Path -LiteralPath (Join-Path $legacyRoot 'config.json') -PathType Leaf)) {
-        try {
-            Get-Content -LiteralPath (Join-Path $legacyRoot 'config.json') -Raw | ConvertFrom-Json | Out-Null
-            Copy-Item -LiteralPath (Join-Path $legacyRoot 'config.json') -Destination $ConfigPath
-            Write-PiStickStep 'Preserved the existing Windows PiStick configuration'
-        }
-        catch {
-            Write-Warning 'The old PiStick config.json was not valid and was not migrated.'
-        }
-    }
-    if (-not (Test-Path -LiteralPath $StatePath) -and (Test-Path -LiteralPath (Join-Path $legacyRoot 'pistick_state.json') -PathType Leaf)) {
-        try {
-            Get-Content -LiteralPath (Join-Path $legacyRoot 'pistick_state.json') -Raw | ConvertFrom-Json | Out-Null
-            Copy-Item -LiteralPath (Join-Path $legacyRoot 'pistick_state.json') -Destination $StatePath
-            Write-PiStickStep 'Preserved the existing Windows profiles and watch history'
-        }
-        catch {
-            Write-Warning 'The old PiStick state file was not valid and was not migrated.'
-        }
-    }
+main() {
+    require_root
+    check_platform
+    resolve_target_user
+    install_packages
+    prepare_source
+    check_source
+    collect_token
+    install_release
+    write_config
+    configure_user_access
+    write_xwrapper
+    write_services
+    write_update_command
+    start_services
+    print_summary
 }
 
-function Ensure-PiStickConfig {
-    param([Parameter(Mandatory = $true)][string]$ExampleConfigPath)
-    $config = $null
-    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
-        try {
-            $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-        }
-        catch {
-            Write-Warning 'The existing PiStick config.json is invalid. It will be replaced only after a valid token is entered.'
-        }
-    }
-    if ($null -eq $config) {
-        $config = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
-    }
-
-    $token = ''
-    if ($null -ne $config.PSObject.Properties['tmdb_read_token']) {
-        $token = [string]$config.tmdb_read_token
-    }
-    if ([string]::IsNullOrWhiteSpace($token) -and $null -ne $config.PSObject.Properties['tmdb_token']) {
-        $token = [string]$config.tmdb_token
-    }
-    if ($token -like 'PASTE_*') {
-        $token = ''
-    }
-    if ([string]::IsNullOrWhiteSpace($token) -and -not [string]::IsNullOrWhiteSpace($env:PISTICK_TMDB_TOKEN)) {
-        $token = $env:PISTICK_TMDB_TOKEN.Trim()
-    }
-
-    while ([string]::IsNullOrWhiteSpace($token)) {
-        $secureToken = Read-Host 'Paste your TMDB API Read Access Token' -AsSecureString
-        $token = (Get-PlainText -SecureValue $secureToken).Trim()
-        if ([string]::IsNullOrWhiteSpace($token)) {
-            Write-Warning 'The token cannot be empty.'
-            continue
-        }
-        if (-not (Test-TmdbToken -Token $token)) {
-            Write-Warning 'TMDB rejected that token. Use the long API Read Access Token, not the shorter v3 key.'
-            $token = ''
-        }
-    }
-
-    if ($null -eq $config.PSObject.Properties['tmdb_read_token']) {
-        $config | Add-Member -NotePropertyName 'tmdb_read_token' -NotePropertyValue $token
-    }
-    else {
-        $config.tmdb_read_token = $token
-    }
-    if ($null -ne $config.PSObject.Properties['tmdb_token']) {
-        $config.PSObject.Properties.Remove('tmdb_token')
-    }
-    if ($null -ne $config.PSObject.Properties['playback_base_url']) {
-        $config.PSObject.Properties.Remove('playback_base_url')
-    }
-
-    $temporaryConfig = "$ConfigPath.tmp"
-    Write-Utf8File -Path $temporaryConfig -Content (($config | ConvertTo-Json -Depth 20) + [Environment]::NewLine)
-    Move-Item -LiteralPath $temporaryConfig -Destination $ConfigPath -Force
-}
-
-function Install-PiStickIcon {
-    param([Parameter(Mandatory = $true)][string]$ReleaseSource)
-    $releaseIcon = Join-Path $ReleaseSource 'assets\pistick.ico'
-    $temporaryIcon = Join-Path $TemporaryDirectory 'pistick.ico'
-    if (Test-Path -LiteralPath $releaseIcon -PathType Leaf) {
-        Copy-Item -LiteralPath $releaseIcon -Destination $temporaryIcon -Force
-    }
-    else {
-        Write-PiStickStep 'Downloading the PiStick Start Menu icon'
-        Invoke-WebRequest -Uri $IconFallbackUrl -OutFile $temporaryIcon -Headers @{
-            'User-Agent' = "PiStick-Windows-Installer/$InstallerVersion"
-        }
-    }
-    $bytes = [IO.File]::ReadAllBytes($temporaryIcon)
-    if ($bytes.Length -lt 4 -or $bytes[0] -ne 0 -or $bytes[1] -ne 0 -or $bytes[2] -ne 1 -or $bytes[3] -ne 0) {
-        throw 'The PiStick icon is not a valid Windows ICO file.'
-    }
-    Move-Item -LiteralPath $temporaryIcon -Destination $IconPath -Force
-}
-
-function Write-Launcher {
-    $launcherSource = @'
-Option Explicit
-Dim shell, fileSystem, environment, appRoot, pointerFile, pointer, releaseName
-Dim releaseDirectory, runtimeDirectory, runtimePython, pythonw, python, entrypoint, command
-
-Set shell = CreateObject("WScript.Shell")
-Set fileSystem = CreateObject("Scripting.FileSystemObject")
-appRoot = fileSystem.GetParentFolderName(WScript.ScriptFullName)
-pointerFile = fileSystem.BuildPath(appRoot, "current-release.txt")
-
-If Not fileSystem.FileExists(pointerFile) Then
-    MsgBox "PiStick's active release could not be found. Run the installer again.", 16, "PiStick"
-    WScript.Quit 2
-End If
-
-Set pointer = fileSystem.OpenTextFile(pointerFile, 1, False)
-releaseName = ""
-If Not pointer.AtEndOfStream Then
-    releaseName = Trim(pointer.ReadLine)
-End If
-pointer.Close
-If Len(releaseName) = 0 Or InStr(releaseName, "\") > 0 Or InStr(releaseName, "/") > 0 Or InStr(releaseName, ":") > 0 Then
-    MsgBox "PiStick's active release record is invalid. Run the installer again.", 16, "PiStick"
-    WScript.Quit 2
-End If
-
-releaseDirectory = fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "releases"), releaseName)
-runtimeDirectory = fileSystem.BuildPath(fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "runtimes"), releaseName), "Scripts")
-pythonw = fileSystem.BuildPath(runtimeDirectory, "pythonw.exe")
-python = fileSystem.BuildPath(runtimeDirectory, "python.exe")
-entrypoint = fileSystem.BuildPath(releaseDirectory, "main.py")
-If fileSystem.FileExists(pythonw) Then
-    runtimePython = pythonw
-ElseIf fileSystem.FileExists(python) Then
-    runtimePython = python
-Else
-    MsgBox "PiStick is incomplete. Run the installer again.", 16, "PiStick"
-    WScript.Quit 2
-End If
-If Not fileSystem.FileExists(entrypoint) Then
-    MsgBox "PiStick is incomplete. Run the installer again.", 16, "PiStick"
-    WScript.Quit 2
-End If
-
-Set environment = shell.Environment("PROCESS")
-environment("PISTICK_CONFIG_PATH") = fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "data"), "config.json")
-environment("PISTICK_STATE_PATH") = fileSystem.BuildPath(fileSystem.BuildPath(appRoot, "data"), "pistick_state.json")
-environment("PISTICK_CACHE_DIR") = fileSystem.BuildPath(appRoot, "cache")
-shell.CurrentDirectory = releaseDirectory
-command = Chr(34) & runtimePython & Chr(34) & " " & Chr(34) & entrypoint & Chr(34)
-shell.Run command, 0, False
-'@
-    $temporaryLauncher = "$LauncherPath.tmp"
-    Write-Utf8File -Path $temporaryLauncher -Content ($launcherSource + [Environment]::NewLine)
-    Move-Item -LiteralPath $temporaryLauncher -Destination $LauncherPath -Force
-}
-
-function Write-StartMenuShortcut {
-    [IO.Directory]::CreateDirectory($StartMenuDirectory) | Out-Null
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($ShortcutPath)
-    $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
-    $shortcut.Arguments = '"' + $LauncherPath + '"'
-    $shortcut.WorkingDirectory = $InstallRoot
-    $shortcut.IconLocation = "$IconPath,0"
-    $shortcut.Description = 'Open PiStick'
-    $shortcut.Save()
-}
-
-try {
-    [IO.Directory]::CreateDirectory($TemporaryDirectory) | Out-Null
-    [IO.Directory]::CreateDirectory($InstallRoot) | Out-Null
-    [IO.Directory]::CreateDirectory($ReleasesDirectory) | Out-Null
-    [IO.Directory]::CreateDirectory($RuntimesDirectory) | Out-Null
-    [IO.Directory]::CreateDirectory($DataDirectory) | Out-Null
-    [IO.Directory]::CreateDirectory($CacheDirectory) | Out-Null
-
-    $pythonPath = Ensure-Python
-    $release = Get-LatestPublishedRelease
-    $safeTag = ([string]$release.tag_name -replace '[^A-Za-z0-9._-]', '_').Trim('_')
-    if ([string]::IsNullOrWhiteSpace($safeTag)) {
-        $safeTag = 'release'
-    }
-    if ($safeTag.Length -gt 80) {
-        $safeTag = $safeTag.Substring(0, 80)
-    }
-    $releaseName = "$([long]$release.id)-$safeTag"
-    $releaseDirectory = Join-Path $ReleasesDirectory $releaseName
-
-    if (-not (Test-Path -LiteralPath $releaseDirectory -PathType Container)) {
-        $releaseSource = Get-ValidatedReleaseSource -Release $release -PythonPath $pythonPath
-        $stagingRelease = Join-Path $ReleasesDirectory ('.staging-' + [guid]::NewGuid().ToString('N'))
-        [IO.Directory]::CreateDirectory($stagingRelease) | Out-Null
-        Get-ChildItem -LiteralPath $releaseSource -Force | Copy-Item -Destination $stagingRelease -Recurse -Force
-        Move-Item -LiteralPath $stagingRelease -Destination $releaseDirectory
-    }
-    else {
-        Write-PiStickStep "Published release $($release.tag_name) is already downloaded"
-    }
-
-    Write-PiStickStep 'Installing the private Python runtime and Windows dependencies'
-    $releaseRuntimeDirectory = Join-Path $RuntimesDirectory $releaseName
-    $runtimePython = Join-Path $releaseRuntimeDirectory 'Scripts\python.exe'
-    if (Test-Path -LiteralPath $runtimePython -PathType Leaf) {
-        $runtimeVersionCheck = @('-c', 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)')
-        & $runtimePython @runtimeVersionCheck 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning 'Replacing the existing PiStick runtime with the supported Python 3.12 runtime.'
-            Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force
-        }
-    }
-    if (-not (Test-Path -LiteralPath $runtimePython -PathType Leaf)) {
-        if (Test-Path -LiteralPath $releaseRuntimeDirectory) {
-            Remove-Item -LiteralPath $releaseRuntimeDirectory -Recurse -Force
-        }
-        Invoke-NativeCommand -FilePath $pythonPath -ArgumentList @('-m', 'venv', $releaseRuntimeDirectory) -FailureMessage 'Python could not create the PiStick runtime'
-        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList @(
-            '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', '-r',
-            (Join-Path $releaseDirectory 'requirements-windows.txt')
-        ) -FailureMessage 'PiStick Windows dependencies could not be installed'
-    }
-    $dependencyCheck = @(
-        '-c', 'import pygame, requests; from PySide6.QtWebEngineWidgets import QWebEngineView; from PySide6.QtWebView import QWebView'
-    )
-    try {
-        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList $dependencyCheck -FailureMessage 'PiStick Windows dependencies did not load correctly'
-    }
-    catch {
-        Write-Warning 'The existing PiStick runtime needs repair. Close PiStick if it is currently open.'
-        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList @(
-            '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', '-r',
-            (Join-Path $releaseDirectory 'requirements-windows.txt')
-        ) -FailureMessage 'PiStick Windows dependencies could not be repaired'
-        Invoke-NativeCommand -FilePath $runtimePython -ArgumentList $dependencyCheck -FailureMessage 'PiStick Windows dependencies did not load correctly after repair'
-    }
-
-    Copy-LegacyUserData
-    Ensure-PiStickConfig -ExampleConfigPath (Join-Path $releaseDirectory 'config.example.json')
-    Install-PiStickIcon -ReleaseSource $releaseDirectory
-    Write-Launcher
-
-    $temporaryPointer = "$CurrentReleaseFile.tmp"
-    Write-Utf8File -Path $temporaryPointer -Content ($releaseName + [Environment]::NewLine)
-    Move-Item -LiteralPath $temporaryPointer -Destination $CurrentReleaseFile -Force
-
-    $releaseInstaller = Join-Path $releaseDirectory 'install.ps1'
-    $installerSource = $null
-    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
-        $installerSource = $PSCommandPath
-    }
-    elseif (Test-Path -LiteralPath $releaseInstaller -PathType Leaf) {
-        $installerSource = $releaseInstaller
-    }
-    if ($null -ne $installerSource) {
-        $sourceFullPath = [IO.Path]::GetFullPath($installerSource)
-        $destinationFullPath = [IO.Path]::GetFullPath($InstalledInstallerPath)
-        if (-not $sourceFullPath.Equals($destinationFullPath, [StringComparison]::OrdinalIgnoreCase)) {
-            Copy-Item -LiteralPath $sourceFullPath -Destination $destinationFullPath -Force
-        }
-    }
-    Write-StartMenuShortcut
-
-    Write-PiStickStep "Installed $($release.tag_name) to $InstallRoot"
-    Write-Host 'PiStick is available from the Start Menu.' -ForegroundColor Green
-    Write-Host 'Run this installer again whenever you want to check for a published update.'
-
-    if (-not $NoLaunch) {
-        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') -ArgumentList ('"' + $LauncherPath + '"')
-    }
-}
-finally {
-    if (Test-Path -LiteralPath $TemporaryDirectory -PathType Container) {
-        Remove-Item -LiteralPath $TemporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
+main "$@"
