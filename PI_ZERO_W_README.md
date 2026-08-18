@@ -78,11 +78,10 @@ Use the long token, which usually begins with `eyJ`. Do not use the shorter v3 A
 
 ## Part 3: Install PiStick
 
-In the Pi's SSH window, run these two commands:
+In the Pi's SSH window, run this one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh
-sudo bash /tmp/pistick-install.sh
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/install-pistick.sh && sudo bash /tmp/install-pistick.sh
 ```
 
 The installer will:
@@ -157,6 +156,14 @@ sudo pistick-configure-tmdb
 ```
 
 Paste the new long API Read Access Token. The command validates it, saves it privately, and restarts only the PiStick server.
+
+To confirm that a token is saved without displaying or exposing it, run:
+
+```bash
+sudo pistick-configure-tmdb --check
+```
+
+If `/var/lib/pistick/data` does not exist, the Pi appliance installer did not finish. Do not create an empty `config.json` by hand. Run the one-line installer in **Part 3** again; it safely resumes and preserves any data from a previous completed installation.
 
 ## Part 5: Pair a controller
 
@@ -369,10 +376,12 @@ The original Zero W has only one CPU core. The branch already disables visual ef
 Run:
 
 ```bash
-sudo pistick-update
+sudo update-pistick
 ```
 
 The updater downloads the newest commit from `agent/pi-zero-w`, keeps the TMDB token, profiles, history, and browser data, then restarts PiStick.
+
+The older `sudo pistick-update` spelling remains as a compatibility alias, but `sudo update-pistick` is the main command going forward.
 
 ## Data locations
 

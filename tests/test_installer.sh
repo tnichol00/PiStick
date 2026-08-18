@@ -47,6 +47,26 @@ mkdir -p "$TEST_ROOT"
 bash -n "$PROJECT_DIR/install.sh"
 bash -n "$PROJECT_DIR/pi/launch-kiosk.sh"
 bash -n "$PROJECT_DIR/pi/kiosk-session.sh"
+bash -n "$PROJECT_DIR/pi/configure-tmdb.sh"
+
+# Even if the interactive token step is interrupted, the private data path is
+# prepared so the failure is recognizable and the installer can be rerun.
+PARTIAL_ROOT="${TEST_DIR}/partial-root"
+mkdir -p "$PARTIAL_ROOT"
+if env \
+    PISTICK_TEST_MODE=1 \
+    PISTICK_TEST_ROOT="$PARTIAL_ROOT" \
+    PISTICK_SOURCE_DIR="$PROJECT_DIR" \
+    PISTICK_USER=pistick \
+    PISTICK_GROUP=pistick \
+    PISTICK_HOME=/home/pistick \
+    PISTICK_UID=1000 \
+    PISTICK_SKIP_TMDB_VALIDATION=1 \
+    bash "$PROJECT_DIR/install.sh" </dev/null >"${TEST_DIR}/partial-install.log" 2>&1; then
+    fail "A noninteractive install without a TMDB token unexpectedly succeeded"
+fi
+[[ -d "$PARTIAL_ROOT/var/lib/pistick/data" ]] \
+    || fail "An interrupted install did not prepare the private data path"
 
 run_installer PISTICK_TMDB_TOKEN=test-tmdb-read-token-value
 
@@ -65,10 +85,16 @@ assert_file "$TEST_ROOT/var/lib/pistick/data/config.json"
 assert_file "$TEST_ROOT/etc/systemd/system/pistick-server.service"
 assert_file "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service"
 assert_file "$TEST_ROOT/etc/X11/Xwrapper.config"
+assert_file "$TEST_ROOT/usr/local/bin/update-pistick"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-update"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb"
 assert_file "$TEST_ROOT/usr/local/libexec/pistick-system-helper"
 assert_file "$TEST_ROOT/etc/sudoers.d/pistick-system"
+[[ -L "$TEST_ROOT/usr/local/bin/pistick-update" ]] \
+    || fail "The old updater spelling should be a compatibility symlink"
+[[ "$(readlink "$TEST_ROOT/usr/local/bin/pistick-update")" == "update-pistick" ]] \
+    || fail "The old updater spelling does not target update-pistick"
+bash -n "$TEST_ROOT/usr/local/bin/update-pistick"
 [[ "$(stat -c '%a' "$TEST_ROOT/var/lib/pistick/data/config.json")" == "600" ]] \
     || fail "The TMDB configuration file must be owner-only"
 
@@ -99,11 +125,53 @@ assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "?platform
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w"
 assert_contains "$TEST_ROOT/etc/sudoers.d/pistick-system" "pistick-system-helper wifi-connect"
 assert_contains "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" "TMDB token updated"
+assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "agent/pi-zero-w"
 assert_contains "$PROJECT_DIR/install.sh" "avahi-daemon"
 assert_contains "$PROJECT_DIR/install.sh" "hostnamectl set-hostname pistick"
 assert_contains "$CURRENT/pi/kiosk-session.sh" "--renderer-process-limit=2"
 assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
 assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
+
+token_status="$(
+    PISTICK_TEST_MODE=1 \
+    PISTICK_TEST_ROOT="$TEST_ROOT" \
+    bash "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" --check
+)"
+[[ "$token_status" == "TMDB token is set. The token itself was not displayed." ]] \
+    || fail "The SSH-only token check did not report a configured token"
+
+replacement_token="replacement-tmdb-read-token-value"
+configure_output="$(
+    PISTICK_TEST_MODE=1 \
+    PISTICK_TEST_ROOT="$TEST_ROOT" \
+    PISTICK_SKIP_TMDB_VALIDATION=1 \
+    PISTICK_TMDB_TOKEN="$replacement_token" \
+    bash "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb"
+)"
+[[ "$configure_output" != *"$replacement_token"* ]] \
+    || fail "The TMDB configuration command printed the private token"
+python3 - "$TEST_ROOT/var/lib/pistick/data/config.json" "$replacement_token" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    config = json.load(source)
+assert config["tmdb_read_token"] == sys.argv[2]
+assert config["port"] == 8787
+assert config["lan_enabled"] is True
+assert len(config["shutdown_token"]) >= 24
+PY
+[[ "$(stat -c '%a' "$TEST_ROOT/var/lib/pistick/data/config.json")" == "600" ]] \
+    || fail "Changing the TMDB token loosened its file permissions"
+
+MISSING_ROOT="${TEST_DIR}/missing-root"
+missing_output="${TEST_DIR}/missing-config.log"
+if PISTICK_TEST_MODE=1 PISTICK_TEST_ROOT="$MISSING_ROOT" \
+    bash "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" --check \
+    >"$missing_output" 2>&1; then
+    fail "The token check unexpectedly accepted a missing installation"
+fi
+assert_contains "$missing_output" "Run the Pi Zero W installer first"
 
 if grep -Rq "test-tmdb-read-token-value" \
     "$TEST_ROOT/etc/systemd/system" "$TEST_ROOT/opt/pistick"; then
@@ -148,5 +216,50 @@ run_installer
     || fail "A reinstall changed watch state"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
     || fail "A reinstall changed the saved configuration"
+
+# Exercise the exact documented updater command without contacting GitHub.
+# The fake curl supplies this checkout's installer, and the fake sudo lets the
+# test cover the non-root wrapper path used by GitHub's runner.
+FAKE_BIN="${TEST_DIR}/fake-bin"
+mkdir -p "$FAKE_BIN"
+cat >"$FAKE_BIN/curl" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+output=""
+while (($#)); do
+    case "$1" in
+        -o)
+            output="$2"
+            shift 2
+            ;;
+        *) shift ;;
+    esac
+done
+[[ -n "$output" ]]
+cp "$PISTICK_TEST_INSTALLER_SOURCE" "$output"
+SH
+cat >"$FAKE_BIN/sudo" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec "$@"
+SH
+chmod 0755 "$FAKE_BIN/curl" "$FAKE_BIN/sudo"
+
+env \
+    PATH="$FAKE_BIN:$PATH" \
+    PISTICK_TEST_INSTALLER_SOURCE="$PROJECT_DIR/install.sh" \
+    PISTICK_TEST_MODE=1 \
+    PISTICK_TEST_ROOT="$TEST_ROOT" \
+    PISTICK_SOURCE_DIR="$PROJECT_DIR" \
+    PISTICK_USER=pistick \
+    PISTICK_GROUP=pistick \
+    PISTICK_HOME=/home/pistick \
+    PISTICK_UID=1000 \
+    PISTICK_SKIP_TMDB_VALIDATION=1 \
+    bash "$TEST_ROOT/usr/local/bin/update-pistick"
+[[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)" == "$state_hash" ]] \
+    || fail "update-pistick changed watch state"
+[[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
+    || fail "update-pistick changed the saved configuration"
 
 printf 'All Pi Zero W installer checks passed.\n'

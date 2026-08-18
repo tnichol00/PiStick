@@ -165,6 +165,20 @@ install_packages() {
     apt-get install -y --no-install-recommends "${packages[@]}"
 }
 
+prepare_private_data() {
+    step "Preparing PiStick's private data directories"
+    install -d -m 0750 \
+        "$DATA_ROOT" \
+        "${DATA_ROOT}/data" \
+        "${DATA_ROOT}/logs" \
+        "$CACHE_ROOT" \
+        "${CACHE_ROOT}/chromium"
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_ROOT" "$CACHE_ROOT"
+    fi
+}
+
 prepare_source() {
     if [[ -n "$SOURCE_DIR" ]]; then
         SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
@@ -325,7 +339,6 @@ collect_token() {
 }
 
 write_config() {
-    install -d -m 0750 "${DATA_ROOT}/data" "${DATA_ROOT}/logs" "$CACHE_ROOT/chromium"
     python3 -c '
 import json, os, secrets, sys
 path = sys.argv[1]
@@ -345,7 +358,10 @@ except (TypeError, ValueError):
     port = 8787
 data["port"] = port if 1024 <= port <= 65535 else 8787
 data["shutdown_token"] = str(data.get("shutdown_token") or secrets.token_urlsafe(32))
-data["lan_enabled"] = bool(data.get("lan_enabled", True))
+lan_enabled = data.get("lan_enabled", True)
+if isinstance(lan_enabled, str):
+    lan_enabled = lan_enabled.strip().lower() in {"1", "true", "yes", "on"}
+data["lan_enabled"] = bool(lan_enabled)
 temporary = path + ".tmp"
 with open(temporary, "w", encoding="utf-8") as destination:
     json.dump(data, destination, indent=2)
@@ -509,19 +525,31 @@ EOF
 
 write_update_command() {
     install -d -m 0755 "$LOCAL_BIN"
-    cat >"${LOCAL_BIN}/pistick-update" <<EOF
+    cat >"${LOCAL_BIN}/update-pistick" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-temporary="\$(mktemp \"\${TMPDIR:-/tmp}/pistick-update.XXXXXX.sh\")"
+umask 077
+
+temporary="\$(mktemp "\${TMPDIR:-/tmp}/update-pistick.XXXXXX.sh")"
 trap 'rm -f -- "\$temporary"' EXIT
+
+printf '[PiStick] Downloading the newest Pi Zero W installer...\n'
 curl -fsSL "https://raw.githubusercontent.com/${REPOSITORY}/refs/heads/${SOURCE_BRANCH}/install.sh" -o "\$temporary"
+if ! grep -Fq 'SOURCE_BRANCH="${SOURCE_BRANCH}"' "\$temporary"; then
+    printf 'PiStick update failed: the downloaded installer was not the Pi Zero W installer.\n' >&2
+    exit 1
+fi
+
 if [[ \${EUID:-\$(id -u)} -eq 0 ]]; then
     bash "\$temporary"
 else
     sudo bash "\$temporary"
 fi
 EOF
-    chmod 0755 "${LOCAL_BIN}/pistick-update"
+    chmod 0755 "${LOCAL_BIN}/update-pistick"
+
+    # Keep the old command working for existing branch installations.
+    ln -sfn "update-pistick" "${LOCAL_BIN}/pistick-update"
 }
 
 start_services() {
@@ -560,6 +588,7 @@ print_summary() {
         printf '\nPair a Bluetooth controller over SSH with:\n  bluetoothctl\n'
         printf '\nOther devices on this Wi-Fi can open:\n  http://pistick.local\n'
         printf '\nChange the TMDB token over SSH with:\n  sudo pistick-configure-tmdb\n'
+        printf '\nInstall future PiStick updates with:\n  sudo update-pistick\n'
     fi
 }
 
@@ -568,6 +597,7 @@ main() {
     check_platform
     resolve_target_user
     install_packages
+    prepare_private_data
     prepare_source
     check_source
     collect_token

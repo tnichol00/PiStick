@@ -119,7 +119,7 @@ PiStick uses the long Read Access Token as a Bearer token. Do not use the shorte
 This branch's installer is intended for the original Pi Zero W on **Raspberry Pi OS Legacy Lite (32-bit, Bookworm)**. Follow the separate [Pi Zero W installation and controller guide](PI_ZERO_W_README.md). The installation command is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/install-pistick.sh && sudo bash /tmp/install-pistick.sh
 ```
 
 The installer saves private configuration under `/var/lib/pistick`, installs PiStick under `/opt/pistick`, starts it immediately, and launches it automatically after every boot. Other devices on the same Wi-Fi can open `http://pistick.local` while LAN access is enabled.
@@ -177,7 +177,7 @@ Replace `192.168.1.123` with the Pi's actual address.
 After copying the TMDB token, run the Linux command shown above:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/pistick-install.sh && sudo bash /tmp/pistick-install.sh
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/install-pistick.sh && sudo bash /tmp/install-pistick.sh
 ```
 
 The installer prompts for:
@@ -210,7 +210,7 @@ The Linux installer also:
 - Points `/opt/pistick/current` at the active release.
 - Creates a minimal fullscreen X11 service with no desktop.
 - Starts PiStick at boot and restarts it if it crashes.
-- Installs the manual `pistick-update` command.
+- Installs the manual `update-pistick` command and keeps `pistick-update` as a compatibility alias.
 - Installs HDMI-only Wi-Fi and controller controls plus the SSH-only `pistick-configure-tmdb` command.
 - Keeps application releases separate from private configuration and watch data.
 
@@ -228,7 +228,7 @@ Updates remain manual on both platforms.
 On Linux, connect over SSH and run:
 
 ```bash
-sudo pistick-update
+sudo update-pistick
 ```
 
 On Windows, rerun the Windows installation command, or run the saved installer directly:
@@ -307,6 +307,12 @@ The TMDB token is also unavailable through the browser. Change it over SSH with:
 
 ```bash
 sudo pistick-configure-tmdb
+```
+
+Confirm a token is saved without displaying it:
+
+```bash
+sudo pistick-configure-tmdb --check
 ```
 
 ## Controller setup
@@ -399,7 +405,7 @@ GitHub may have temporarily rate-limited an anonymous branch download. Wait and 
 
 Confirm the branch URL in [PI_ZERO_W_README.md](PI_ZERO_W_README.md), then check that the Pi can reach GitHub with `ping -c 3 github.com`.
 
-### `pistick-update: command not found`
+### `update-pistick: command not found`
 
 Rerun the full installation command. It safely reuses the existing private configuration and release data while restoring the updater command.
 
@@ -420,11 +426,13 @@ command -v chromium-browser || command -v chromium
 
 ### The TMDB setup message remains visible
 
-Validate the private configuration file:
+First confirm that a token is saved without displaying it:
 
 ```bash
-sudo python3 -m json.tool /var/lib/pistick/data/config.json
+sudo pistick-configure-tmdb --check
 ```
+
+If that command reports that `/var/lib/pistick/data` does not exist, the appliance installer never finished. Rerun the full installation command above instead of creating an empty configuration file manually.
 
 Then restart PiStick:
 
@@ -456,10 +464,10 @@ The trailer screen uses Chromium and is the heaviest part of this Pi edition. An
 
 ### A movie or episode does not load
 
-First validate the local configuration and confirm the TMDB token file is valid JSON:
+First confirm that the private TMDB token is saved:
 
 ```bash
-sudo python3 -m json.tool /var/lib/pistick/data/config.json
+sudo pistick-configure-tmdb --check
 ```
 
 Then test Videasy's player from the Pi:
