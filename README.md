@@ -1,6 +1,6 @@
 # PiStick
 
-> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch replaces the broken Linux installer with a real Raspberry Pi OS Legacy Lite (32-bit Bookworm) appliance setup. It runs the lightweight PiStick server in fullscreen Chromium, starts at boot, includes low-memory tuning, HDMI-only Wi-Fi/controller settings, and optional unauthenticated access at `http://pistick.local`. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
+> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch replaces the broken Linux installer with a real Raspberry Pi OS Legacy Lite (32-bit Bookworm) appliance setup. It runs the lightweight PiStick server with an ARMv6-compatible Cog/WPE kiosk on the original Zero W (Chromium on newer Pis), starts at boot, includes low-memory tuning, HDMI-only Wi-Fi/controller settings, and optional unauthenticated access at `http://pistick.local`. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
 
 > **Windows localhost-server edition:** the `agent/windows-local-server` branch runs PiStick silently in the Windows background and serves the interface at `http://127.0.0.1:8787`. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
 
@@ -53,7 +53,7 @@ For Windows:
 - 64-bit Windows 10 or Windows 11
 - Microsoft Edge WebView2 Runtime; Windows 11 normally includes it
 
-The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick is tuned for it, but Chromium-based trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
+The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick uses Cog/WPE because current Raspberry Pi OS Chromium builds no longer support that CPU, but trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
 
 ## Videasy playback
 
@@ -75,7 +75,7 @@ https://player.videasy.to/tv/1399/1/3
 
 Videasy's docs currently show `player.videasy.net`, which redirects to `player.videasy.to`. PiStick uses the final HTTPS origin directly so its anti-popup navigation lock does not reject that redirect. When saved progress exists, PiStick appends only Videasy's documented `progress` parameter, such as `?progress=120`.
 
-On this Pi Zero W branch, PiStick loads the player inside the fullscreen Raspberry Pi OS Chromium package. This avoids Qt WebEngine and uses the browser's normal media-codec and Gamepad API support. Movies open from **Watch Movie**; TV shows first open the season and episode picker. Controller A toggles playback, X requests English subtitles, Left/Right seeks, and B closes the player.
+On this Pi Zero W branch, PiStick loads the player inside the fullscreen browser selected for the CPU. This avoids Qt WebEngine and uses standard browser media and Gamepad APIs. Movies open from **Watch Movie**; TV shows first open the season and episode picker. Controller A toggles playback, X requests English subtitles, Left/Right seeks, and B closes the player.
 
 Videasy sends `PLAYER_EVENT` progress messages containing the current timestamp and duration. The PiStick web interface accepts those documented messages with origin checks and saves the reported position per profile.
 
@@ -95,11 +95,11 @@ PiStick reads the latest reported state every two seconds. The timestamp and dur
 
 An in-progress TV show exposes separate **Mark Episode as Finished** and **Mark Show as Finished** actions. Finishing the whole show removes it from Continue Watching and replaces those actions with the same **Mark as Unwatched** action used for finished movies.
 
-Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern Chromium keeps different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
+Do not use `document.domain`, `window.parent.addEventListener(...)`, or direct reads from `iframe.contentWindow.document` to connect frames. Modern browsers keep different origins isolated. Register listeners on the current frame's own `window` and exchange data with `window.top.postMessage(...)` instead.
 
 ### Playback sandbox
 
-On this Pi branch, every third-party player is placed in a restricted cross-origin iframe. Pop-up windows, downloads, payment requests, and top-level navigation are not granted. The full desktop and Windows editions have additional engine-specific host filtering; those filters are not claimed by this lightweight Chromium edition.
+On this Pi branch, every third-party player is placed in a restricted cross-origin iframe. Pop-up windows, downloads, payment requests, and top-level navigation are not granted. The full desktop and Windows editions have additional engine-specific host filtering; those filters are not claimed by this lightweight appliance edition.
 
 ## Install PiStick
 
@@ -134,7 +134,7 @@ PiStick is designed for a fresh **Raspberry Pi OS Legacy Lite (32-bit, Bookworm)
 The finished boot flow is:
 
 ```text
-Power on -> Raspberry Pi OS Lite -> minimal X11 session -> PiStick fullscreen
+Power on -> Raspberry Pi OS Lite -> PiStick server -> CPU-compatible fullscreen browser
 ```
 
 #### 1. Write Raspberry Pi OS to the microSD card
@@ -188,7 +188,7 @@ Paste your TMDB API Read Access Token:
 
 Paste the token and press Enter. The prompt is hidden, so the value does not appear while it is pasted or typed. It is stored only in `/var/lib/pistick/data/config.json` on the Pi.
 
-The first installation can take a while on an original Pi Zero W because the Pi must download Chromium and the minimal display packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again.
+The first installation can take a while on an original Pi Zero W because the Pi must download WPE WebKit and media packages. Leave the SSH window open. If the connection is interrupted, reconnect and run the same command again.
 
 When installation succeeds, PiStick starts immediately and launches automatically after every boot.
 
@@ -204,11 +204,11 @@ Both installers:
 The Linux installer also:
 
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
-- Installs Python, Chromium, minimal X11, Openbox, fonts, NetworkManager, mDNS, and Bluetooth support.
+- Installs Python, fonts, media codecs, NetworkManager, mDNS, Bluetooth support, and either Cog/WPE (ARMv6) or Chromium/X11 (newer Pis).
 - Downloads the dedicated `agent/pi-zero-w` branch and validates its required files and syntax.
 - Stores immutable release snapshots under `/opt/pistick/releases/`.
 - Points `/opt/pistick/current` at the active release.
-- Creates a minimal fullscreen X11 service with no desktop.
+- Creates a minimal fullscreen service with no desktop and selects its browser from the Pi's CPU architecture.
 - Starts PiStick at boot and restarts it if it crashes.
 - Installs the manual `update-pistick` command and keeps `pistick-update` as a compatibility alias.
 - Installs HDMI-only Wi-Fi and controller controls plus the SSH-only `pistick-configure-tmdb` command.
@@ -421,7 +421,7 @@ Then check the installed server and browser:
 
 ```bash
 python3 -c "import pistick_server; print('Server OK')"
-command -v chromium-browser || command -v chromium
+sudo pistick-diagnose
 ```
 
 ### The TMDB setup message remains visible
@@ -460,7 +460,7 @@ If no device appears, reconnect or pair the controller again. If a device appear
 
 ### Trailer playback is slow
 
-The trailer screen uses Chromium and is the heaviest part of this Pi edition. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
+The trailer screen is the heaviest part of this Pi edition. An original Pi Zero W may still struggle with YouTube playback even when the rest of the interface is responsive.
 
 ### A movie or episode does not load
 
@@ -476,7 +476,7 @@ Then test Videasy's player from the Pi:
 curl -I https://player.videasy.to/movie/550
 ```
 
-The player needs JavaScript and media playback support from the browser engine. Check the PiStick logs for Chromium, network, or certificate errors:
+The player needs JavaScript and media playback support from the browser engine. Check the PiStick logs for browser, network, or certificate errors:
 
 ```bash
 journalctl -u pistick-kiosk.service -b -n 100 --no-pager

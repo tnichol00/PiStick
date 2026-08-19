@@ -275,8 +275,11 @@ class ApplicationTests(unittest.TestCase):
         response = self.app.dispatch("GET", "/", {})
         self.assertEqual(response.status, 200)
         self.assertIn(b"PiStick", response.body)
+        self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
+
         script = self.app.dispatch("GET", "/app.js", {})
         self.assertEqual(script.status, 200)
+        self.assertEqual(script.headers.get("Cache-Control"), "no-cache")
         self.assertIn(b"/api/watch/progress", script.body)
         self.assertIn(b"openSearchKeyboard", script.body)
         self.assertIn(b"/api/system/wifi/connect", script.body)

@@ -490,9 +490,10 @@ class PiStickApplication:
                 if (content_type or "").startswith(("text/", "application/javascript"))
                 else ""
             ),
-            headers={
-                "Cache-Control": "no-cache" if candidate.name == "index.html" else "public, max-age=3600"
-            },
+            # The appliance serves these files over loopback. Revalidating is
+            # cheap and ensures a manual update cannot leave stale JS or CSS
+            # in the persistent kiosk profile.
+            headers={"Cache-Control": "no-cache"},
         )
 
 

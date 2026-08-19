@@ -3,8 +3,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 # PiStick appliance installer for the original Raspberry Pi Zero W.
-# This branch intentionally uses the lightweight PiStick server and the
-# Raspberry Pi OS Chromium package instead of Qt WebEngine.
+# The ARMv6 Zero W uses Cog/WPE WebKit because current Chromium packages no
+# longer support its CPU. Newer Pi models keep the Chromium/X11 kiosk.
 
 REPOSITORY="tnichol00/PiStick"
 SOURCE_BRANCH="agent/pi-zero-w"
@@ -28,6 +28,7 @@ CONFIG_PATH="${DATA_ROOT}/data/config.json"
 TEMP_DIR=""
 SOURCE_DIR="${PISTICK_SOURCE_DIR:-}"
 TMDB_TOKEN="${PISTICK_TMDB_TOKEN:-}"
+MACHINE="${PISTICK_MACHINE:-$(uname -m)}"
 
 cleanup() {
     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
@@ -68,20 +69,18 @@ check_platform() {
         raspbian|debian) ;;
         *) fail "Use Raspberry Pi OS Legacy Lite (32-bit, Bookworm)." ;;
     esac
-    local machine
-    machine="$(uname -m)"
-    case "$machine" in
+    case "$MACHINE" in
         armv6l|armv7l|aarch64) ;;
-        *) fail "This installer is for Raspberry Pi hardware, not $machine." ;;
+        *) fail "This installer is for Raspberry Pi hardware, not $MACHINE." ;;
     esac
-    if [[ "$machine" == "armv6l" ]]; then
+    if [[ "$MACHINE" == "armv6l" ]]; then
         local debian_major
         debian_major="${VERSION_ID%%.*}"
         if [[ "$debian_major" =~ ^[0-9]+$ ]] && ((debian_major >= 13)); then
             fail "The original Pi Zero W needs Raspberry Pi OS Legacy Lite (32-bit, Bookworm). Trixie's browsers require a newer CPU."
         fi
     fi
-    if [[ "$machine" == "aarch64" ]]; then
+    if [[ "$MACHINE" == "aarch64" ]]; then
         printf 'Warning: the original Pi Zero W should use Raspberry Pi OS Legacy Lite (32-bit, Bookworm).\n' >&2
     fi
 }
@@ -113,11 +112,15 @@ resolve_target_user() {
 
 install_packages() {
     if [[ "$TEST_MODE" == "1" ]]; then
-        BROWSER_PACKAGE="chromium"
+        if [[ "$MACHINE" == "armv6l" ]]; then
+            BROWSER_PACKAGE="cog"
+        else
+            BROWSER_PACKAGE="chromium"
+        fi
         return
     fi
 
-    step "Installing the minimal display, browser, Python, and Bluetooth packages"
+    step "Installing the browser, media, Python, network, and controller packages"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
 
@@ -126,12 +129,6 @@ install_packages() {
         curl
         git
         python3
-        xserver-xorg-core
-        xserver-xorg-legacy
-        xinit
-        openbox
-        x11-xserver-utils
-        dbus-x11
         alsa-utils
         pulseaudio
         pulseaudio-utils
@@ -144,19 +141,42 @@ install_packages() {
         sudo
     )
 
-    if package_available chromium-browser; then
-        BROWSER_PACKAGE="chromium-browser"
-    elif package_available chromium; then
-        BROWSER_PACKAGE="chromium"
+    if [[ "$MACHINE" == "armv6l" ]]; then
+        package_available cog \
+            || fail "Raspberry Pi OS Legacy Bookworm did not provide the ARMv6-compatible Cog browser."
+        BROWSER_PACKAGE="cog"
+        packages+=(
+            cog
+            libgl1-mesa-dri
+            gstreamer1.0-alsa
+            gstreamer1.0-libav
+            gstreamer1.0-plugins-base
+            gstreamer1.0-plugins-good
+            gstreamer1.0-plugins-bad
+        )
     else
-        fail "Raspberry Pi OS did not provide Chromium. Update the OS and run the installer again."
-    fi
-    packages+=("$BROWSER_PACKAGE")
+        packages+=(
+            xserver-xorg-core
+            xserver-xorg-legacy
+            xinit
+            openbox
+            x11-xserver-utils
+            dbus-x11
+        )
+        if package_available chromium-browser; then
+            BROWSER_PACKAGE="chromium-browser"
+        elif package_available chromium; then
+            BROWSER_PACKAGE="chromium"
+        else
+            fail "Raspberry Pi OS did not provide Chromium. Update the OS and run the installer again."
+        fi
+        packages+=("$BROWSER_PACKAGE")
 
-    if package_available unclutter-xfixes; then
-        packages+=(unclutter-xfixes)
-    elif package_available unclutter; then
-        packages+=(unclutter)
+        if package_available unclutter-xfixes; then
+            packages+=(unclutter-xfixes)
+        elif package_available unclutter; then
+            packages+=(unclutter)
+        fi
     fi
     if package_available pi-bluetooth; then
         packages+=(pi-bluetooth)
@@ -172,7 +192,8 @@ prepare_private_data() {
         "${DATA_ROOT}/data" \
         "${DATA_ROOT}/logs" \
         "$CACHE_ROOT" \
-        "${CACHE_ROOT}/chromium"
+        "${CACHE_ROOT}/chromium" \
+        "${CACHE_ROOT}/cog"
 
     if [[ "$TEST_MODE" != "1" ]]; then
         chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_ROOT" "$CACHE_ROOT"
@@ -205,7 +226,9 @@ check_source() {
         pistick_server/static/app.js
         pistick_server/static/styles.css
         pi/launch-kiosk.sh
+        pi/kiosk-cog.sh
         pi/kiosk-session.sh
+        pi/diagnose.sh
         pi/pistick-system-helper.py
         pi/configure-tmdb.sh
         PI_ZERO_W_README.md
@@ -215,7 +238,9 @@ check_source() {
         [[ -f "${SOURCE_DIR}/${path}" ]] || fail "The branch is missing $path."
     done
     bash -n "${SOURCE_DIR}/pi/launch-kiosk.sh"
+    bash -n "${SOURCE_DIR}/pi/kiosk-cog.sh"
     bash -n "${SOURCE_DIR}/pi/kiosk-session.sh"
+    bash -n "${SOURCE_DIR}/pi/diagnose.sh"
     bash -n "${SOURCE_DIR}/pi/configure-tmdb.sh"
     python3 -m py_compile \
         "${SOURCE_DIR}/server.py" \
@@ -251,7 +276,11 @@ install_release() {
     cp -a "${SOURCE_DIR}/pi" "$staging/pi"
     install -m 0644 "${SOURCE_DIR}/PI_ZERO_W_README.md" "$staging/PI_ZERO_W_README.md"
     [[ ! -f "${SOURCE_DIR}/LICENSE" ]] || install -m 0644 "${SOURCE_DIR}/LICENSE" "$staging/LICENSE"
-    chmod 0755 "$staging/pi/launch-kiosk.sh" "$staging/pi/kiosk-session.sh"
+    chmod 0755 \
+        "$staging/pi/launch-kiosk.sh" \
+        "$staging/pi/kiosk-cog.sh" \
+        "$staging/pi/kiosk-session.sh" \
+        "$staging/pi/diagnose.sh"
     find "$staging" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 
     mv "$staging" "$release_dir"
@@ -412,6 +441,9 @@ install_system_helpers() {
     install -m 0755 \
         "${INSTALL_ROOT}/current/pi/configure-tmdb.sh" \
         "${LOCAL_BIN}/pistick-configure-tmdb"
+    install -m 0755 \
+        "${INSTALL_ROOT}/current/pi/diagnose.sh" \
+        "${LOCAL_BIN}/pistick-diagnose"
     cat >"$sudoers_temporary" <<EOF
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper status
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/libexec/pistick-system-helper wifi-scan
@@ -503,10 +535,15 @@ Environment=DISPLAY=:0
 Environment=XAUTHORITY=${TARGET_HOME}/.Xauthority
 Environment=PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w
 Environment=PISTICK_BROWSER_PROFILE=/var/cache/pistick/chromium
+Environment=PISTICK_COG_PROFILE=/var/cache/pistick/cog
+Environment=PISTICK_MAX_DISPLAY_MODE=1280x720@60
+RuntimeDirectory=pistick-kiosk
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/pistick-kiosk
 TTYPath=/dev/tty1
 StandardInput=tty
-StandardOutput=journal
-StandardError=journal
+StandardOutput=journal+console
+StandardError=journal+console
 TTYReset=yes
 TTYVHangup=yes
 TTYVTDisallocate=yes
@@ -589,6 +626,7 @@ print_summary() {
         printf '\nOther devices on this Wi-Fi can open:\n  http://pistick.local\n'
         printf '\nChange the TMDB token over SSH with:\n  sudo pistick-configure-tmdb\n'
         printf '\nInstall future PiStick updates with:\n  sudo update-pistick\n'
+        printf '\nCollect safe display diagnostics with:\n  sudo pistick-diagnose\n'
     fi
 }
 

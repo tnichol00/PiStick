@@ -213,6 +213,26 @@ class TMDBClient:
         return items
 
     def home(self) -> dict[str, Any]:
+        if self.low_memory:
+            # One TMDB round trip is much more reliable on the single-core
+            # ARMv6 Zero W than holding the home request open for five feeds.
+            # The full discover pages remain available from the navigation.
+            payload = self._request("/trending/all/week", {"page": 1})
+            trending = self._items(payload)
+            rows = [
+                {"title": "Trending Now", "items": trending},
+                {
+                    "title": "Trending Movies",
+                    "items": [item for item in trending if item.get("media_type") == "movie"],
+                },
+                {
+                    "title": "Trending TV Shows",
+                    "items": [item for item in trending if item.get("media_type") == "tv"],
+                },
+            ]
+            hero = next((item for item in trending if item.get("backdrop_path")), None)
+            return {"hero": hero, "rows": rows}
+
         definitions = (
             ("Trending Now", "/trending/all/week", None),
             ("Popular Movies", "/movie/popular", "movie"),
@@ -222,8 +242,7 @@ class TMDBClient:
         )
         rows: dict[int, dict[str, Any]] = {}
         errors: list[str] = []
-        worker_count = 2 if self.low_memory else len(definitions)
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        with ThreadPoolExecutor(max_workers=len(definitions)) as pool:
             futures = {
                 pool.submit(self._request, endpoint, {"page": 1}): (index, title, kind)
                 for index, (title, endpoint, kind) in enumerate(definitions)

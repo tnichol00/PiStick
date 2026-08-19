@@ -38,6 +38,7 @@ run_installer() {
         PISTICK_GROUP=pistick \
         PISTICK_HOME=/home/pistick \
         PISTICK_UID=1000 \
+        PISTICK_MACHINE=armv6l \
         PISTICK_SKIP_TMDB_VALIDATION=1 \
         "$@" \
         bash "$PROJECT_DIR/install.sh"
@@ -46,7 +47,9 @@ run_installer() {
 mkdir -p "$TEST_ROOT"
 bash -n "$PROJECT_DIR/install.sh"
 bash -n "$PROJECT_DIR/pi/launch-kiosk.sh"
+bash -n "$PROJECT_DIR/pi/kiosk-cog.sh"
 bash -n "$PROJECT_DIR/pi/kiosk-session.sh"
+bash -n "$PROJECT_DIR/pi/diagnose.sh"
 bash -n "$PROJECT_DIR/pi/configure-tmdb.sh"
 
 # Even if the interactive token step is interrupted, the private data path is
@@ -61,6 +64,7 @@ if env \
     PISTICK_GROUP=pistick \
     PISTICK_HOME=/home/pistick \
     PISTICK_UID=1000 \
+    PISTICK_MACHINE=armv6l \
     PISTICK_SKIP_TMDB_VALIDATION=1 \
     bash "$PROJECT_DIR/install.sh" </dev/null >"${TEST_DIR}/partial-install.log" 2>&1; then
     fail "A noninteractive install without a TMDB token unexpectedly succeeded"
@@ -77,7 +81,9 @@ assert_file "$CURRENT/playback_api.py"
 assert_file "$CURRENT/pistick_server/static/app.js"
 assert_file "$CURRENT/pistick_server/system_control.py"
 assert_file "$CURRENT/pi/launch-kiosk.sh"
+assert_file "$CURRENT/pi/kiosk-cog.sh"
 assert_file "$CURRENT/pi/kiosk-session.sh"
+assert_file "$CURRENT/pi/diagnose.sh"
 assert_file "$CURRENT/pi/pistick-system-helper.py"
 assert_file "$CURRENT/pi/configure-tmdb.sh"
 assert_file "$CURRENT/PI_ZERO_W_README.md"
@@ -87,6 +93,7 @@ assert_file "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service"
 assert_file "$TEST_ROOT/etc/X11/Xwrapper.config"
 assert_file "$TEST_ROOT/usr/local/bin/update-pistick"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-update"
+assert_file "$TEST_ROOT/usr/local/bin/pistick-diagnose"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb"
 assert_file "$TEST_ROOT/usr/local/libexec/pistick-system-helper"
 assert_file "$TEST_ROOT/etc/sudoers.d/pistick-system"
@@ -95,6 +102,7 @@ assert_file "$TEST_ROOT/etc/sudoers.d/pistick-system"
 [[ "$(readlink "$TEST_ROOT/usr/local/bin/pistick-update")" == "update-pistick" ]] \
     || fail "The old updater spelling does not target update-pistick"
 bash -n "$TEST_ROOT/usr/local/bin/update-pistick"
+bash -n "$TEST_ROOT/usr/local/bin/pistick-diagnose"
 [[ "$(stat -c '%a' "$TEST_ROOT/var/lib/pistick/data/config.json")" == "600" ]] \
     || fail "The TMDB configuration file must be owner-only"
 
@@ -123,14 +131,43 @@ if grep -Fq "NoNewPrivileges=true" "$TEST_ROOT/etc/systemd/system/pistick-server
 fi
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "?platform=pi-zero-w"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_COG_PROFILE=/var/cache/pistick/cog"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_MAX_DISPLAY_MODE=1280x720@60"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "StandardError=journal+console"
 assert_contains "$TEST_ROOT/etc/sudoers.d/pistick-system" "pistick-system-helper wifi-connect"
 assert_contains "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" "TMDB token updated"
 assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "agent/pi-zero-w"
 assert_contains "$PROJECT_DIR/install.sh" "avahi-daemon"
 assert_contains "$PROJECT_DIR/install.sh" "hostnamectl set-hostname pistick"
+assert_contains "$PROJECT_DIR/install.sh" "BROWSER_PACKAGE=\"cog\""
+assert_contains "$CURRENT/pi/kiosk-cog.sh" "--platform=drm"
+assert_contains "$CURRENT/pi/kiosk-cog.sh" "--gamepad=manette"
+assert_contains "$CURRENT/pi/kiosk-cog.sh" "--media-playback-requires-user-gesture=false"
 assert_contains "$CURRENT/pi/kiosk-session.sh" "--renderer-process-limit=2"
 assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
 assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
+
+[[ "$(PISTICK_MACHINE=armv6l "$CURRENT/pi/launch-kiosk.sh" --print-backend)" == "cog" ]] \
+    || fail "The original ARMv6 Zero W did not select Cog/WPE"
+[[ "$(PISTICK_MACHINE=armv7l "$CURRENT/pi/launch-kiosk.sh" --print-backend)" == "chromium" ]] \
+    || fail "A newer Pi did not keep the Chromium kiosk"
+
+python3 - "$CURRENT/pistick_server/static/styles.css" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+css = Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(
+    r"html\.pi-zero-w \*,\s*html\.pi-zero-w \*::before,\s*"
+    r"html\.pi-zero-w \*::after \{(?P<body>.*?)\}",
+    css,
+    re.DOTALL,
+)
+assert match, "Pi Zero W low-memory CSS block is missing"
+assert "animation-duration" not in match.group("body"), "low-memory CSS accelerates the spinner"
+assert "animation-iteration-count: 1" in css, "reduced-motion animations can spin indefinitely"
+PY
 
 token_status="$(
     PISTICK_TEST_MODE=1 \
@@ -255,6 +292,7 @@ env \
     PISTICK_GROUP=pistick \
     PISTICK_HOME=/home/pistick \
     PISTICK_UID=1000 \
+    PISTICK_MACHINE=armv6l \
     PISTICK_SKIP_TMDB_VALIDATION=1 \
     bash "$TEST_ROOT/usr/local/bin/update-pistick"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)" == "$state_hash" ]] \

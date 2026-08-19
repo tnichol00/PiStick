@@ -41,7 +41,7 @@ jobs:
 
       - name: Check Bash and JavaScript syntax
         run: |
-          bash -n install.sh pi/configure-tmdb.sh pi/launch-kiosk.sh pi/kiosk-session.sh tests/test_installer.sh
+          bash -n install.sh pi/configure-tmdb.sh pi/diagnose.sh pi/kiosk-cog.sh pi/launch-kiosk.sh pi/kiosk-session.sh tests/test_installer.sh
           node --check pistick_server/static/app.js
 
       - name: Test the appliance installer

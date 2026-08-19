@@ -2,6 +2,34 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MACHINE="${PISTICK_MACHINE:-$(uname -m)}"
+BACKEND="${PISTICK_KIOSK_BACKEND:-}"
+
+if [[ -z "$BACKEND" ]]; then
+    if [[ "$MACHINE" == "armv6l" ]]; then
+        BACKEND="cog"
+    else
+        BACKEND="chromium"
+    fi
+fi
+
+case "$BACKEND" in
+    cog|chromium) ;;
+    *)
+        printf 'Unknown PiStick kiosk backend: %s\n' "$BACKEND" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "${1:-}" == "--print-backend" ]]; then
+    printf '%s\n' "$BACKEND"
+    exit 0
+fi
+
+if [[ "$BACKEND" == "cog" ]]; then
+    printf '[PiStick] Starting the ARMv6-compatible Cog/WPE kiosk.\n'
+    exec "$SCRIPT_DIR/kiosk-cog.sh"
+fi
 
 # Xorg leaves a stale lock behind only after an unclean power loss. Do not
 # remove a lock while a real X server is running.

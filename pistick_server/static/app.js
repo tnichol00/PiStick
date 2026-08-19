@@ -79,6 +79,8 @@
 
   async function api(path, options) {
     var settings = Object.assign({}, options || {});
+    var requestTimeout = Number(settings.timeout || 40000);
+    delete settings.timeout;
     var headers = Object.assign({ "Accept": "application/json" }, settings.headers || {});
     if (settings.body && typeof settings.body !== "string") {
       settings.body = JSON.stringify(settings.body);
@@ -86,11 +88,23 @@
     }
     if (settings.method && settings.method !== "GET") headers["X-PiStick-Request"] = "1";
     settings.headers = headers;
+    var timeout = null;
+    var controller = null;
+    if (!settings.signal && typeof window.AbortController === "function") {
+      controller = new window.AbortController();
+      settings.signal = controller.signal;
+      timeout = window.setTimeout(function () { controller.abort(); }, requestTimeout);
+    }
     var response;
     try {
       response = await fetch(path, settings);
     } catch (error) {
+      if (error && error.name === "AbortError") {
+        throw new Error("PiStick took too long to load this screen. Check the network and try again.");
+      }
       throw new Error("PiStick Server is not responding. Restart it and try again.");
+    } finally {
+      if (timeout !== null) window.clearTimeout(timeout);
     }
     var payload;
     try {

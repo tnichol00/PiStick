@@ -5,10 +5,10 @@ This guide installs the `agent/pi-zero-w` edition of PiStick as a television app
 The finished boot flow is:
 
 ```text
-Power on → Raspberry Pi OS Lite → PiStick server → fullscreen Chromium
+Power on → Raspberry Pi OS Lite → PiStick server → fullscreen browser
 ```
 
-There is no normal desktop, taskbar, or file manager. PiStick opens automatically on HDMI, can be controlled with a Bluetooth or USB game controller, and can optionally serve the same interface to other devices on your Wi-Fi.
+There is no normal desktop, taskbar, or file manager. PiStick opens automatically on HDMI, can be controlled with a Bluetooth or USB game controller, and can optionally serve the same interface to other devices on your Wi-Fi. The installer uses the ARMv6-compatible Cog/WPE browser on an original Zero W and Chromium on a Zero 2 W or newer Pi.
 
 ## Before you begin
 
@@ -23,7 +23,7 @@ You need:
 - Free TMDB account and its long **API Read Access Token**
 - Optional Bluetooth controller, or a USB controller with a micro-USB OTG adapter
 
-The original Zero W is much slower than a Zero 2 W. PiStick reduces image sizes, animation, background work, and browser processes on this branch. Browsing should be usable, but modern YouTube and third-party video pages can still be demanding. A Zero 2 W is the better choice if smooth video playback is the priority.
+The original Zero W is much slower than a Zero 2 W. PiStick reduces image sizes, expensive visual effects, background work, and display resolution on this branch. Browsing should be usable, but modern YouTube and third-party video pages can still be demanding. A Zero 2 W is the better choice if smooth video playback is the priority.
 
 ## Part 1: Prepare Raspberry Pi OS
 
@@ -86,7 +86,7 @@ curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/
 
 The installer will:
 
-- Install Python, Chromium, minimal X11 components, Openbox, NetworkManager, mDNS, and Bluetooth tools.
+- Install Python, NetworkManager, mDNS, Bluetooth tools, media codecs, and the correct kiosk browser for the detected Pi CPU.
 - Download only the `agent/pi-zero-w` branch.
 - Ask for and validate the TMDB Read Access Token.
 - Store the token and watch data outside the application files.
@@ -97,7 +97,7 @@ The installer will:
 
 When it asks for the TMDB token, paste it and press Enter. Nothing appears while you paste or type; this is intentional.
 
-The first install can take 15–40 minutes on an original Zero W because Chromium and the display packages are large. Leave the SSH window open.
+The first install can take 15–40 minutes on an original Zero W because WPE WebKit and the media packages are large. Leave the SSH window open.
 
 When the installer finishes, reboot:
 
@@ -181,7 +181,7 @@ The easiest method is the HDMI settings screen:
 4. Wait about 10 seconds, select the controller, then choose **Pair**.
 5. Press any controller button once after it connects.
 
-Chromium does not reveal a controller to a website until the controller has produced input.
+The browser does not reveal a controller to a website until the controller has produced input.
 
 #### SSH pairing fallback
 
@@ -219,7 +219,7 @@ quit
 
 Replace `AA:BB:CC:DD:EE:FF` every time with the controller's real address. The `info` output should show both `Paired: yes` and `Connected: yes`.
 
-Restart only the fullscreen interface so Chromium sees the controller:
+Restart only the fullscreen interface so the browser sees the controller:
 
 ```bash
 sudo systemctl restart pistick-kiosk.service
@@ -265,7 +265,7 @@ sudo reboot
 - Left or Right during playback: seek backward or forward 10 seconds
 - A / Cross while the search box is selected: open PiStick's on-screen keyboard
 
-Controllers that expose Chromium's standard gamepad mapping work best. Some generic controllers swap the A/B or X/Y buttons.
+Controllers that expose the standard browser gamepad mapping work best. Some generic controllers swap the A/B or X/Y buttons.
 
 ## Service commands
 
@@ -313,7 +313,7 @@ Show the server log:
 journalctl -u pistick-server.service -b -n 100 --no-pager
 ```
 
-Show the display and Chromium log:
+Show the display-browser log:
 
 ```bash
 journalctl -u pistick-kiosk.service -b -n 150 --no-pager
@@ -327,7 +327,13 @@ journalctl -u pistick-server.service -u pistick-kiosk.service -f
 
 ### Black screen
 
-Check whether both services are active:
+Run the safe, one-command diagnostic report:
+
+```bash
+sudo pistick-diagnose
+```
+
+It omits the TMDB token and Wi-Fi credentials. To check manually, confirm both services are active:
 
 ```bash
 sudo systemctl status pistick-server.service pistick-kiosk.service
@@ -369,7 +375,7 @@ The original Zero W supports only 2.4 GHz. Move it closer to the router, make su
 
 ### Video is slow
 
-The original Zero W has only one CPU core. The branch already disables visual effects and limits Chromium to two renderer processes, but some modern player pages remain too heavy. Try a 720p television mode or use a Pi Zero 2 W for smoother playback. Do not add Chromium's `--disable-gpu` option; that can make video performance worse.
+The original Zero W has only one CPU core. PiStick uses the lighter Cog/WPE kiosk at a maximum 720p mode there, but some modern player pages remain too heavy. A Pi Zero 2 W or newer model is recommended for smoother playback.
 
 ## Update this branch
 
@@ -390,7 +396,7 @@ The older `sudo pistick-update` spelling remains as a compatibility alias, but `
 | Current application | `/opt/pistick/current` |
 | Versioned application copies | `/opt/pistick/releases` |
 | TMDB token and watch state | `/var/lib/pistick/data` |
-| Chromium profile and cache | `/var/cache/pistick/chromium` |
+| Browser profiles and caches | `/var/cache/pistick/cog` and `/var/cache/pistick/chromium` |
 | Boot services | `/etc/systemd/system/pistick-*.service` |
 | Root-owned system helper | `/usr/local/libexec/pistick-system-helper` |
 
