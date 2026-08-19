@@ -4,6 +4,11 @@ set -Eeuo pipefail
 PISTICK_URL="${PISTICK_URL:-http://127.0.0.1/?platform=pi-zero-w}"
 PROFILE_DIR="${PISTICK_COG_PROFILE:-/var/cache/pistick/cog}"
 
+# Keep one long-lived service process around Cog. On the original ARMv6 Zero W,
+# WPE/Cog can occasionally terminate with TRAP/SEGV while DRM or the WebProcess
+# is settling. Let this wrapper restart Cog instead of letting systemd replace
+# the whole kiosk service PID; PiStick's installer can then distinguish a
+# recoverable browser crash from a genuinely broken application release.
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-run-session >/dev/null 2>&1; then
     exec dbus-run-session -- "$0"
 fi
@@ -49,4 +54,19 @@ fi
 
 printf '[PiStick] Opening %s with Cog/WPE at up to %s.\n' \
     "$PISTICK_URL" "$COG_PLATFORM_DRM_MODE_MAX"
-exec cog "${cog_args[@]}" "$PISTICK_URL"
+
+restart_delay=2
+while true; do
+    set +e
+    cog "${cog_args[@]}" "$PISTICK_URL"
+    status=$?
+    set -e
+
+    if [[ "$status" -eq 0 ]]; then
+        printf '[PiStick] Cog exited; reopening the television interface.\n' >&2
+    else
+        printf '[PiStick] Cog exited unexpectedly (status %s); restarting in %ss.\n' \
+            "$status" "$restart_delay" >&2
+    fi
+    sleep "$restart_delay"
+done
