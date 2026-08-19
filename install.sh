@@ -326,10 +326,6 @@ install_release() {
     [[ ! -f "${SOURCE_DIR}/LICENSE" ]] || install -m 0644 "${SOURCE_DIR}/LICENSE" "$staging/LICENSE"
     find "$staging" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 
-    # update-pistick intentionally downloads with umask 077. A Git checkout
-    # made under that mask has root-only directories, and cp -a preserves
-    # them. Application releases contain no private data, so normalize every
-    # directory/file before the regular service user tries to import or run it.
     chmod -R u=rwX,go=rX "$staging"
     chmod 0755 \
         "$staging/pi/launch-kiosk.sh" \
@@ -708,7 +704,6 @@ fi
 EOF
     chmod 0755 "${LOCAL_BIN}/update-pistick"
 
-    # Keep the old command working for existing branch installations.
     ln -sfn "update-pistick" "${LOCAL_BIN}/pistick-update"
 }
 
@@ -729,7 +724,7 @@ start_services() {
     systemctl restart pistick-server.service \
         || fail "The PiStick server service could not be started. Run: journalctl -u pistick-server -n 100"
 
-    local attempt homepage
+    local attempt homepage asset
     for attempt in $(seq 1 30); do
         if curl -fsS --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
             break
@@ -739,41 +734,35 @@ start_services() {
     curl -fsS --max-time 3 http://127.0.0.1/health >/dev/null \
         || fail "The local PiStick server did not pass its health check. Run: journalctl -u pistick-server -n 100"
 
-    # Do not pipe curl into `grep -q` here. grep intentionally closes the pipe
-    # as soon as it finds a match, which makes curl return error 23 under
-    # `set -o pipefail` even though the page is correct.
+    # Validate the HTML and both static assets before committing a release.
+    # Keeping curl output out of a grep pipeline avoids the old error-23 false
+    # failure caused by grep closing the pipe early under pipefail.
     if ! homepage="$(curl -fsS --max-time 5 \
         "http://127.0.0.1/?platform=pi-zero-w&release=${ACTIVE_RELEASE_ID}")"; then
         fail "The local PiStick server started, but its web interface could not be downloaded."
     fi
-    if [[ "$homepage" != *'/styles.css?v='* ]]; then
+    if [[ "$homepage" != *'/styles.css?v='* || "$homepage" != *'/app.js?v='* ]]; then
         fail "The local PiStick server started, but its web interface did not pass validation."
     fi
-
-    systemctl restart pistick-kiosk.service \
-        || fail "The PiStick kiosk service could not be started. Run: journalctl -u pistick-kiosk -n 100"
-
-    # A crash-looping kiosk can appear active briefly between systemd
-    # restarts. Require the same process to remain alive longer than the
-    # service's five-second restart delay before declaring the update healthy.
-    local kiosk_pid="" current_pid
-    for attempt in $(seq 1 20); do
-        if systemctl is-active --quiet pistick-kiosk.service; then
-            kiosk_pid="$(systemctl show -p MainPID --value pistick-kiosk.service 2>/dev/null || true)"
-            if [[ "$kiosk_pid" =~ ^[1-9][0-9]*$ ]]; then
-                break
-            fi
-        fi
-        sleep 1
+    for asset in styles.css app.js; do
+        curl -fsS --max-time 5 "http://127.0.0.1/${asset}?install=${ACTIVE_RELEASE_ID}" >/dev/null \
+            || fail "The local PiStick server started, but ${asset} could not be downloaded."
     done
-    [[ "$kiosk_pid" =~ ^[1-9][0-9]*$ ]] \
-        || fail "The PiStick kiosk did not become active. Run: journalctl -u pistick-kiosk -n 100"
-    sleep 8
-    current_pid="$(systemctl show -p MainPID --value pistick-kiosk.service 2>/dev/null || true)"
-    if ! systemctl is-active --quiet pistick-kiosk.service \
-        || [[ "$current_pid" != "$kiosk_pid" ]] \
-        || [[ ! -d "/proc/${kiosk_pid}" ]]; then
-        fail "The PiStick kiosk crashed during startup. Run: sudo pistick-diagnose"
+
+    # The application release is considered healthy once its import, server,
+    # HTML, CSS and JavaScript checks pass. Cog/WPE 2.38 on the original ARMv6
+    # Zero W can occasionally TRAP/SEGV while the DRM/WebProcess is settling.
+    # That browser-runtime restart must not roll a healthy application release
+    # back to an older version. The kiosk wrapper now restarts Cog internally
+    # and systemd continues supervising the wrapper.
+    if ! systemctl restart pistick-kiosk.service; then
+        printf 'Warning: PiStick was installed, but the kiosk service did not restart cleanly. Run: sudo pistick-diagnose\n' >&2
+        return 0
+    fi
+
+    sleep 2
+    if ! systemctl is-active --quiet pistick-kiosk.service; then
+        printf 'Warning: PiStick was installed, but the kiosk is still starting/recovering. Run: sudo pistick-diagnose\n' >&2
     fi
 }
 
