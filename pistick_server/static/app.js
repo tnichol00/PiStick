@@ -704,8 +704,27 @@
     openPlayer(title, url, null, null, true);
   }
 
+  function createPlayerFrame(videasy) {
+    var oldFrame = ui.playerFrame;
+    var frame = document.createElement("iframe");
+    frame.id = "player-frame";
+    frame.title = "PiStick player";
+    frame.setAttribute("allow", "autoplay; encrypted-media; fullscreen; picture-in-picture");
+    frame.setAttribute("allowfullscreen", "");
+    frame.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
+    if (!videasy) {
+      frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock");
+    }
+    oldFrame.parentNode.replaceChild(frame, oldFrame);
+    ui.playerFrame = frame;
+    return frame;
+  }
+
   function openPlayer(title, url, media, episode, trailer) {
-    if (!/^https:\/\/(player\.videasy\.(to|net)|www\.youtube-nocookie\.com)\//.test(String(url))) {
+    var playerUrl = String(url);
+    var videasy = /^https:\/\/player\.videasy\.(to|net)\//.test(playerUrl);
+    var youtube = /^https:\/\/www\.youtube-nocookie\.com\//.test(playerUrl);
+    if (!videasy && !youtube) {
       showToast("The player URL was rejected.");
       return;
     }
@@ -720,8 +739,16 @@
       saving: false
     };
     ui.playerTitle.textContent = title;
-    ui.playerFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock");
-    ui.playerFrame.src = url;
+
+    // Videasy rejects sandboxed embeds. Create a brand-new browsing context for
+    // every playback and never put a sandbox attribute on Videasy's iframe.
+    // Recreating the iframe also avoids stale sandbox flags on older WPE WebKit.
+    var frame = createPlayerFrame(videasy);
+    if (videasy && frame.hasAttribute("sandbox")) {
+      frame.removeAttribute("sandbox");
+    }
+    frame.src = playerUrl;
+
     ui.playerOverlay.classList.remove("hidden");
     document.body.style.overflow = "hidden";
     ui.playerClose.focus();
