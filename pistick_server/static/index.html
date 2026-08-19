@@ -121,39 +121,34 @@
       "use strict";
 
       var frame = document.getElementById("player-frame");
-      if (!frame || typeof HTMLIFrameElement === "undefined") return;
+      if (!frame) return;
 
-      var srcDescriptor = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "src");
-      if (!srcDescriptor || typeof srcDescriptor.get !== "function" || typeof srcDescriptor.set !== "function") return;
-
-      var safeSandbox = "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock";
-
-      function isApprovedVideasyUrl(value) {
-        try {
-          var parsed = new URL(String(value), window.location.href);
-          if (parsed.protocol !== "https:") return false;
-          if (parsed.hostname !== "player.videasy.to" && parsed.hostname !== "player.videasy.net") return false;
-          return /^\/(?:movie\/\d+|tv\/\d+\/\d+\/\d+)\/?$/.test(parsed.pathname);
-        } catch (error) {
-          return false;
+      // app.js historically applies a sandbox immediately before assigning the
+      // player URL. Videasy explicitly rejects being embedded that way. Block
+      // the sandbox write itself so the iframe is already unrestricted when
+      // navigation begins. This works on the older WPE WebKit shipped for the
+      // original ARMv6 Pi Zero W, where overriding HTMLIFrameElement.src is not
+      // reliable.
+      var nativeSetAttribute = frame.setAttribute;
+      frame.removeAttribute("sandbox");
+      frame.setAttribute = function (name, value) {
+        if (String(name).toLowerCase() === "sandbox") {
+          this.removeAttribute("sandbox");
+          return;
         }
+        return nativeSetAttribute.call(this, name, value);
+      };
+
+      // Defensive fallback in case another script changes the attribute by a
+      // different DOM path. The synchronous setAttribute override above is the
+      // part that guarantees the attribute is absent before player navigation.
+      if (typeof MutationObserver === "function") {
+        new MutationObserver(function () {
+          if (frame.hasAttribute("sandbox")) frame.removeAttribute("sandbox");
+        }).observe(frame, { attributes: true, attributeFilter: ["sandbox"] });
       }
 
-      Object.defineProperty(frame, "src", {
-        configurable: true,
-        enumerable: srcDescriptor.enumerable,
-        get: function () {
-          return srcDescriptor.get.call(this);
-        },
-        set: function (value) {
-          if (isApprovedVideasyUrl(value)) {
-            this.removeAttribute("sandbox");
-          } else {
-            this.setAttribute("sandbox", safeSandbox);
-          }
-          srcDescriptor.set.call(this, value);
-        }
-      });
+      window.__PISTICK_PLAYER_SANDBOX_DISABLED__ = true;
     }());
   </script>
   <script src="/app.js?v=__PISTICK_ASSET_VERSION__" defer></script>
