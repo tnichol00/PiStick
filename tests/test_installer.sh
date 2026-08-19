@@ -34,6 +34,20 @@ assert_mode() {
         || fail "Expected mode $2 for $1, got $(stat -Lc '%a' "$1")"
 }
 
+assert_single_active_release() {
+    local releases_root="$TEST_ROOT/opt/pistick/releases"
+    local current_target entry
+    local entries=()
+    current_target="$(readlink -f -- "$TEST_ROOT/opt/pistick/current")"
+    while IFS= read -r -d '' entry; do
+        entries+=("$entry")
+    done < <(find "$releases_root" -mindepth 1 -maxdepth 1 -print0)
+    [[ "${#entries[@]}" -eq 1 ]] \
+        || fail "Expected only the active release, found ${#entries[@]} entries"
+    [[ "${entries[0]}" == "$current_target" ]] \
+        || fail "Old-version cleanup did not preserve exactly the active release"
+}
+
 run_installer() {
     env \
         PISTICK_TEST_MODE=1 \
@@ -81,6 +95,7 @@ run_installer PISTICK_TMDB_TOKEN=test-tmdb-read-token-value
 
 CURRENT="$TEST_ROOT/opt/pistick/current"
 [[ -L "$CURRENT" ]] || fail "Expected the current release symlink"
+assert_single_active_release
 assert_file "$CURRENT/server.py"
 assert_file "$CURRENT/playback_api.py"
 assert_file "$CURRENT/pistick_server/static/app.js"
@@ -136,12 +151,15 @@ if grep -Fq "NoNewPrivileges=true" "$TEST_ROOT/etc/systemd/system/pistick-server
 fi
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "?platform=pi-zero-w"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "&release="
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_COG_PROFILE=/var/cache/pistick/cog"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_MAX_DISPLAY_MODE=1280x720@60"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "StandardError=journal+console"
 assert_contains "$TEST_ROOT/etc/sudoers.d/pistick-system" "pistick-system-helper wifi-connect"
 assert_contains "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" "TMDB token updated"
 assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "agent/pi-zero-w"
+assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "Cache-Control: no-cache"
+assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "?cache="
 assert_contains "$PROJECT_DIR/install.sh" "avahi-daemon"
 assert_contains "$PROJECT_DIR/install.sh" "hostnamectl set-hostname pistick"
 assert_contains "$PROJECT_DIR/install.sh" "BROWSER_PACKAGE=\"cog\""
@@ -149,6 +167,8 @@ assert_contains "$CURRENT/pi/kiosk-cog.sh" "--platform=drm"
 assert_contains "$CURRENT/pi/kiosk-cog.sh" "--gamepad=manette"
 assert_contains "$CURRENT/pi/kiosk-cog.sh" "--media-playback-requires-user-gesture=false"
 assert_contains "$CURRENT/pi/kiosk-session.sh" "--renderer-process-limit=2"
+assert_contains "$CURRENT/pi/diagnose.sh" "Server import as"
+assert_contains "$CURRENT/pi/diagnose.sh" "Versioned home page"
 assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
 assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
 
@@ -163,6 +183,9 @@ import re
 import sys
 
 css = Path(sys.argv[1]).read_text(encoding="utf-8")
+base_spinner = re.search(r"\.spinner \{(?P<body>.*?)\}", css, re.DOTALL)
+assert base_spinner, "base spinner rule is missing"
+assert "animation: spin 0.8s linear infinite" in base_spinner.group("body")
 match = re.search(
     r"html\.pi-zero-w \*,\s*html\.pi-zero-w \*::before,\s*"
     r"html\.pi-zero-w \*::after \{(?P<body>.*?)\}",
@@ -171,7 +194,13 @@ match = re.search(
 )
 assert match, "Pi Zero W low-memory CSS block is missing"
 assert "animation-duration" not in match.group("body"), "low-memory CSS accelerates the spinner"
-assert "animation-iteration-count: 1" in css, "reduced-motion animations can spin indefinitely"
+pi_spinner = re.search(r"html\.pi-zero-w \.spinner \{(?P<body>.*?)\}", css, re.DOTALL)
+assert pi_spinner, "Pi Zero W spinner override is missing"
+assert "animation: spin 1.2s linear infinite !important" in pi_spinner.group("body")
+assert "animation-duration: 0.01ms" not in css, "a legacy rule can still accelerate the spinner"
+reduced = re.search(r"@media \(prefers-reduced-motion: reduce\) \{(?P<body>.*)\}\s*$", css, re.DOTALL)
+assert reduced, "reduced-motion CSS block is missing"
+assert "animation: none !important" in reduced.group("body")
 PY
 
 token_status="$(
@@ -249,11 +278,35 @@ kill "$SERVER_PID"
 wait "$SERVER_PID"
 SERVER_PID=""
 
+# A release that passes syntax checks but cannot import must never replace the
+# last working installation. The exit trap restores the old symlink, and the
+# next successful run removes the rejected release.
+working_release="$(readlink -f -- "$CURRENT")"
+BROKEN_SOURCE="${TEST_DIR}/broken-source"
+cp -a "$PROJECT_DIR" "$BROKEN_SOURCE"
+printf '\nimport intentionally_missing_pistick_test_module\n' \
+    >>"$BROKEN_SOURCE/pistick_server/app.py"
+rollback_log="${TEST_DIR}/rollback.log"
+if run_installer PISTICK_SOURCE_DIR="$BROKEN_SOURCE" >"$rollback_log" 2>&1; then
+    fail "An installed release with a broken application import unexpectedly passed"
+fi
+[[ "$(readlink -f -- "$CURRENT")" == "$working_release" ]] \
+    || fail "A failed update did not restore the previous active release"
+assert_contains "$rollback_log" "Restoring the last working PiStick release"
+
 # A reinstall must preserve watch state and the existing secret.
 printf '{"profiles":[],"marker":"keep-me"}\n' >"$TEST_ROOT/var/lib/pistick/data/state.json"
 state_hash="$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)"
 config_hash="$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)"
+mkdir -p \
+    "$TEST_ROOT/opt/pistick/releases/20000101000000-obsolete" \
+    "$TEST_ROOT/opt/pistick/releases/.interrupted.staging"
 run_installer
+assert_single_active_release
+[[ ! -e "$TEST_ROOT/opt/pistick/releases/20000101000000-obsolete" ]] \
+    || fail "The installer kept an obsolete application version"
+[[ ! -e "$TEST_ROOT/opt/pistick/releases/.interrupted.staging" ]] \
+    || fail "The installer kept an interrupted staging version"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)" == "$state_hash" ]] \
     || fail "A reinstall changed watch state"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
@@ -319,5 +372,6 @@ assert_mode "$CURRENT/pistick_server" 755
 assert_mode "$CURRENT/pistick_server/app.py" 644
 assert_mode "$CURRENT/pi" 755
 assert_mode "$CURRENT/pi/launch-kiosk.sh" 755
+assert_single_active_release
 
 printf 'All Pi Zero W installer checks passed.\n'

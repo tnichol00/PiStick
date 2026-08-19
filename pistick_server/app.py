@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import hashlib
 import ipaddress
 import json
 import logging
@@ -121,6 +122,7 @@ class PiStickApplication:
         self.advertised_port = self.config.port
         self.state = WatchStateStore(self.data_dir / "state.json")
         self.static_dir = Path(static_dir or Path(__file__).with_name("static")).resolve()
+        self.asset_version = self._asset_version()
         self.low_memory = _low_memory_enabled()
         self.tmdb = tmdb or TMDBClient(
             lambda: self.config.tmdb_read_token,
@@ -128,6 +130,18 @@ class PiStickApplication:
         )
         self.system_controller = system_controller or SystemController()
         self.shutdown_callback: Optional[Callable[[], None]] = None
+
+    def _asset_version(self) -> str:
+        """Return a content version that invalidates persistent kiosk caches."""
+        digest = hashlib.sha256()
+        for name in ("styles.css", "app.js"):
+            digest.update(name.encode("ascii"))
+            try:
+                digest.update((self.static_dir / name).read_bytes())
+            except OSError:
+                # Missing assets are handled as normal 404s by _static().
+                pass
+        return digest.hexdigest()[:12]
 
     @property
     def lan_url(self) -> str:
@@ -481,6 +495,10 @@ class PiStickApplication:
             content = candidate.read_bytes()
         except OSError:
             return Response.text("Not found", 404)
+        if candidate.name == "index.html":
+            content = content.replace(
+                b"__PISTICK_ASSET_VERSION__", self.asset_version.encode("ascii")
+            )
         content_type, _ = mimetypes.guess_type(candidate.name)
         return Response(
             status=200,
@@ -490,10 +508,14 @@ class PiStickApplication:
                 if (content_type or "").startswith(("text/", "application/javascript"))
                 else ""
             ),
-            # The appliance serves these files over loopback. Revalidating is
-            # cheap and ensures a manual update cannot leave stale JS or CSS
-            # in the persistent kiosk profile.
-            headers={"Cache-Control": "no-cache"},
+            # PiStick's persistent kiosk profile previously cached CSS for an
+            # hour. Content-versioned URLs bypass that old cache entry, while
+            # these headers prevent another stale UI after future updates.
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
         )
 
 

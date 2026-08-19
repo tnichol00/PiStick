@@ -385,7 +385,7 @@ Run:
 sudo update-pistick
 ```
 
-The updater downloads the newest commit from `agent/pi-zero-w`, keeps the TMDB token, profiles, history, and browser data, then restarts PiStick.
+The updater downloads the newest commit from `agent/pi-zero-w`, keeps the TMDB token, profiles, history, and browser data, then restarts PiStick. It validates the server and kiosk before deleting every inactive application version. If the new version fails startup validation, the installer restores the last working version instead of deleting it.
 
 The older `sudo pistick-update` spelling remains as a compatibility alias, but `sudo update-pistick` is the main command going forward.
 
@@ -394,7 +394,7 @@ The older `sudo pistick-update` spelling remains as a compatibility alias, but `
 | Purpose | Location |
 | --- | --- |
 | Current application | `/opt/pistick/current` |
-| Versioned application copies | `/opt/pistick/releases` |
+| Active versioned application | `/opt/pistick/releases` |
 | TMDB token and watch state | `/var/lib/pistick/data` |
 | Browser profiles and caches | `/var/cache/pistick/cog` and `/var/cache/pistick/chromium` |
 | Boot services | `/etc/systemd/system/pistick-*.service` |

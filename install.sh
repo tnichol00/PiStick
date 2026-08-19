@@ -29,12 +29,22 @@ TEMP_DIR=""
 SOURCE_DIR="${PISTICK_SOURCE_DIR:-}"
 TMDB_TOKEN="${PISTICK_TMDB_TOKEN:-}"
 MACHINE="${PISTICK_MACHINE:-$(uname -m)}"
+ACTIVE_RELEASE_DIR=""
+ACTIVE_RELEASE_ID=""
+PREVIOUS_RELEASE_DIR=""
+RELEASE_SWITCHED=0
+RELEASE_COMMITTED=0
 
 cleanup() {
+    local status=$?
+    if [[ "$status" -ne 0 && "$RELEASE_SWITCHED" == "1" && "$RELEASE_COMMITTED" != "1" ]]; then
+        restore_previous_release || true
+    fi
     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
         rm -rf -- "$TEMP_DIR"
     fi
     TMDB_TOKEN=""
+    return "$status"
 }
 trap cleanup EXIT
 
@@ -47,6 +57,27 @@ step() {
     printf '\n[PiStick] %s\n' "$*"
 }
 
+release_path_is_safe() {
+    [[ -n "$1" && "$1" == "${INSTALL_ROOT}/releases/"* ]]
+}
+
+restore_previous_release() {
+    [[ -n "$PREVIOUS_RELEASE_DIR" && -d "$PREVIOUS_RELEASE_DIR" ]] || return 0
+    release_path_is_safe "$PREVIOUS_RELEASE_DIR" || return 1
+
+    step "Restoring the last working PiStick release"
+    rm -f -- "${INSTALL_ROOT}/current.rollback"
+    ln -s "$PREVIOUS_RELEASE_DIR" "${INSTALL_ROOT}/current.rollback"
+    mv -Tf "${INSTALL_ROOT}/current.rollback" "${INSTALL_ROOT}/current"
+    RELEASE_SWITCHED=0
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl restart pistick-server.service >/dev/null 2>&1 || true
+        systemctl restart pistick-kiosk.service >/dev/null 2>&1 || true
+    fi
+}
+
 package_available() {
     apt-cache show "$1" >/dev/null 2>&1
 }
@@ -56,6 +87,15 @@ require_root() {
         return
     fi
     [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Run this installer with sudo."
+}
+
+acquire_install_lock() {
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return
+    fi
+    install -d -m 0755 /run/lock
+    exec 9>/run/lock/pistick-install.lock
+    flock -n 9 || fail "Another PiStick installer or update is already running."
 }
 
 check_platform() {
@@ -255,7 +295,7 @@ check_source() {
 
 install_release() {
     step "Installing the PiStick application"
-    local revision release_base release_id staging release_dir current_link counter
+    local revision release_base release_id staging release_dir current_link counter previous
     revision="$(git -C "$SOURCE_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'local')"
     release_base="$(date -u +%Y%m%d%H%M%S)-${revision}"
     release_id="$release_base"
@@ -267,6 +307,14 @@ install_release() {
     release_dir="${INSTALL_ROOT}/releases/${release_id}"
     staging="${INSTALL_ROOT}/releases/.${release_id}.staging"
     current_link="${INSTALL_ROOT}/current"
+
+    PREVIOUS_RELEASE_DIR=""
+    if [[ -L "$current_link" ]]; then
+        previous="$(readlink -f -- "$current_link" 2>/dev/null || true)"
+        if release_path_is_safe "$previous" && [[ -d "$previous" ]]; then
+            PREVIOUS_RELEASE_DIR="$previous"
+        fi
+    fi
 
     install -d -m 0755 "${INSTALL_ROOT}/releases"
     install -d -m 0755 "$staging"
@@ -293,6 +341,72 @@ install_release() {
     rm -f -- "${current_link}.new"
     ln -s "$release_dir" "${current_link}.new"
     mv -Tf "${current_link}.new" "$current_link"
+    ACTIVE_RELEASE_DIR="$release_dir"
+    ACTIVE_RELEASE_ID="$release_id"
+    RELEASE_SWITCHED=1
+}
+
+verify_installed_release() {
+    step "Verifying the installed release as the PiStick service user"
+    local current_target
+    current_target="$(readlink -f -- "${INSTALL_ROOT}/current" 2>/dev/null || true)"
+    [[ "$current_target" == "$ACTIVE_RELEASE_DIR" ]] \
+        || fail "The active release link was not switched correctly."
+
+    if [[ "$TEST_MODE" == "1" ]]; then
+        [[ -x "${ACTIVE_RELEASE_DIR}/pi/launch-kiosk.sh" ]] \
+            || fail "The installed kiosk launcher is not executable."
+        [[ -r "${ACTIVE_RELEASE_DIR}/pistick_server/static/index.html" ]] \
+            || fail "The installed web interface is not readable."
+        if ! python3 -I -B -c \
+            'import sys; sys.path.insert(0, sys.argv[1]); from pistick_server.app import PiStickApplication' \
+            "$ACTIVE_RELEASE_DIR"; then
+            fail "The installed PiStick server cannot import its application module."
+        fi
+    else
+        if ! runuser -u "$TARGET_USER" -- /usr/bin/test \
+            -x "${ACTIVE_RELEASE_DIR}/pi/launch-kiosk.sh"; then
+            fail "The PiStick service user cannot execute the installed kiosk launcher."
+        fi
+        if ! runuser -u "$TARGET_USER" -- /usr/bin/test \
+            -r "${ACTIVE_RELEASE_DIR}/pistick_server/static/index.html"; then
+            fail "The PiStick service user cannot read the installed web interface."
+        fi
+        if ! runuser -u "$TARGET_USER" -- /usr/bin/python3 -I -B -c \
+            'import sys; sys.path.insert(0, sys.argv[1]); from pistick_server.app import PiStickApplication' \
+            "$ACTIVE_RELEASE_DIR"; then
+            fail "The PiStick service user cannot read or import the installed application."
+        fi
+    fi
+}
+
+cleanup_old_releases() {
+    step "Removing all previous PiStick application versions"
+    local releases_root current_target candidate removed
+    releases_root="$(readlink -f -- "${INSTALL_ROOT}/releases" 2>/dev/null || true)"
+    current_target="$(readlink -f -- "${INSTALL_ROOT}/current" 2>/dev/null || true)"
+    [[ -n "$releases_root" && -d "$releases_root" ]] \
+        || fail "The PiStick release directory could not be verified; no old versions were deleted."
+    [[ -n "$current_target" && -d "$current_target" ]] \
+        || fail "The active PiStick release could not be verified; no old versions were deleted."
+    case "$current_target" in
+        "$releases_root"/*) ;;
+        *) fail "The active release is outside the managed release directory; no old versions were deleted." ;;
+    esac
+
+    removed=0
+    while IFS= read -r -d '' candidate; do
+        [[ "$candidate" == "$current_target" ]] && continue
+        case "$candidate" in
+            "$releases_root"/*) ;;
+            *) fail "Refusing to delete an unexpected release path: $candidate" ;;
+        esac
+        rm -rf -- "$candidate"
+        removed=$((removed + 1))
+    done < <(find "$releases_root" -mindepth 1 -maxdepth 1 -print0)
+
+    [[ -d "$current_target" ]] || fail "Old-version cleanup removed the active release unexpectedly."
+    printf '[PiStick] Removed %d inactive application version(s); private data was preserved.\n' "$removed"
 }
 
 usable_token() {
@@ -539,7 +653,7 @@ WorkingDirectory=/opt/pistick/current
 Environment=HOME=${TARGET_HOME}
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=${TARGET_HOME}/.Xauthority
-Environment=PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w
+Environment=PISTICK_URL=http://127.0.0.1/?platform=pi-zero-w&release=${ACTIVE_RELEASE_ID}
 Environment=PISTICK_BROWSER_PROFILE=/var/cache/pistick/chromium
 Environment=PISTICK_COG_PROFILE=/var/cache/pistick/cog
 Environment=PISTICK_MAX_DISPLAY_MODE=1280x720@60
@@ -577,7 +691,10 @@ temporary="\$(mktemp "\${TMPDIR:-/tmp}/update-pistick.XXXXXX.sh")"
 trap 'rm -f -- "\$temporary"' EXIT
 
 printf '[PiStick] Downloading the newest Pi Zero W installer...\n'
-curl -fsSL "https://raw.githubusercontent.com/${REPOSITORY}/refs/heads/${SOURCE_BRANCH}/install.sh" -o "\$temporary"
+cache_buster="\$(date +%s)"
+curl -fsSL -H 'Cache-Control: no-cache' \
+    "https://raw.githubusercontent.com/${REPOSITORY}/refs/heads/${SOURCE_BRANCH}/install.sh?cache=\${cache_buster}" \
+    -o "\$temporary"
 if ! grep -Fq 'SOURCE_BRANCH="${SOURCE_BRANCH}"' "\$temporary"; then
     printf 'PiStick update failed: the downloaded installer was not the Pi Zero W installer.\n' >&2
     exit 1
@@ -600,14 +717,17 @@ start_services() {
         return
     fi
     step "Starting PiStick"
-    systemctl daemon-reload
+    systemctl daemon-reload \
+        || fail "systemd could not reload the PiStick service definitions."
     systemctl enable bluetooth.service >/dev/null 2>&1 || true
     systemctl restart bluetooth.service >/dev/null 2>&1 || true
     systemctl enable avahi-daemon.service >/dev/null 2>&1 || true
     systemctl restart avahi-daemon.service >/dev/null 2>&1 || true
     systemctl disable --now getty@tty1.service >/dev/null 2>&1 || true
-    systemctl enable pistick-server.service pistick-kiosk.service >/dev/null
-    systemctl restart pistick-server.service
+    systemctl enable pistick-server.service pistick-kiosk.service >/dev/null \
+        || fail "systemd could not enable the PiStick boot services."
+    systemctl restart pistick-server.service \
+        || fail "The PiStick server service could not be started. Run: journalctl -u pistick-server -n 100"
 
     local attempt
     for attempt in $(seq 1 30); do
@@ -618,12 +738,44 @@ start_services() {
     done
     curl -fsS --max-time 3 http://127.0.0.1/health >/dev/null \
         || fail "The local PiStick server did not pass its health check. Run: journalctl -u pistick-server -n 100"
-    systemctl restart pistick-kiosk.service
+
+    if ! curl -fsS --max-time 5 \
+        "http://127.0.0.1/?platform=pi-zero-w&release=${ACTIVE_RELEASE_ID}" \
+        | grep -Fq '/styles.css?v='; then
+        fail "The local PiStick server started, but its web interface did not pass validation."
+    fi
+
+    systemctl restart pistick-kiosk.service \
+        || fail "The PiStick kiosk service could not be started. Run: journalctl -u pistick-kiosk -n 100"
+
+    # A crash-looping kiosk can appear active briefly between systemd
+    # restarts. Require the same process to remain alive longer than the
+    # service's five-second restart delay before declaring the update healthy.
+    local kiosk_pid="" current_pid
+    for attempt in $(seq 1 20); do
+        if systemctl is-active --quiet pistick-kiosk.service; then
+            kiosk_pid="$(systemctl show -p MainPID --value pistick-kiosk.service 2>/dev/null || true)"
+            if [[ "$kiosk_pid" =~ ^[1-9][0-9]*$ ]]; then
+                break
+            fi
+        fi
+        sleep 1
+    done
+    [[ "$kiosk_pid" =~ ^[1-9][0-9]*$ ]] \
+        || fail "The PiStick kiosk did not become active. Run: journalctl -u pistick-kiosk -n 100"
+    sleep 8
+    current_pid="$(systemctl show -p MainPID --value pistick-kiosk.service 2>/dev/null || true)"
+    if ! systemctl is-active --quiet pistick-kiosk.service \
+        || [[ "$current_pid" != "$kiosk_pid" ]] \
+        || [[ ! -d "/proc/${kiosk_pid}" ]]; then
+        fail "The PiStick kiosk crashed during startup. Run: sudo pistick-diagnose"
+    fi
 }
 
 print_summary() {
     printf '\nPiStick for Pi Zero W is installed.\n'
     printf '  Application: /opt/pistick/current\n'
+    printf '  Release: %s\n' "$ACTIVE_RELEASE_ID"
     printf '  Private data: /var/lib/pistick/data\n'
     printf '  Guide: /opt/pistick/current/PI_ZERO_W_README.md\n'
     if [[ "$TEST_MODE" != "1" ]]; then
@@ -638,6 +790,7 @@ print_summary() {
 
 main() {
     require_root
+    acquire_install_lock
     check_platform
     resolve_target_user
     install_packages
@@ -646,6 +799,7 @@ main() {
     check_source
     collect_token
     install_release
+    verify_installed_release
     write_config
     configure_user_access
     write_xwrapper
@@ -653,6 +807,8 @@ main() {
     write_services
     write_update_command
     start_services
+    RELEASE_COMMITTED=1
+    cleanup_old_releases
     print_summary
 }
 

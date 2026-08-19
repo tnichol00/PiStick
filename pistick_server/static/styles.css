@@ -697,6 +697,10 @@ html.pi-zero-w *::after {
   transition-duration: 0.01ms !important;
 }
 
+html.pi-zero-w .spinner {
+  animation: spin 1.2s linear infinite !important;
+}
+
 html.pi-zero-w .hero { min-height: min(58vh, 600px); }
 html.pi-zero-w .media-card:hover,
 html.pi-zero-w .media-card:focus-visible { transform: none; }
@@ -781,5 +785,13 @@ html.pi-zero-w .media-section { content-visibility: auto; contain-intrinsic-size
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .spinner,
+  html.pi-zero-w .spinner {
+    animation: none !important;
+  }
 }

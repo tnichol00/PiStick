@@ -206,7 +206,7 @@ The Linux installer also:
 - Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
 - Installs Python, fonts, media codecs, NetworkManager, mDNS, Bluetooth support, and either Cog/WPE (ARMv6) or Chromium/X11 (newer Pis).
 - Downloads the dedicated `agent/pi-zero-w` branch and validates its required files and syntax.
-- Stores immutable release snapshots under `/opt/pistick/releases/`.
+- Stages each application version under `/opt/pistick/releases/` and keeps only the active version after startup passes its health checks.
 - Points `/opt/pistick/current` at the active release.
 - Creates a minimal fullscreen service with no desktop and selects its browser from the Pi's CPU architecture.
 - Starts PiStick at boot and restarts it if it crashes.
@@ -242,10 +242,12 @@ The Pi updater downloads the newest `agent/pi-zero-w` commit and safely reuses p
 When a new Pi branch commit exists, the updater:
 
 1. Downloads the branch installer and source without changing private data.
-2. Validates its required files and syntax.
+2. Validates its required files, syntax, permissions, and Python import as the regular PiStick service user.
 3. Activates a new versioned application snapshot.
-4. Restarts the services and checks the local server's health.
-5. Keeps the user's TMDB token, profiles, watch history, and caches.
+4. Restarts the services, validates the web interface, and checks that the kiosk remains running instead of entering a restart loop.
+5. Restores the last working version automatically if validation fails.
+6. After validation succeeds, deletes every inactive application version and abandoned staging directory.
+7. Keeps the user's TMDB token, profiles, watch history, and caches.
 
 The Pi updater intentionally follows only the dedicated Pi Zero W branch.
 
@@ -257,7 +259,7 @@ These files survive every update:
 | --- | --- | --- |
 | Private TMDB configuration | `/var/lib/pistick/data/config.json` | `%LOCALAPPDATA%\PiStick\data\config.json` |
 | Profiles, watch history, and resume timestamps | `/var/lib/pistick/data/state.json` | `%LOCALAPPDATA%\PiStick\data\pistick_state.json` |
-| Application releases | `/opt/pistick/releases/` | `%LOCALAPPDATA%\PiStick\releases\` |
+| Active application release | `/opt/pistick/releases/` | `%LOCALAPPDATA%\PiStick\releases\` |
 | Posters, API data, and browser cache | `/var/lib/pistick/data/cache/` and `/var/cache/pistick/` | `%LOCALAPPDATA%\PiStick\cache\` |
 
 The Linux service and Windows launcher pass these locations to the app through `PISTICK_CONFIG_PATH`, `PISTICK_STATE_PATH`, and `PISTICK_CACHE_DIR`.

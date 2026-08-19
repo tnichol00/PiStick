@@ -275,11 +275,23 @@ class ApplicationTests(unittest.TestCase):
         response = self.app.dispatch("GET", "/", {})
         self.assertEqual(response.status, 200)
         self.assertIn(b"PiStick", response.body)
-        self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
+        version = self.app.asset_version.encode("ascii")
+        self.assertIn(b"/styles.css?v=" + version, response.body)
+        self.assertIn(b"/app.js?v=" + version, response.body)
+        self.assertNotIn(b"__PISTICK_ASSET_VERSION__", response.body)
+        self.assertEqual(
+            response.headers.get("Cache-Control"),
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
+        self.assertEqual(response.headers.get("Pragma"), "no-cache")
+        self.assertEqual(response.headers.get("Expires"), "0")
 
-        script = self.app.dispatch("GET", "/app.js", {})
+        script = self.app.dispatch("GET", f"/app.js?v={self.app.asset_version}", {})
         self.assertEqual(script.status, 200)
-        self.assertEqual(script.headers.get("Cache-Control"), "no-cache")
+        self.assertEqual(
+            script.headers.get("Cache-Control"),
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
         self.assertIn(b"/api/watch/progress", script.body)
         self.assertIn(b"openSearchKeyboard", script.body)
         self.assertIn(b"/api/system/wifi/connect", script.body)
