@@ -29,6 +29,11 @@ assert_contains() {
     grep -Fq -- "$2" "$1" || fail "Expected '$2' in $1"
 }
 
+assert_mode() {
+    [[ "$(stat -Lc '%a' "$1")" == "$2" ]] \
+        || fail "Expected mode $2 for $1, got $(stat -Lc '%a' "$1")"
+}
+
 run_installer() {
     env \
         PISTICK_TEST_MODE=1 \
@@ -282,12 +287,22 @@ exec "$@"
 SH
 chmod 0755 "$FAKE_BIN/curl" "$FAKE_BIN/sudo"
 
+# Reproduce update-pistick's restrictive umask checkout. The installer runs as
+# root, but its server and kiosk later run as the regular Pi user. Release code
+# must therefore be normalized instead of preserving root-only source modes.
+STRICT_SOURCE="${TEST_DIR}/strict-source"
+cp -a "$PROJECT_DIR" "$STRICT_SOURCE"
+chmod -R go-rwx "$STRICT_SOURCE"
+assert_mode "$STRICT_SOURCE/pistick_server" 700
+assert_mode "$STRICT_SOURCE/pistick_server/app.py" 600
+assert_mode "$STRICT_SOURCE/pi" 700
+
 env \
     PATH="$FAKE_BIN:$PATH" \
     PISTICK_TEST_INSTALLER_SOURCE="$PROJECT_DIR/install.sh" \
     PISTICK_TEST_MODE=1 \
     PISTICK_TEST_ROOT="$TEST_ROOT" \
-    PISTICK_SOURCE_DIR="$PROJECT_DIR" \
+    PISTICK_SOURCE_DIR="$STRICT_SOURCE" \
     PISTICK_USER=pistick \
     PISTICK_GROUP=pistick \
     PISTICK_HOME=/home/pistick \
@@ -299,5 +314,10 @@ env \
     || fail "update-pistick changed watch state"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
     || fail "update-pistick changed the saved configuration"
+assert_mode "$CURRENT" 755
+assert_mode "$CURRENT/pistick_server" 755
+assert_mode "$CURRENT/pistick_server/app.py" 644
+assert_mode "$CURRENT/pi" 755
+assert_mode "$CURRENT/pi/launch-kiosk.sh" 755
 
 printf 'All Pi Zero W installer checks passed.\n'

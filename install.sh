@@ -276,12 +276,18 @@ install_release() {
     cp -a "${SOURCE_DIR}/pi" "$staging/pi"
     install -m 0644 "${SOURCE_DIR}/PI_ZERO_W_README.md" "$staging/PI_ZERO_W_README.md"
     [[ ! -f "${SOURCE_DIR}/LICENSE" ]] || install -m 0644 "${SOURCE_DIR}/LICENSE" "$staging/LICENSE"
+    find "$staging" -type d -name __pycache__ -prune -exec rm -rf -- {} +
+
+    # update-pistick intentionally downloads with umask 077. A Git checkout
+    # made under that mask has root-only directories, and cp -a preserves
+    # them. Application releases contain no private data, so normalize every
+    # directory/file before the regular service user tries to import or run it.
+    chmod -R u=rwX,go=rX "$staging"
     chmod 0755 \
         "$staging/pi/launch-kiosk.sh" \
         "$staging/pi/kiosk-cog.sh" \
         "$staging/pi/kiosk-session.sh" \
         "$staging/pi/diagnose.sh"
-    find "$staging" -type d -name __pycache__ -prune -exec rm -rf -- {} +
 
     mv "$staging" "$release_dir"
     rm -f -- "${current_link}.new"
