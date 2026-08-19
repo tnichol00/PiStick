@@ -73,8 +73,11 @@ curl -fsS --max-time 5 http://127.0.0.1/health 2>&1 || true
 printf '\n'
 
 section "Local web interface"
-if curl -fsS --max-time 5 'http://127.0.0.1/?platform=pi-zero-w&diagnose=1' 2>/dev/null \
-    | grep -Fq '/styles.css?v='; then
+homepage="$(
+    curl -fsS --max-time 5 \
+        'http://127.0.0.1/?platform=pi-zero-w&diagnose=1' 2>/dev/null || true
+)"
+if [[ "$homepage" == *'/styles.css?v='* ]]; then
     printf 'Versioned home page: OK\n'
 else
     printf 'Versioned home page: FAILED\n'

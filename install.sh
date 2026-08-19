@@ -729,7 +729,7 @@ start_services() {
     systemctl restart pistick-server.service \
         || fail "The PiStick server service could not be started. Run: journalctl -u pistick-server -n 100"
 
-    local attempt
+    local attempt homepage
     for attempt in $(seq 1 30); do
         if curl -fsS --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
             break
@@ -739,9 +739,14 @@ start_services() {
     curl -fsS --max-time 3 http://127.0.0.1/health >/dev/null \
         || fail "The local PiStick server did not pass its health check. Run: journalctl -u pistick-server -n 100"
 
-    if ! curl -fsS --max-time 5 \
-        "http://127.0.0.1/?platform=pi-zero-w&release=${ACTIVE_RELEASE_ID}" \
-        | grep -Fq '/styles.css?v='; then
+    # Do not pipe curl into `grep -q` here. grep intentionally closes the pipe
+    # as soon as it finds a match, which makes curl return error 23 under
+    # `set -o pipefail` even though the page is correct.
+    if ! homepage="$(curl -fsS --max-time 5 \
+        "http://127.0.0.1/?platform=pi-zero-w&release=${ACTIVE_RELEASE_ID}")"; then
+        fail "The local PiStick server started, but its web interface could not be downloaded."
+    fi
+    if [[ "$homepage" != *'/styles.css?v='* ]]; then
         fail "The local PiStick server started, but its web interface did not pass validation."
     fi
 

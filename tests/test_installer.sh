@@ -171,6 +171,10 @@ assert_contains "$CURRENT/pi/diagnose.sh" "Server import as"
 assert_contains "$CURRENT/pi/diagnose.sh" "Versioned home page"
 assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
 assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
+assert_contains "$PROJECT_DIR/install.sh" 'if ! homepage="$(curl -fsS --max-time 5'
+if grep -Fq "| grep -Fq '/styles.css?v='" "$PROJECT_DIR/install.sh"; then
+    fail "Web-interface validation can falsely fail with curl error 23 under pipefail"
+fi
 
 [[ "$(PISTICK_MACHINE=armv6l "$CURRENT/pi/launch-kiosk.sh" --print-backend)" == "cog" ]] \
     || fail "The original ARMv6 Zero W did not select Cog/WPE"
