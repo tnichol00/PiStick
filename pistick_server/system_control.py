@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
-from typing import Any, Optional
 
 
 class SystemControlError(RuntimeError):
@@ -24,7 +22,7 @@ class SystemController:
         "bluetooth-pair": 70,
     }
 
-    def __init__(self, helper_path: Optional[Path] = None):
+    def __init__(self, helper_path: Path | None = None):
         configured = os.getenv("PISTICK_SYSTEM_HELPER", "").strip()
         self.helper_path = Path(
             helper_path or configured or "/usr/local/libexec/pistick-system-helper"
@@ -34,7 +32,11 @@ class SystemController:
     def available(self) -> bool:
         return self.helper_path.is_file() and os.access(self.helper_path, os.X_OK)
 
-    def run(self, action: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def run(
+        self, action: str, payload: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        import subprocess
+
         if action not in self.ACTION_TIMEOUTS:
             raise SystemControlError("That system action is not supported.")
         if not self.available:

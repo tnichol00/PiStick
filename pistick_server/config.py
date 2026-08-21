@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import secrets
 import tempfile
 import threading
-from typing import Any
 
 
 class ConfigStore:
@@ -21,11 +19,12 @@ class ConfigStore:
         self._lock = threading.RLock()
         self.data = self._load()
 
-    def _load(self) -> dict[str, Any]:
+    def _load(self) -> dict[str, object]:
+        source_exists = self.path.is_file()
         try:
-            # Windows PowerShell 5.1 may have written an older config with a
-            # UTF-8 BOM.  utf-8-sig accepts both BOM and ordinary UTF-8 files.
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            # json.loads(bytes) accepts both ordinary UTF-8 and an older
+            # Windows PowerShell UTF-8 BOM without a second decoded copy.
+            raw = json.loads(self.path.read_bytes())
         except (OSError, ValueError, TypeError):
             raw = {}
         if not isinstance(raw, dict):
@@ -60,17 +59,24 @@ class ConfigStore:
         normalized = {
             "tmdb_read_token": token,
             "port": port,
-            "shutdown_token": str(raw.get("shutdown_token") or secrets.token_urlsafe(32)),
+            "shutdown_token": str(raw.get("shutdown_token") or os.urandom(32).hex()),
             "lan_enabled": bool(configured_lan),
         }
-        self._write(normalized)
+        if not source_exists or raw != normalized:
+            self._write(normalized)
+        else:
+            try:
+                if self.path.stat().st_mode & 0o777 != 0o600:
+                    os.chmod(self.path, 0o600)
+            except OSError:
+                pass
         return normalized
 
     @staticmethod
-    def _serialize(data: dict[str, Any]) -> str:
+    def _serialize(data: dict[str, object]) -> str:
         return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
-    def _write(self, data: dict[str, Any]) -> None:
+    def _write(self, data: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
@@ -130,9 +136,12 @@ class ConfigStore:
             self.data["lan_enabled"] = bool(enabled)
             self._write(self.data)
 
-    def public_payload(self) -> dict[str, Any]:
-        return {
-            "tmdb_configured": self.token_configured,
-            "port": self.port,
-            "lan_enabled": self.lan_enabled,
-        }
+    def public_payload(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "tmdb_configured": self.usable_token(
+                    str(self.data.get("tmdb_read_token") or "")
+                ),
+                "port": int(self.data.get("port") or self.DEFAULT_PORT),
+                "lan_enabled": bool(self.data.get("lan_enabled", False)),
+            }

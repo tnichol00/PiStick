@@ -1,6 +1,6 @@
 # PiStick on Raspberry Pi Zero W
 
-This guide installs the `agent/pi-zero-w` edition of PiStick as a television appliance. It is written for the **original Raspberry Pi Zero W** with a single-core ARMv6 processor and 512 MB of RAM. It also works on a Pi Zero 2 W.
+This guide installs the `agent/pi-zero-w` edition of PiStick as a television appliance. This branch is optimized exclusively for the **original Raspberry Pi Zero W** with a single-core ARMv6 processor and 512 MB of RAM.
 
 The finished boot flow is:
 
@@ -8,7 +8,7 @@ The finished boot flow is:
 Power on → Raspberry Pi OS Lite → PiStick server → fullscreen browser
 ```
 
-There is no normal desktop, taskbar, or file manager. PiStick opens automatically on HDMI, can be controlled with a Bluetooth or USB game controller, and can optionally serve the same interface to other devices on your Wi-Fi. The installer uses the ARMv6-compatible Cog/WPE browser on an original Zero W and Chromium on a Zero 2 W or newer Pi.
+There is no normal desktop, taskbar, or file manager. PiStick opens automatically on HDMI, can be controlled with a Bluetooth or USB game controller, and can optionally serve the same interface to other devices on your Wi-Fi. The installer uses the ARMv6-compatible Cog/WPE browser.
 
 ## Before you begin
 
@@ -23,7 +23,7 @@ You need:
 - Free TMDB account and its long **API Read Access Token**
 - Optional Bluetooth controller, or a USB controller with a micro-USB OTG adapter
 
-The original Zero W is much slower than a Zero 2 W. PiStick reduces image sizes, expensive visual effects, background work, and display resolution on this branch. Browsing should be usable, but modern YouTube and third-party video pages can still be demanding. A Zero 2 W is the better choice if smooth video playback is the priority.
+PiStick reduces image sizes, expensive visual effects, background work, and display resolution on this branch. Browsing should be usable, but modern YouTube and third-party video pages can still be demanding on the Zero W.
 
 ## Part 1: Prepare Raspberry Pi OS
 
@@ -375,7 +375,7 @@ The original Zero W supports only 2.4 GHz. Move it closer to the router, make su
 
 ### Video is slow
 
-The original Zero W has only one CPU core. PiStick uses the lighter Cog/WPE kiosk at a maximum 720p mode there, but some modern player pages remain too heavy. A Pi Zero 2 W or newer model is recommended for smoother playback.
+The original Zero W has only one CPU core. PiStick uses the lightweight Cog/WPE kiosk at a maximum 720p mode, but some modern player pages can still be demanding.
 
 ## Update this branch
 
@@ -385,9 +385,24 @@ Run:
 sudo update-pistick
 ```
 
-The updater downloads the newest commit from `agent/pi-zero-w`, keeps the TMDB token, profiles, history, and browser data, then restarts PiStick. It validates the server and kiosk before deleting every inactive application version. If the new version fails startup validation, the installer restores the last working version instead of deleting it.
+The compatibility spelling works too:
 
-The older `sudo pistick-update` spelling remains as a compatibility alias, but `sudo update-pistick` is the main command going forward.
+```bash
+sudo pistick-update
+```
+
+The updater downloads the newest commit from `agent/pi-zero-w` into a new release directory. It does not modify the private configuration or watch-state files under `/var/lib/pistick/data`. After the new server and kiosk pass startup validation, it immediately deletes every previous release, abandoned staging directory, and obsolete browser-runtime cache. If validation fails, it restores the last working release and leaves that release in place for recovery.
+
+`sudo update-pistick` and `sudo pistick-update` run the same updater.
+
+To confirm which release is actually serving the screen, run:
+
+```bash
+curl -fsS http://127.0.0.1/health
+readlink -f /opt/pistick/current
+```
+
+The `release` value returned by the server must match the active release directory. The 12-character hexadecimal segment after the timestamp identifies the installed Git commit. The updater now checks this match itself before it deletes the previous release.
 
 ## Data locations
 
@@ -396,7 +411,7 @@ The older `sudo pistick-update` spelling remains as a compatibility alias, but `
 | Current application | `/opt/pistick/current` |
 | Active versioned application | `/opt/pistick/releases` |
 | TMDB token and watch state | `/var/lib/pistick/data` |
-| Browser profiles and caches | `/var/cache/pistick/cog` and `/var/cache/pistick/chromium` |
+| Cog browser data | `/var/cache/pistick/cog` |
 | Boot services | `/etc/systemd/system/pistick-*.service` |
 | Root-owned system helper | `/usr/local/libexec/pistick-system-helper` |
 

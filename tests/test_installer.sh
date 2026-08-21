@@ -67,7 +67,6 @@ mkdir -p "$TEST_ROOT"
 bash -n "$PROJECT_DIR/install.sh"
 bash -n "$PROJECT_DIR/pi/launch-kiosk.sh"
 bash -n "$PROJECT_DIR/pi/kiosk-cog.sh"
-bash -n "$PROJECT_DIR/pi/kiosk-session.sh"
 bash -n "$PROJECT_DIR/pi/diagnose.sh"
 bash -n "$PROJECT_DIR/pi/configure-tmdb.sh"
 
@@ -102,7 +101,6 @@ assert_file "$CURRENT/pistick_server/static/app.js"
 assert_file "$CURRENT/pistick_server/system_control.py"
 assert_file "$CURRENT/pi/launch-kiosk.sh"
 assert_file "$CURRENT/pi/kiosk-cog.sh"
-assert_file "$CURRENT/pi/kiosk-session.sh"
 assert_file "$CURRENT/pi/diagnose.sh"
 assert_file "$CURRENT/pi/pistick-system-helper.py"
 assert_file "$CURRENT/pi/configure-tmdb.sh"
@@ -110,7 +108,6 @@ assert_file "$CURRENT/PI_ZERO_W_README.md"
 assert_file "$TEST_ROOT/var/lib/pistick/data/config.json"
 assert_file "$TEST_ROOT/etc/systemd/system/pistick-server.service"
 assert_file "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service"
-assert_file "$TEST_ROOT/etc/X11/Xwrapper.config"
 assert_file "$TEST_ROOT/usr/local/bin/update-pistick"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-update"
 assert_file "$TEST_ROOT/usr/local/bin/pistick-diagnose"
@@ -138,14 +135,20 @@ assert len(config["shutdown_token"]) >= 24
 assert config["lan_enabled"] is True
 PY
 
-assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_LOW_MEMORY=1"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_ALLOW_LAN_BIND=1"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_ALLOW_HTTP_PORT=1"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_DEFAULT_LAN=1"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "Environment=PISTICK_LOW_MEMORY=1"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "--host 0.0.0.0"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "--port 80"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "AmbientCapabilities=CAP_NET_BIND_SERVICE"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "PISTICK_SYSTEM_HELPER=/usr/local/libexec/pistick-system-helper"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "python3 -OO -B"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "MALLOC_ARENA_MAX=2"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-server.service" "UMask=0077"
+if grep -Fq "network-online.target" "$TEST_ROOT/etc/systemd/system/pistick-server.service"; then
+    fail "The local server still waits for full network readiness before booting"
+fi
 if grep -Fq "NoNewPrivileges=true" "$TEST_ROOT/etc/systemd/system/pistick-server.service"; then
     fail "The server service prevents its allowlisted sudo helper from running"
 fi
@@ -154,6 +157,7 @@ assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_U
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "&release="
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_COG_PROFILE=/var/cache/pistick/cog"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "PISTICK_MAX_DISPLAY_MODE=1280x720@60"
+assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "MALLOC_ARENA_MAX=2"
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "StandardError=journal+console"
 assert_contains "$TEST_ROOT/etc/sudoers.d/pistick-system" "pistick-system-helper wifi-connect"
 assert_contains "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" "TMDB token updated"
@@ -162,24 +166,37 @@ assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "Cache-Control: no-cac
 assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "?cache="
 assert_contains "$PROJECT_DIR/install.sh" "avahi-daemon"
 assert_contains "$PROJECT_DIR/install.sh" "hostnamectl set-hostname pistick"
-assert_contains "$PROJECT_DIR/install.sh" "BROWSER_PACKAGE=\"cog\""
+assert_contains "$PROJECT_DIR/install.sh" "--filter=blob:none"
+assert_contains "$PROJECT_DIR/install.sh" "sparse-checkout"
+assert_contains "$PROJECT_DIR/install.sh" "package_installed"
 assert_contains "$CURRENT/pi/kiosk-cog.sh" "--platform=drm"
 assert_contains "$CURRENT/pi/kiosk-cog.sh" "--gamepad=manette"
 assert_contains "$CURRENT/pi/kiosk-cog.sh" "--media-playback-requires-user-gesture=false"
-assert_contains "$CURRENT/pi/kiosk-session.sh" "--renderer-process-limit=2"
+assert_contains "$CURRENT/pi/kiosk-cog.sh" "restart_delay > 30"
 assert_contains "$CURRENT/pi/diagnose.sh" "Server import as"
 assert_contains "$CURRENT/pi/diagnose.sh" "Versioned home page"
 assert_contains "$CURRENT/pistick_server/static/app.js" "openSearchKeyboard"
-assert_contains "$PROJECT_DIR/install.sh" "debian_major >= 13"
+assert_contains "$PROJECT_DIR/install.sh" '[[ "$debian_major" == "12" ]]'
+assert_contains "$PROJECT_DIR/install.sh" '[[ "$MACHINE" == "armv6l" ]]'
+assert_contains "$PROJECT_DIR/install.sh" '[[ "${ID:-}" == "raspbian" ]]'
+assert_contains "$PROJECT_DIR/install.sh" "pi-bluetooth"
 assert_contains "$PROJECT_DIR/install.sh" 'if ! homepage="$(curl -fsS --max-time 5'
+if grep -Eq 'xserver-xorg|openbox|chromium-browser' "$PROJECT_DIR/install.sh"; then
+    fail "The Pi Zero W-only installer still installs a newer-Pi X11 browser stack"
+fi
 if grep -Fq "| grep -Fq '/styles.css?v='" "$PROJECT_DIR/install.sh"; then
     fail "Web-interface validation can falsely fail with curl error 23 under pipefail"
 fi
 
 [[ "$(PISTICK_MACHINE=armv6l "$CURRENT/pi/launch-kiosk.sh" --print-backend)" == "cog" ]] \
     || fail "The original ARMv6 Zero W did not select Cog/WPE"
-[[ "$(PISTICK_MACHINE=armv7l "$CURRENT/pi/launch-kiosk.sh" --print-backend)" == "chromium" ]] \
-    || fail "A newer Pi did not keep the Chromium kiosk"
+if grep -Fqi "chromium" "$CURRENT/pi/launch-kiosk.sh"; then
+    fail "The Pi Zero W launcher still carries an unused Chromium path"
+fi
+if ! find "$CURRENT/pistick_server/__pycache__" -maxdepth 1 \
+    -name 'app.*.opt-2.pyc' -print -quit | grep -q .; then
+    fail "The installer did not precompile optimized server bytecode"
+fi
 
 python3 - "$CURRENT/pistick_server/static/styles.css" <<'PY'
 from pathlib import Path
@@ -270,13 +287,14 @@ for _attempt in $(seq 1 30); do
     fi
     sleep 0.1
 done
-python3 - "$TEST_DIR/health.json" <<'PY'
+python3 - "$TEST_DIR/health.json" "$(basename "$(readlink -f -- "$CURRENT")")" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     health = json.load(source)
 assert health["ok"] is True
+assert health["release"] == sys.argv[2]
 PY
 kill "$SERVER_PID"
 wait "$SERVER_PID"
@@ -303,18 +321,44 @@ printf '{"profiles":[],"marker":"keep-me"}\n' >"$TEST_ROOT/var/lib/pistick/data/
 state_hash="$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)"
 config_hash="$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)"
 mkdir -p \
-    "$TEST_ROOT/opt/pistick/releases/20000101000000-obsolete" \
-    "$TEST_ROOT/opt/pistick/releases/.interrupted.staging"
+    "$TEST_ROOT/opt/pistick/releases/20000101000000-obsolete/nested" \
+    "$TEST_ROOT/opt/pistick/releases/.interrupted.staging/nested" \
+    "$TEST_ROOT/var/cache/pistick/chromium/old-profile" \
+    "$TEST_ROOT/var/lib/pistick/logs" \
+    "$TEST_ROOT/etc/X11"
+printf 'obsolete application bytes\n' \
+    >"$TEST_ROOT/opt/pistick/releases/20000101000000-obsolete/nested/file.bin"
+printf 'obsolete browser cache\n' \
+    >"$TEST_ROOT/var/cache/pistick/chromium/old-profile/cache.bin"
+printf 'stale runtime marker\n' >"$TEST_ROOT/var/lib/pistick/data/runtime.json"
+printf 'old server log\n' >"$TEST_ROOT/var/lib/pistick/logs/server.log.1"
+printf 'allowed_users=anybody\nneeds_root_rights=yes\n' \
+    >"$TEST_ROOT/etc/X11/Xwrapper.config"
 run_installer
 assert_single_active_release
 [[ ! -e "$TEST_ROOT/opt/pistick/releases/20000101000000-obsolete" ]] \
     || fail "The installer kept an obsolete application version"
 [[ ! -e "$TEST_ROOT/opt/pistick/releases/.interrupted.staging" ]] \
     || fail "The installer kept an interrupted staging version"
+[[ ! -e "$TEST_ROOT/var/cache/pistick/chromium" ]] \
+    || fail "The Pi Zero W installer kept the obsolete Chromium cache"
+[[ ! -e "$TEST_ROOT/var/lib/pistick/data/runtime.json" ]] \
+    || fail "The installer kept the previous server's runtime marker"
+[[ ! -e "$TEST_ROOT/var/lib/pistick/logs/server.log.1" ]] \
+    || fail "The installer kept logs from the previous server version"
+[[ ! -e "$TEST_ROOT/var/lib/pistick/logs" ]] \
+    || fail "The installer kept the empty legacy server-log directory"
+[[ ! -e "$TEST_ROOT/etc/X11/Xwrapper.config" ]] \
+    || fail "The Pi Zero W installer kept its obsolete X11 policy"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)" == "$state_hash" ]] \
     || fail "A reinstall changed watch state"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
     || fail "A reinstall changed the saved configuration"
+
+# A policy not created by PiStick is user/system configuration and must survive.
+printf 'allowed_users=console\nneeds_root_rights=auto\n' \
+    >"$TEST_ROOT/etc/X11/Xwrapper.config"
+custom_xwrapper_hash="$(sha256sum "$TEST_ROOT/etc/X11/Xwrapper.config" | cut -d' ' -f1)"
 
 # Exercise the exact documented updater command without contacting GitHub.
 # The fake curl supplies this checkout's installer, and the fake sudo lets the
@@ -354,6 +398,7 @@ assert_mode "$STRICT_SOURCE/pistick_server" 700
 assert_mode "$STRICT_SOURCE/pistick_server/app.py" 600
 assert_mode "$STRICT_SOURCE/pi" 700
 
+pre_update_release="$(readlink -f -- "$CURRENT")"
 env \
     PATH="$FAKE_BIN:$PATH" \
     PISTICK_TEST_INSTALLER_SOURCE="$PROJECT_DIR/install.sh" \
@@ -366,16 +411,20 @@ env \
     PISTICK_UID=1000 \
     PISTICK_MACHINE=armv6l \
     PISTICK_SKIP_TMDB_VALIDATION=1 \
-    bash "$TEST_ROOT/usr/local/bin/update-pistick"
+    bash "$TEST_ROOT/usr/local/bin/pistick-update"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/state.json" | cut -d' ' -f1)" == "$state_hash" ]] \
     || fail "update-pistick changed watch state"
 [[ "$(sha256sum "$TEST_ROOT/var/lib/pistick/data/config.json" | cut -d' ' -f1)" == "$config_hash" ]] \
     || fail "update-pistick changed the saved configuration"
+[[ "$(sha256sum "$TEST_ROOT/etc/X11/Xwrapper.config" | cut -d' ' -f1)" == "$custom_xwrapper_hash" ]] \
+    || fail "pistick-update changed a non-PiStick X11 configuration"
 assert_mode "$CURRENT" 755
 assert_mode "$CURRENT/pistick_server" 755
 assert_mode "$CURRENT/pistick_server/app.py" 644
 assert_mode "$CURRENT/pi" 755
 assert_mode "$CURRENT/pi/launch-kiosk.sh" 755
 assert_single_active_release
+[[ ! -e "$pre_update_release" ]] \
+    || fail "pistick-update kept every file from the superseded release"
 
 printf 'All Pi Zero W installer checks passed.\n'

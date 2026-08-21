@@ -12,11 +12,11 @@
     loadToken: 0,
     detailsMedia: null,
     player: null,
-    progressTimer: null,
     toastTimer: null,
     manageProfiles: false,
     gamepadPrevious: {},
     gamepadCooldown: 0,
+    gamepadTimer: null,
     lowMemory: requestedPiMode,
     keyboardSubmit: null,
     keyboardReturnFocus: null,
@@ -28,6 +28,9 @@
   };
 
   var ui = {};
+  var PROGRESS_SAVE_INTERVAL_MS = 15000;
+  var GAMEPAD_ACTIVE_POLL_MS = 50;
+  var GAMEPAD_IDLE_POLL_MS = 1000;
 
   function element(tag, className, text) {
     var node = document.createElement(tag);
@@ -163,8 +166,8 @@
     ui.app.replaceChildren(page);
   }
 
-  async function refreshProfiles() {
-    var payload = await api("/api/profiles");
+  async function refreshProfiles(existingPayload) {
+    var payload = existingPayload || await api("/api/profiles");
     state.profiles = payload.profiles || [];
     state.activeProfile = state.profiles.find(function (profile) {
       return profile.id === payload.active_profile;
@@ -736,7 +739,9 @@
       position: 0,
       duration: 0,
       lastSavedAt: 0,
-      saving: false
+      lastSavedPosition: null,
+      lastSavedDuration: null,
+      saving: null
     };
     ui.playerTitle.textContent = title;
 
@@ -777,27 +782,39 @@
 
   async function savePlayerProgress(force) {
     var player = state.player;
-    if (!player || player.trailer || !player.media || player.saving) return;
+    if (!player || player.trailer || !player.media) return;
     if (!(player.position >= 0) || !(player.duration > 0)) return;
+    if (player.saving) {
+      if (!force) return;
+      try { await player.saving; } catch (error) { /* the final save retries below */ }
+      if (state.player !== player) return;
+    }
     var now = Date.now();
-    if (!force && now - player.lastSavedAt < 4500) return;
-    player.saving = true;
+    if (!force && now - player.lastSavedAt < PROGRESS_SAVE_INTERVAL_MS) return;
+    var position = Math.round(Number(player.position) * 10) / 10;
+    var duration = Math.round(Number(player.duration) * 10) / 10;
+    if (position === player.lastSavedPosition && duration === player.lastSavedDuration) return;
+    var request = api("/api/watch/progress", {
+      method: "POST",
+      timeout: force ? 5000 : 10000,
+      body: {
+        profile_id: activeProfileId(),
+        media: player.media,
+        episode: player.episode || undefined,
+        position_seconds: position,
+        duration_seconds: duration
+      }
+    });
+    player.saving = request;
     try {
-      await api("/api/watch/progress", {
-        method: "POST",
-        body: {
-          profile_id: activeProfileId(),
-          media: player.media,
-          episode: player.episode || undefined,
-          position_seconds: player.position,
-          duration_seconds: player.duration
-        }
-      });
-      player.lastSavedAt = now;
+      await request;
+      player.lastSavedAt = Date.now();
+      player.lastSavedPosition = position;
+      player.lastSavedDuration = duration;
     } catch (error) {
       if (force) showToast("Could not save playback progress.");
     } finally {
-      player.saving = false;
+      if (player.saving === request) player.saving = null;
     }
   }
 
@@ -1218,46 +1235,61 @@
     return Boolean(gamepad.buttons[index] && gamepad.buttons[index].pressed);
   }
 
-  function gamepadEdge(gamepad, name, pressed, callback) {
+  function gamepadEdge(gamepad, name, pressed) {
     var key = gamepad.index + ":" + name;
     var previous = Boolean(state.gamepadPrevious[key]);
     state.gamepadPrevious[key] = Boolean(pressed);
-    if (pressed && !previous) callback();
+    return Boolean(pressed && !previous);
   }
 
-  function pollGamepads(timestamp) {
-    var gamepads = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter(Boolean) : [];
-    gamepads.forEach(function (gamepad) {
-      gamepadEdge(gamepad, "a", gamepadPressed(gamepad, 0), function () {
-        if (state.player) postPlayerCommand("toggle");
-        else if (document.activeElement === ui.searchInput) openSearchKeyboard();
-        else if (document.activeElement && document.activeElement.classList.contains("profile-name-input")) {
-          var input = document.activeElement;
-          openControllerKeyboard("Edit profile name", input.value, "Use name", function (value) { input.value = value; });
-        }
-        else if (document.activeElement && typeof document.activeElement.click === "function") document.activeElement.click();
-        else focusFirst();
-      });
-      gamepadEdge(gamepad, "b", gamepadPressed(gamepad, 1), backAction);
-      gamepadEdge(gamepad, "x", gamepadPressed(gamepad, 2), function () {
-        if (state.player) postPlayerCommand("subtitles-english-toggle");
-      });
-
-      if (timestamp < state.gamepadCooldown) return;
-      var horizontal = Number(gamepad.axes[0] || 0);
-      var vertical = Number(gamepad.axes[1] || 0);
-      var direction = null;
-      if (gamepadPressed(gamepad, 14) || horizontal < -0.62) direction = "left";
-      else if (gamepadPressed(gamepad, 15) || horizontal > 0.62) direction = "right";
-      else if (gamepadPressed(gamepad, 12) || vertical < -0.62) direction = "up";
-      else if (gamepadPressed(gamepad, 13) || vertical > 0.62) direction = "down";
-      if (direction) {
-        state.gamepadCooldown = timestamp + 190;
-        if (state.player && (direction === "left" || direction === "right")) playerDirectional(direction);
-        else moveFocus(direction);
+  function handleGamepad(gamepad, timestamp) {
+    if (gamepadEdge(gamepad, "a", gamepadPressed(gamepad, 0))) {
+      if (state.player) postPlayerCommand("toggle");
+      else if (document.activeElement === ui.searchInput) openSearchKeyboard();
+      else if (document.activeElement && document.activeElement.classList.contains("profile-name-input")) {
+        var input = document.activeElement;
+        openControllerKeyboard("Edit profile name", input.value, "Use name", function (value) { input.value = value; });
       }
-    });
-    window.requestAnimationFrame(pollGamepads);
+      else if (document.activeElement && typeof document.activeElement.click === "function") document.activeElement.click();
+      else focusFirst();
+    }
+    if (gamepadEdge(gamepad, "b", gamepadPressed(gamepad, 1))) backAction();
+    if (gamepadEdge(gamepad, "x", gamepadPressed(gamepad, 2)) && state.player) {
+      postPlayerCommand("subtitles-english-toggle");
+    }
+
+    if (timestamp < state.gamepadCooldown) return;
+    var horizontal = Number(gamepad.axes[0] || 0);
+    var vertical = Number(gamepad.axes[1] || 0);
+    var direction = null;
+    if (gamepadPressed(gamepad, 14) || horizontal < -0.62) direction = "left";
+    else if (gamepadPressed(gamepad, 15) || horizontal > 0.62) direction = "right";
+    else if (gamepadPressed(gamepad, 12) || vertical < -0.62) direction = "up";
+    else if (gamepadPressed(gamepad, 13) || vertical > 0.62) direction = "down";
+    if (direction) {
+      state.gamepadCooldown = timestamp + 190;
+      if (state.player && (direction === "left" || direction === "right")) playerDirectional(direction);
+      else moveFocus(direction);
+    }
+  }
+
+  function scheduleGamepadPoll(delay) {
+    if (state.gamepadTimer !== null) window.clearTimeout(state.gamepadTimer);
+    state.gamepadTimer = window.setTimeout(pollGamepads, delay);
+  }
+
+  function pollGamepads() {
+    state.gamepadTimer = null;
+    var gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+    var found = false;
+    var timestamp = Date.now();
+    for (var index = 0; index < gamepads.length; index += 1) {
+      var gamepad = gamepads[index];
+      if (!gamepad) continue;
+      found = true;
+      handleGamepad(gamepad, timestamp);
+    }
+    scheduleGamepadPoll(found && !document.hidden ? GAMEPAD_ACTIVE_POLL_MS : GAMEPAD_IDLE_POLL_MS);
   }
 
   async function bootstrap() {
@@ -1350,20 +1382,27 @@
     });
     document.addEventListener("visibilitychange", function () {
       if (document.hidden) savePlayerProgress(true);
+      else scheduleGamepadPoll(0);
     });
     window.addEventListener("gamepadconnected", function (event) {
       showToast("Controller connected: " + (event.gamepad.id || "Gamepad"));
       focusFirst();
+      scheduleGamepadPoll(0);
+    });
+    window.addEventListener("gamepaddisconnected", function () {
+      state.gamepadPrevious = {};
+      scheduleGamepadPoll(0);
     });
     setupKeyboard();
-    window.requestAnimationFrame(pollGamepads);
+    scheduleGamepadPoll(0);
 
     loadingPage("Connecting to PiStick Server…", false);
     try {
-      state.status = await api("/api/status");
+      var initial = await Promise.all([api("/api/status"), api("/api/profiles")]);
+      state.status = initial[0];
       state.lowMemory = state.lowMemory || Boolean(state.status.low_memory);
       document.documentElement.classList.toggle("pi-zero-w", state.lowMemory);
-      await refreshProfiles();
+      await refreshProfiles(initial[1]);
       if (state.activeProfile) await renderHome();
       else renderProfiles(false);
     } catch (error) {

@@ -1,6 +1,3 @@
-import argparse
-import contextlib
-import io
 import json
 import os
 from pathlib import Path
@@ -16,6 +13,8 @@ from pistick_server.app import (
     LoopbackHTTPServer,
     PiStickApplication,
     PiStickRequestHandler,
+    _address_scope,
+    _installed_release_id,
     _server_host,
     main,
 )
@@ -131,6 +130,7 @@ class ApplicationTests(unittest.TestCase):
         self.app.config.save = lambda: None
         response, payload = self.dispatch_json("GET", "/api/status")
         self.assertEqual(response.status, 200)
+        self.assertEqual(payload["release"], "development")
         self.assertNotIn("token", json.dumps(payload).lower().replace("tmdb_configured", ""))
         self.assertNotIn("this-is-a-private-token", response.body.decode("utf-8"))
 
@@ -146,6 +146,17 @@ class ApplicationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             store = ConfigStore(path)
         self.assertFalse(store.lan_enabled)
+
+    def test_unchanged_private_config_is_not_rewritten_on_boot(self) -> None:
+        path = Path(self.temporary.name) / "stable-config.json"
+        with patch.dict(os.environ, {}, clear=True):
+            original = ConfigStore(path)
+            original_bytes = path.read_bytes()
+            with patch.object(ConfigStore, "_write") as writer:
+                reloaded = ConfigStore(path)
+        writer.assert_not_called()
+        self.assertEqual(path.read_bytes(), original_bytes)
+        self.assertEqual(reloaded.shutdown_token, original.shutdown_token)
 
     def test_home_includes_server_side_continue_watching(self) -> None:
         movie = self.fake_tmdb.movie()
@@ -252,24 +263,72 @@ class ApplicationTests(unittest.TestCase):
     def test_lan_bind_requires_explicit_pi_service_environment(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_server_host("127.0.0.1"), "127.0.0.1")
-            with self.assertRaises(argparse.ArgumentTypeError):
+            with self.assertRaises(ValueError):
                 _server_host("0.0.0.0")
         with patch.dict(os.environ, {"PISTICK_ALLOW_LAN_BIND": "1"}):
             self.assertEqual(_server_host("0.0.0.0"), "0.0.0.0")
+            self.assertEqual(_server_host("::"), "::")
+
+    def test_address_scoping_accepts_only_loopback_and_home_lan_ranges(self) -> None:
+        self.assertEqual(_address_scope("127.0.0.1")[0], "loopback")
+        self.assertEqual(_address_scope("::1")[0], "loopback")
+        for address in (
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.20",
+            "169.254.1.2",
+            "100.64.1.2",
+            "fd00::1234",
+            "fe80::1234%eth0",
+        ):
+            with self.subTest(address=address):
+                self.assertEqual(_address_scope(address)[0], "lan")
+        for address in ("0.0.0.0", "::", "8.8.8.8", "2606:4700:4700::1111"):
+            with self.subTest(address=address):
+                self.assertNotIn(_address_scope(address)[0], {"loopback", "lan"})
+        self.assertIsNone(_address_scope("not-an-address"))
+
+    def test_release_identity_comes_from_active_release_path(self) -> None:
+        with patch(
+            "pistick_server.app.__file__",
+            "/opt/pistick/releases/20260821235959-abcdef123456/pistick_server/app.py",
+        ):
+            self.assertEqual(
+                _installed_release_id(), "20260821235959-abcdef123456"
+            )
+        with patch("pistick_server.app.__file__", "/tmp/random/app.py"):
+            self.assertEqual(_installed_release_id(), "development")
 
     def test_port_80_requires_explicit_pi_service_environment(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch(
             "pistick_server.app.run_server"
-        ) as runner:
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit):
-                    main(["--port", "80"])
+        ) as runner, patch("sys.stderr"):
+            self.assertEqual(main(["--port", "80"]), 2)
             runner.assert_not_called()
         with patch.dict(os.environ, {"PISTICK_ALLOW_HTTP_PORT": "1"}), patch(
             "pistick_server.app.run_server"
         ) as runner:
             self.assertEqual(main(["--port", "80"]), 0)
             runner.assert_called_once()
+
+    def test_lightweight_server_argument_parser_keeps_cli_errors_safe(self) -> None:
+        with patch("pistick_server.app.run_server") as runner, patch("sys.stdout"):
+            self.assertEqual(main(["--help"]), 0)
+            runner.assert_not_called()
+        with patch("pistick_server.app.run_server") as runner, patch("sys.stderr"):
+            self.assertEqual(main(["--unknown-option"]), 2)
+            runner.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "pistick_server.app.run_server"
+        ) as runner:
+            self.assertEqual(
+                main(["--host=localhost", "--port=18788", "--data-dir", directory]),
+                0,
+            )
+            self.assertEqual(runner.call_args.kwargs["host"], "127.0.0.1")
+            self.assertEqual(runner.call_args.kwargs["port"], 18788)
+            self.assertEqual(runner.call_args.args[0], Path(directory))
 
     def test_static_ui_is_served(self) -> None:
         response = self.app.dispatch("GET", "/", {})
@@ -290,17 +349,26 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(script.status, 200)
         self.assertEqual(
             script.headers.get("Cache-Control"),
-            "no-store, no-cache, must-revalidate, max-age=0",
+            "public, max-age=31536000, immutable",
         )
         self.assertIn(b"/api/watch/progress", script.body)
         self.assertIn(b"openSearchKeyboard", script.body)
         self.assertIn(b"/api/system/wifi/connect", script.body)
         self.assertNotIn(b"/api/settings/tmdb", script.body)
 
-    def test_pi_low_memory_mode_limits_home_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"PISTICK_LOW_MEMORY": "1"}
-        ):
+        unversioned = self.app.dispatch("GET", "/app.js", {})
+        self.assertEqual(
+            unversioned.headers.get("Cache-Control"),
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
+
+    def test_static_assets_are_preloaded_once(self) -> None:
+        expected = self.app.dispatch("GET", "/app.js", {}).body
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("disk read")):
+            self.assertEqual(self.app.dispatch("GET", "/app.js", {}).body, expected)
+
+    def test_pi_zero_branch_always_limits_home_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
             app = PiStickApplication(Path(directory) / "data", tmdb=FakeTMDB())
             profile_id = app.state.profiles()[0]["id"]
             app.state.activate_profile(profile_id)
@@ -341,8 +409,12 @@ class LoopbackHTTPTests(unittest.TestCase):
         with urlopen(self.base + "/health", timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
             self.assertTrue(payload["ok"])
+            self.assertEqual(payload["release"], "development")
             self.assertEqual(response.headers["X-Frame-Options"], "DENY")
-            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+            policy = response.headers["Content-Security-Policy"]
+            self.assertIn("frame-ancestors 'none'", policy)
+            self.assertIn("https://player.videasy.to", policy)
+            self.assertIn("https://player.videasy.net", policy)
 
     def test_write_without_pistick_header_is_blocked(self) -> None:
         request = Request(

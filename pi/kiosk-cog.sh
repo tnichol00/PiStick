@@ -10,7 +10,7 @@ PROFILE_DIR="${PISTICK_COG_PROFILE:-/var/cache/pistick/cog}"
 # the whole kiosk service PID; PiStick's installer can then distinguish a
 # recoverable browser crash from a genuinely broken application release.
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-run-session >/dev/null 2>&1; then
-    exec dbus-run-session -- "$0"
+    exec dbus-run-session -- "$0" "$@"
 fi
 
 command -v cog >/dev/null 2>&1 \
@@ -18,7 +18,7 @@ command -v cog >/dev/null 2>&1 \
 [[ -e /dev/dri/card0 ]] \
     || { printf 'The DRM display device /dev/dri/card0 is missing.\n' >&2; exit 1; }
 
-for _attempt in $(seq 1 45); do
+for ((_attempt = 0; _attempt < 45; _attempt += 1)); do
     if curl -fsS --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
         break
     fi
@@ -45,22 +45,28 @@ cog_args=(
     --bg-color=#09090bff
 )
 cog_help="$(cog --help-all 2>&1 || true)"
-if grep -Fq -- '--gamepad' <<<"$cog_help"; then
+if [[ "$cog_help" == *--gamepad* ]]; then
     cog_args+=(--gamepad=manette)
 fi
-if grep -Fq -- '--media-playback-requires-user-gesture' <<<"$cog_help"; then
+if [[ "$cog_help" == *--media-playback-requires-user-gesture* ]]; then
     cog_args+=(--media-playback-requires-user-gesture=false)
 fi
+unset cog_help
 
 printf '[PiStick] Opening %s with Cog/WPE at up to %s.\n' \
     "$PISTICK_URL" "$COG_PLATFORM_DRM_MODE_MAX"
 
 restart_delay=2
 while true; do
+    started_at=$SECONDS
     set +e
     cog "${cog_args[@]}" "$PISTICK_URL"
     status=$?
     set -e
+    runtime=$((SECONDS - started_at))
+    if ((runtime >= 60)); then
+        restart_delay=2
+    fi
 
     if [[ "$status" -eq 0 ]]; then
         printf '[PiStick] Cog exited; reopening the television interface.\n' >&2
@@ -69,4 +75,10 @@ while true; do
             "$status" "$restart_delay" >&2
     fi
     sleep "$restart_delay"
+    if ((runtime < 60 && restart_delay < 30)); then
+        restart_delay=$((restart_delay * 2))
+        if ((restart_delay > 30)); then
+            restart_delay=30
+        fi
+    fi
 done

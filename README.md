@@ -1,6 +1,6 @@
 # PiStick
 
-> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch replaces the broken Linux installer with a real Raspberry Pi OS Legacy Lite (32-bit Bookworm) appliance setup. It runs the lightweight PiStick server with an ARMv6-compatible Cog/WPE kiosk on the original Zero W (Chromium on newer Pis), starts at boot, includes low-memory tuning, HDMI-only Wi-Fi/controller settings, and optional unauthenticated access at `http://pistick.local`. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
+> **Original Raspberry Pi Zero W edition:** this `agent/pi-zero-w` branch is intentionally optimized only for the original ARMv6 Pi Zero W on Raspberry Pi OS Legacy Lite (32-bit Bookworm). It runs the lightweight PiStick server with Cog/WPE, starts at boot, includes low-memory tuning, HDMI-only Wi-Fi/controller settings, and optional unauthenticated access at `http://pistick.local`. Follow [PI_ZERO_W_README.md](PI_ZERO_W_README.md) for installation and controller pairing.
 
 > **Windows localhost-server edition:** the `agent/windows-local-server` branch runs PiStick silently in the Windows background and serves the interface at `http://127.0.0.1:8787`. See [SERVER_README.md](SERVER_README.md) for its installer and usage guide. The original desktop/Raspberry Pi application remains unchanged on `main`.
 
@@ -40,7 +40,7 @@ For either platform:
 
 For Raspberry Pi:
 
-- Raspberry Pi Zero W or a newer Raspberry Pi
+- Original Raspberry Pi Zero W
 - 8 GB or larger microSD card
 - Reliable 5 V power supply
 - Mini-HDMI cable for an original Pi Zero W when connecting it to a TV
@@ -53,7 +53,7 @@ For Windows:
 - 64-bit Windows 10 or Windows 11
 - Microsoft Edge WebView2 Runtime; Windows 11 normally includes it
 
-The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. PiStick uses Cog/WPE because current Raspberry Pi OS Chromium builds no longer support that CPU, but trailer and movie playback is still demanding. A Pi Zero 2 W or newer model should feel noticeably smoother.
+The original Pi Zero W has a single-core ARMv6 processor and 512 MB of RAM. This branch uses Cog/WPE because current Raspberry Pi OS Chromium builds no longer support that CPU. Trailer and movie playback can still be demanding.
 
 ## Videasy playback
 
@@ -203,12 +203,12 @@ Both installers:
 
 The Linux installer also:
 
-- Checks that it is running on a supported Raspberry Pi architecture and Debian-based OS.
-- Installs Python, fonts, media codecs, NetworkManager, mDNS, Bluetooth support, and either Cog/WPE (ARMv6) or Chromium/X11 (newer Pis).
+- Requires an ARMv6 original Pi Zero W running Raspberry Pi OS Legacy Lite (32-bit Bookworm).
+- Installs Python, fonts, media codecs, NetworkManager, mDNS, Bluetooth support, and Cog/WPE.
 - Downloads the dedicated `agent/pi-zero-w` branch and validates its required files and syntax.
 - Stages each application version under `/opt/pistick/releases/` and keeps only the active version after startup passes its health checks.
 - Points `/opt/pistick/current` at the active release.
-- Creates a minimal fullscreen service with no desktop and selects its browser from the Pi's CPU architecture.
+- Creates a minimal Cog fullscreen service with no desktop.
 - Starts PiStick at boot and restarts it if it crashes.
 - Installs the manual `update-pistick` command and keeps `pistick-update` as a compatibility alias.
 - Installs HDMI-only Wi-Fi and controller controls plus the SSH-only `pistick-configure-tmdb` command.
@@ -231,6 +231,12 @@ On Linux, connect over SSH and run:
 sudo update-pistick
 ```
 
+The equivalent compatibility command remains available:
+
+```bash
+sudo pistick-update
+```
+
 On Windows, rerun the Windows installation command, or run the saved installer directly:
 
 ```powershell
@@ -246,8 +252,8 @@ When a new Pi branch commit exists, the updater:
 3. Activates a new versioned application snapshot.
 4. Restarts the services, validates the web interface, and checks that the kiosk remains running instead of entering a restart loop.
 5. Restores the last working version automatically if validation fails.
-6. After validation succeeds, deletes every inactive application version and abandoned staging directory.
-7. Keeps the user's TMDB token, profiles, watch history, and caches.
+6. After validation succeeds, immediately deletes every previous application version, abandoned staging directory, and obsolete browser-runtime cache.
+7. Keeps the user's private configuration, profiles, watch history, resume positions, and current Cog data.
 
 The Pi updater intentionally follows only the dedicated Pi Zero W branch.
 

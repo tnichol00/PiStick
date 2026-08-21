@@ -15,8 +15,6 @@ import os
 from pathlib import Path
 import threading
 import time
-import uuid
-from typing import Any, Optional
 
 
 class StateError(ValueError):
@@ -35,7 +33,7 @@ class WatchStateStore:
         self.data = self._load()
 
     @staticmethod
-    def _default_data() -> dict[str, Any]:
+    def _default_data() -> dict[str, object]:
         profile_id = "profile-1"
         return {
             "active_profile": None,
@@ -45,14 +43,18 @@ class WatchStateStore:
             "watch_state": {profile_id: {}},
         }
 
-    def _load(self) -> dict[str, Any]:
+    def _load(self) -> dict[str, object]:
+        source_exists = self.path.is_file()
+        repair_needed = not source_exists
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_bytes())
         except (OSError, ValueError, TypeError):
             raw = self._default_data()
+            repair_needed = True
 
         if not isinstance(raw, dict) or not isinstance(raw.get("profiles"), list):
             raw = self._default_data()
+            repair_needed = True
 
         profiles: list[dict[str, str]] = []
         seen: set[str] = set()
@@ -61,7 +63,7 @@ class WatchStateStore:
                 continue
             profile_id = str(candidate.get("id", "")).strip()
             if not profile_id or profile_id in seen:
-                profile_id = f"profile-{uuid.uuid4().hex[:10]}"
+                profile_id = f"profile-{os.urandom(5).hex()}"
             seen.add(profile_id)
             name = str(candidate.get("name", "")).strip()[:40]
             avatar = str(candidate.get("avatar", "")).strip().lower()
@@ -101,24 +103,29 @@ class WatchStateStore:
             "profiles": profiles,
             "watch_state": normalized_watch,
         }
-        self._write(normalized)
+        # Normal boots should not rewrite the SD card. Persist only a new or
+        # repaired schema; mutations below remain atomic as before.
+        if repair_needed or raw != normalized:
+            self._write(normalized)
         return normalized
 
     @staticmethod
-    def _payload(data: dict[str, Any]) -> str:
-        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    def _payload(data: dict[str, object]) -> bytes:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
 
-    def _write(self, data: dict[str, Any]) -> None:
+    def _write(self, data: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        temporary.write_text(self._payload(data), encoding="utf-8")
+        temporary.write_bytes(self._payload(data))
         os.replace(temporary, self.path)
 
     def save(self) -> None:
         with self._lock:
             self._write(self.data)
 
-    def profiles_payload(self) -> dict[str, Any]:
+    def profiles_payload(self) -> dict[str, object]:
         with self._lock:
             return {
                 "profiles": deepcopy(self.data["profiles"]),
@@ -126,11 +133,13 @@ class WatchStateStore:
                 "max_profiles": self.MAX_PROFILES,
             }
 
-    def profiles(self) -> list[dict[str, Any]]:
+    def profiles(self) -> list[dict[str, object]]:
         with self._lock:
             return deepcopy(self.data["profiles"])
 
-    def _profile_unlocked(self, profile_id: Optional[str]) -> Optional[dict[str, Any]]:
+    def _profile_unlocked(
+        self, profile_id: str | None
+    ) -> dict[str, object] | None:
         if not profile_id:
             return None
         return next(
@@ -138,18 +147,26 @@ class WatchStateStore:
             None,
         )
 
-    def profile(self, profile_id: Optional[str]) -> Optional[dict[str, Any]]:
+    def profile(self, profile_id: str | None) -> dict[str, object] | None:
         with self._lock:
             profile = self._profile_unlocked(profile_id)
             return deepcopy(profile) if profile else None
 
-    def _require_profile_unlocked(self, profile_id: Optional[str]) -> dict[str, Any]:
+    def resolve_profile_id(self, candidate: str | None = None) -> str:
+        """Resolve and validate a profile with one lock and no deep copies."""
+        with self._lock:
+            profile_id = str(candidate or self.data.get("active_profile") or "")
+            if self._profile_unlocked(profile_id) is None:
+                raise StateError("Choose a profile first.")
+            return profile_id
+
+    def _require_profile_unlocked(self, profile_id: str | None) -> dict[str, object]:
         profile = self._profile_unlocked(profile_id)
         if profile is None:
             raise StateError("Choose a valid profile first.")
         return profile
 
-    def activate_profile(self, profile_id: str) -> dict[str, Any]:
+    def activate_profile(self, profile_id: str) -> dict[str, object]:
         with self._lock:
             profile = self._require_profile_unlocked(profile_id)
             self.data["active_profile"] = profile_id
@@ -157,7 +174,7 @@ class WatchStateStore:
             self._write(self.data)
             return deepcopy(profile)
 
-    def add_profile(self, name: str) -> dict[str, Any]:
+    def add_profile(self, name: str) -> dict[str, object]:
         with self._lock:
             profiles = self.data["profiles"]
             if len(profiles) >= self.MAX_PROFILES:
@@ -166,7 +183,7 @@ class WatchStateStore:
             if not cleaned:
                 cleaned = f"Profile {len(profiles) + 1}"
             profile = {
-                "id": f"profile-{uuid.uuid4().hex[:10]}",
+                "id": f"profile-{os.urandom(5).hex()}",
                 "name": cleaned,
                 "avatar": self.DEFAULT_AVATARS[len(profiles) % len(self.DEFAULT_AVATARS)],
             }
@@ -175,7 +192,7 @@ class WatchStateStore:
             self._write(self.data)
             return deepcopy(profile)
 
-    def rename_profile(self, profile_id: str, name: str) -> dict[str, Any]:
+    def rename_profile(self, profile_id: str, name: str) -> dict[str, object]:
         with self._lock:
             profile = self._require_profile_unlocked(profile_id)
             cleaned = str(name or "").strip()[:40]
@@ -201,7 +218,7 @@ class WatchStateStore:
             self._write(self.data)
 
     @staticmethod
-    def _media_identity(media: dict[str, Any]) -> tuple[str, int]:
+    def _media_identity(media: dict[str, object]) -> tuple[str, int]:
         media_type = str(media.get("media_type") or "movie").strip().lower()
         if media_type not in {"movie", "tv"}:
             raise StateError("Media type must be movie or tv.")
@@ -214,12 +231,12 @@ class WatchStateStore:
         return media_type, media_id
 
     @classmethod
-    def media_key(cls, media: dict[str, Any]) -> str:
+    def media_key(cls, media: dict[str, object]) -> str:
         media_type, media_id = cls._media_identity(media)
         return f"{media_type}:{media_id}"
 
     @staticmethod
-    def snapshot(media: dict[str, Any]) -> dict[str, Any]:
+    def snapshot(media: dict[str, object]) -> dict[str, object]:
         keys = (
             "id",
             "media_type",
@@ -235,46 +252,83 @@ class WatchStateStore:
             "number_of_seasons",
             "seasons",
         )
-        return {
-            key: deepcopy(media.get(key))
-            for key in keys
-            if media.get(key) is not None
-        }
+        return deepcopy({key: media[key] for key in keys if media.get(key) is not None})
 
-    def _history_unlocked(self, profile_id: str) -> dict[str, Any]:
+    def _history_unlocked(self, profile_id: str) -> dict[str, object]:
         self._require_profile_unlocked(profile_id)
         return self.data["watch_state"].setdefault(profile_id, {})
 
-    def entry(self, profile_id: str, media: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def entry(
+        self, profile_id: str, media: dict[str, object]
+    ) -> dict[str, object] | None:
         with self._lock:
             entry = self._history_unlocked(profile_id).get(self.media_key(media))
             return deepcopy(entry) if isinstance(entry, dict) else None
 
-    def decorate(self, profile_id: str, media: dict[str, Any]) -> dict[str, Any]:
-        result = deepcopy(media)
-        entry = self.entry(profile_id, media)
-        if entry:
-            result["watch"] = {
-                key: deepcopy(entry.get(key))
-                for key in (
-                    "status",
-                    "progress",
-                    "position_seconds",
-                    "duration_seconds",
-                    "updated_at",
-                    "last_episode",
-                )
-                if entry.get(key) is not None
-            }
+    @staticmethod
+    def _watch_payload(entry: dict[str, object]) -> dict[str, object]:
+        return {
+            key: deepcopy(entry[key])
+            for key in (
+                "status",
+                "progress",
+                "position_seconds",
+                "duration_seconds",
+                "updated_at",
+                "last_episode",
+            )
+            if entry.get(key) is not None
+        }
+
+    def _decorate_unlocked(
+        self,
+        history: dict[str, object],
+        media: dict[str, object],
+        *,
+        shallow: bool = False,
+    ) -> dict[str, object]:
+        # TMDB list items contain only scalar display fields, so a shallow copy
+        # avoids thousands of recursive copy calls while preserving the input.
+        result = dict(media) if shallow else deepcopy(media)
+        entry = history.get(self.media_key(media))
+        if isinstance(entry, dict):
+            result["watch"] = self._watch_payload(entry)
         return result
 
-    def mark_started(self, profile_id: str, media: dict[str, Any]) -> None:
+    def decorate(
+        self, profile_id: str, media: dict[str, object]
+    ) -> dict[str, object]:
+        with self._lock:
+            history = self._history_unlocked(profile_id)
+            return self._decorate_unlocked(history, media)
+
+    def decorate_many(
+        self,
+        profile_id: str,
+        items: object,
+    ) -> list[dict[str, object]]:
+        """Decorate a metadata row under one state lock."""
+        if not isinstance(items, list):
+            return []
+        with self._lock:
+            history = self._history_unlocked(profile_id)
+            return [
+                self._decorate_unlocked(history, media, shallow=True)
+                for media in items
+                if isinstance(media, dict)
+            ]
+
+    def mark_started(self, profile_id: str, media: dict[str, object]) -> None:
         with self._lock:
             history = self._history_unlocked(profile_id)
             key = self.media_key(media)
             previous = history.get(key, {})
             previous_progress = float(previous.get("progress", 0.0) or 0.0)
-            progress = 0.03 if previous.get("status") == "finished" else max(0.03, previous_progress)
+            progress = (
+                0.03
+                if previous.get("status") == "finished"
+                else max(0.03, previous_progress)
+            )
             history[key] = {
                 "status": "in_progress",
                 "progress": min(progress, 0.97),
@@ -286,7 +340,7 @@ class WatchStateStore:
                     history[key][name] = previous[name]
             self._write(self.data)
 
-    def mark_finished(self, profile_id: str, media: dict[str, Any]) -> None:
+    def mark_finished(self, profile_id: str, media: dict[str, object]) -> None:
         with self._lock:
             history = self._history_unlocked(profile_id)
             key = self.media_key(media)
@@ -298,10 +352,10 @@ class WatchStateStore:
                 "media": self.snapshot(media) or deepcopy(previous.get("media", {})),
             }
             if isinstance(previous.get("episodes"), dict):
-                history[key]["episodes"] = deepcopy(previous["episodes"])
+                history[key]["episodes"] = previous["episodes"]
             self._write(self.data)
 
-    def mark_unwatched(self, profile_id: str, media: dict[str, Any]) -> None:
+    def mark_unwatched(self, profile_id: str, media: dict[str, object]) -> None:
         with self._lock:
             self._history_unlocked(profile_id).pop(self.media_key(media), None)
             self._write(self.data)
@@ -309,7 +363,7 @@ class WatchStateStore:
     def set_position(
         self,
         profile_id: str,
-        media: dict[str, Any],
+        media: dict[str, object],
         position_seconds: float,
         duration_seconds: float,
     ) -> None:
@@ -319,21 +373,19 @@ class WatchStateStore:
             if duration > 0:
                 position = min(position, duration)
             progress = position / duration if duration > 0 else 0.03
-            if progress >= 0.98:
-                self.mark_finished(profile_id, media)
-                history = self._history_unlocked(profile_id)
-                entry = history[self.media_key(media)]
-            else:
-                history = self._history_unlocked(profile_id)
-                entry = {
-                    "status": "in_progress",
-                    "progress": max(0.03, min(0.97, progress)),
-                    "updated_at": time.time(),
-                    "media": self.snapshot(media),
-                }
-                history[self.media_key(media)] = entry
+            history = self._history_unlocked(profile_id)
+            key = self.media_key(media)
+            previous = history.get(key, {})
+            saved_media = previous.get("media") if isinstance(previous, dict) else None
+            entry = {
+                "status": "finished" if progress >= 0.98 else "in_progress",
+                "progress": 1.0 if progress >= 0.98 else max(0.03, min(0.97, progress)),
+                "updated_at": time.time(),
+                "media": saved_media if isinstance(saved_media, dict) else self.snapshot(media),
+            }
             entry["position_seconds"] = round(position, 1)
             entry["duration_seconds"] = round(duration, 1)
+            history[key] = entry
             self._write(self.data)
 
     @staticmethod
@@ -341,7 +393,7 @@ class WatchStateStore:
         return f"{int(season_number)}:{int(episode_number)}"
 
     @staticmethod
-    def episode_snapshot(episode: dict[str, Any]) -> dict[str, Any]:
+    def episode_snapshot(episode: dict[str, object]) -> dict[str, object]:
         keys = (
             "id",
             "name",
@@ -352,16 +404,14 @@ class WatchStateStore:
             "season_number",
             "episode_number",
         )
-        return {
-            key: deepcopy(episode.get(key))
-            for key in keys
-            if episode.get(key) is not None
-        }
+        return deepcopy(
+            {key: episode[key] for key in keys if episode.get(key) is not None}
+        )
 
     @staticmethod
-    def available_seasons(media: dict[str, Any]) -> list[dict[str, Any]]:
+    def available_seasons(media: dict[str, object]) -> list[dict[str, object]]:
         seasons = [
-            deepcopy(season)
+            season
             for season in media.get("seasons", [])
             if isinstance(season, dict)
             and int(season.get("episode_count", 0) or 0) > 0
@@ -379,10 +429,10 @@ class WatchStateStore:
     @classmethod
     def next_episode_position(
         cls,
-        media: dict[str, Any],
+        media: dict[str, object],
         season_number: int,
         episode_number: int,
-    ) -> Optional[tuple[int, int]]:
+    ) -> tuple[int, int] | None:
         seasons = cls.available_seasons(media)
         numbers = [int(season.get("season_number", 0) or 0) for season in seasons]
         counts = {
@@ -407,17 +457,56 @@ class WatchStateStore:
     def episode_entry(
         self,
         profile_id: str,
-        media: dict[str, Any],
+        media: dict[str, object],
         season_number: int,
         episode_number: int,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, object] | None:
         with self._lock:
             show = self._history_unlocked(profile_id).get(self.media_key(media), {})
             episodes = show.get("episodes", {}) if isinstance(show, dict) else {}
             entry = episodes.get(self.episode_key(season_number, episode_number))
             return deepcopy(entry) if isinstance(entry, dict) else None
 
-    def resume_episode(self, profile_id: str, media: dict[str, Any]) -> tuple[int, int]:
+    def decorate_episodes(
+        self,
+        profile_id: str,
+        media: dict[str, object],
+        source_episodes: object,
+    ) -> list[dict[str, object]]:
+        """Apply episode watch badges with one lock and one history lookup."""
+        if not isinstance(source_episodes, list):
+            return []
+        with self._lock:
+            show = self._history_unlocked(profile_id).get(self.media_key(media), {})
+            saved_episodes = show.get("episodes", {}) if isinstance(show, dict) else {}
+            result = []
+            for source in source_episodes:
+                if not isinstance(source, dict):
+                    continue
+                episode = deepcopy(source)
+                saved = saved_episodes.get(
+                    self.episode_key(
+                        int(episode["season_number"]),
+                        int(episode["episode_number"]),
+                    )
+                )
+                if isinstance(saved, dict):
+                    episode["watch"] = {
+                        key: saved[key]
+                        for key in (
+                            "status",
+                            "progress",
+                            "position_seconds",
+                            "duration_seconds",
+                        )
+                        if saved.get(key) is not None
+                    }
+                result.append(episode)
+            return result
+
+    def resume_episode(
+        self, profile_id: str, media: dict[str, object]
+    ) -> tuple[int, int]:
         with self._lock:
             show = self._history_unlocked(profile_id).get(self.media_key(media), {})
             episodes = show.get("episodes", {}) if isinstance(show, dict) else {}
@@ -444,8 +533,8 @@ class WatchStateStore:
     def set_episode_position(
         self,
         profile_id: str,
-        media: dict[str, Any],
-        episode: dict[str, Any],
+        media: dict[str, object],
+        episode: dict[str, object],
         position_seconds: float,
         duration_seconds: float,
     ) -> None:
@@ -466,8 +555,8 @@ class WatchStateStore:
     def mark_episode_started(
         self,
         profile_id: str,
-        media: dict[str, Any],
-        episode: dict[str, Any],
+        media: dict[str, object],
+        episode: dict[str, object],
     ) -> None:
         season = int(episode.get("season_number", 1) or 1)
         number = int(episode.get("episode_number", 1) or 1)
@@ -480,20 +569,20 @@ class WatchStateStore:
     def mark_episode_finished(
         self,
         profile_id: str,
-        media: dict[str, Any],
-        episode: dict[str, Any],
+        media: dict[str, object],
+        episode: dict[str, object],
     ) -> None:
         self._set_episode_progress(profile_id, media, episode, 1.0)
 
     def _set_episode_progress(
         self,
         profile_id: str,
-        media: dict[str, Any],
-        episode: dict[str, Any],
+        media: dict[str, object],
+        episode: dict[str, object],
         progress: float,
         *,
-        position: Optional[float] = None,
-        duration: Optional[float] = None,
+        position: float | None = None,
+        duration: float | None = None,
     ) -> None:
         with self._lock:
             if str(media.get("media_type")) != "tv":
@@ -507,23 +596,39 @@ class WatchStateStore:
             history = self._history_unlocked(profile_id)
             key = self.media_key(media)
             previous_show = history.get(key, {})
-            episodes = deepcopy(previous_show.get("episodes", {}))
+            if not isinstance(previous_show, dict):
+                previous_show = {}
+            episodes = previous_show.get("episodes", {})
+            if not isinstance(episodes, dict):
+                episodes = {}
+            episode_key = self.episode_key(season, number)
+            previous_episode = episodes.get(episode_key, {})
+            saved_episode = (
+                previous_episode.get("episode")
+                if isinstance(previous_episode, dict)
+                else None
+            )
             episode_data = {
                 "status": "finished" if progress >= 0.98 else "in_progress",
                 "progress": 1.0 if progress >= 0.98 else max(0.03, progress),
                 "updated_at": now,
                 "season_number": season,
                 "episode_number": number,
-                "episode": self.episode_snapshot(episode),
+                "episode": (
+                    saved_episode
+                    if isinstance(saved_episode, dict)
+                    else self.episode_snapshot(episode)
+                ),
             }
             if position is not None:
                 episode_data["position_seconds"] = round(max(0.0, position), 1)
             if duration is not None:
                 episode_data["duration_seconds"] = round(max(0.0, duration), 1)
-            episodes[self.episode_key(season, number)] = episode_data
+            episodes[episode_key] = episode_data
 
-            following = self.next_episode_position(media, season, number)
-            show_finished = episode_data["status"] == "finished" and following is None
+            show_finished = False
+            if episode_data["status"] == "finished":
+                show_finished = self.next_episode_position(media, season, number) is None
             history[key] = {
                 "status": "finished" if show_finished else "in_progress",
                 "progress": (
@@ -534,13 +639,17 @@ class WatchStateStore:
                     else max(0.03, min(0.97, episode_data["progress"]))
                 ),
                 "updated_at": now,
-                "media": self.snapshot(media) or deepcopy(previous_show.get("media", {})),
+                "media": (
+                    previous_show.get("media")
+                    if isinstance(previous_show.get("media"), dict)
+                    else self.snapshot(media)
+                ),
                 "episodes": episodes,
                 "last_episode": {"season_number": season, "episode_number": number},
             }
             self._write(self.data)
 
-    def continue_watching(self, profile_id: str) -> list[dict[str, Any]]:
+    def continue_watching(self, profile_id: str) -> list[dict[str, object]]:
         with self._lock:
             history = self._history_unlocked(profile_id)
             entries = [
@@ -554,7 +663,7 @@ class WatchStateStore:
                 key=lambda entry: float(entry.get("updated_at", 0.0) or 0.0),
                 reverse=True,
             )
-            result: list[dict[str, Any]] = []
+            result: list[dict[str, object]] = []
             for entry in entries:
                 media = deepcopy(entry["media"])
                 media["watch"] = {

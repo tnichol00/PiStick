@@ -24,7 +24,7 @@ if [[ -x /opt/pistick/current/pi/launch-kiosk.sh ]]; then
     printf 'Backend: '
     /opt/pistick/current/pi/launch-kiosk.sh --print-backend 2>&1 || true
 fi
-for browser in cog chromium-browser chromium; do
+for browser in cog; do
     if command -v "$browser" >/dev/null 2>&1; then
         printf '%s: %s\n' "$browser" "$(command -v "$browser")"
         "$browser" --version 2>&1 | head -n 1 || true
@@ -53,7 +53,7 @@ if [[ -n "$current_release" && -d "$current_release" ]]; then
 
     service_user="$(systemctl show -p User --value pistick-server.service 2>/dev/null || true)"
     if [[ "${EUID:-$(id -u)}" -eq 0 && -n "$service_user" ]] \
-        && runuser -u "$service_user" -- /usr/bin/python3 -I -B -c \
+        && runuser -u "$service_user" -- /usr/bin/python3 -I -OO -B -c \
             'import sys; sys.path.insert(0, sys.argv[1]); from pistick_server.app import PiStickApplication' \
             "$current_release" >/dev/null 2>&1; then
         printf 'Server import as %s: OK\n' "$service_user"
