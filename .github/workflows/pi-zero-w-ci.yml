@@ -13,7 +13,7 @@ on:
       - ".github/workflows/pi-zero-w-ci.yml"
   push:
     branches:
-      - agent/pi-zero-w
+      - Pi-Zero-W
     paths:
       - "install.sh"
       - "PI_ZERO_W_README.md"

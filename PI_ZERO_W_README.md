@@ -1,6 +1,6 @@
 # PiStick on Raspberry Pi Zero W
 
-This guide installs the `agent/pi-zero-w` edition of PiStick as a television appliance. This branch is optimized exclusively for the **original Raspberry Pi Zero W** with a single-core ARMv6 processor and 512 MB of RAM.
+This guide installs the `Pi-Zero-W` edition of PiStick as a television appliance. This branch is optimized exclusively for the **original Raspberry Pi Zero W** with a single-core ARMv6 processor and 512 MB of RAM.
 
 The finished boot flow is:
 
@@ -81,13 +81,13 @@ Use the long token, which usually begins with `eyJ`. Do not use the shorter v3 A
 In the Pi's SSH window, run this one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/agent/pi-zero-w/install.sh -o /tmp/install-pistick.sh && sudo bash /tmp/install-pistick.sh
+curl -fsSL https://raw.githubusercontent.com/tnichol00/PiStick/refs/heads/Pi-Zero-W/install.sh -o /tmp/install-pistick.sh && sudo bash /tmp/install-pistick.sh
 ```
 
 The installer will:
 
 - Install Python, NetworkManager, mDNS, Bluetooth tools, media codecs, and the correct kiosk browser for the detected Pi CPU.
-- Download only the `agent/pi-zero-w` branch.
+- Download only the `Pi-Zero-W` branch.
 - Ask for and validate the TMDB Read Access Token.
 - Store the token and watch data outside the application files.
 - Add the Pi user to the controller, video, audio, and graphics groups.
@@ -391,7 +391,7 @@ The compatibility spelling works too:
 sudo pistick-update
 ```
 
-The updater downloads the newest commit from `agent/pi-zero-w` into a new release directory. It does not modify the private configuration or watch-state files under `/var/lib/pistick/data`. After the new server and kiosk pass startup validation, it immediately deletes every previous release, abandoned staging directory, and obsolete browser-runtime cache. If validation fails, it restores the last working release and leaves that release in place for recovery.
+The updater downloads the newest commit from `Pi-Zero-W` into a new release directory. It does not modify the private configuration or watch-state files under `/var/lib/pistick/data`. After the new server and kiosk pass startup validation, it immediately deletes every previous release, abandoned staging directory, and obsolete browser-runtime cache. If validation fails, it restores the last working release and leaves that release in place for recovery.
 
 `sudo update-pistick` and `sudo pistick-update` run the same updater.
 

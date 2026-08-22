@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 REPOSITORY="tnichol00/PiStick"
-SOURCE_BRANCH="agent/pi-zero-w"
+SOURCE_BRANCH="Pi-Zero-W"
 TEST_MODE="${PISTICK_TEST_MODE:-0}"
 TEST_ROOT="${PISTICK_TEST_ROOT:-}"
 DATA_DIR="${TEST_ROOT}/var/lib/pistick/data"

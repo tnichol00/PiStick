@@ -161,7 +161,7 @@ assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "MALLOC_AR
 assert_contains "$TEST_ROOT/etc/systemd/system/pistick-kiosk.service" "StandardError=journal+console"
 assert_contains "$TEST_ROOT/etc/sudoers.d/pistick-system" "pistick-system-helper wifi-connect"
 assert_contains "$TEST_ROOT/usr/local/bin/pistick-configure-tmdb" "TMDB token updated"
-assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "agent/pi-zero-w"
+assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "Pi-Zero-W"
 assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "Cache-Control: no-cache"
 assert_contains "$TEST_ROOT/usr/local/bin/update-pistick" "?cache="
 assert_contains "$PROJECT_DIR/install.sh" "avahi-daemon"

@@ -6,7 +6,7 @@ IFS=$'\n\t'
 # This branch intentionally supports only its ARMv6 CPU and Cog/WPE kiosk.
 
 REPOSITORY="tnichol00/PiStick"
-SOURCE_BRANCH="agent/pi-zero-w"
+SOURCE_BRANCH="Pi-Zero-W"
 TEST_MODE="${PISTICK_TEST_MODE:-0}"
 TEST_ROOT="${PISTICK_TEST_ROOT:-}"
 
