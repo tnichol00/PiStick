@@ -24,6 +24,7 @@ from pistick_server.config import ConfigStore
 class FakeTMDB:
     def __init__(self) -> None:
         self.validated = None
+        self.video_calls = []
 
     @staticmethod
     def movie():
@@ -65,6 +66,19 @@ class FakeTMDB:
 
     def details(self, media_type, media_id):
         return self.movie() if media_type == "movie" else self.show()
+
+    def videos(self, media_type, media_id):
+        self.video_calls.append((media_type, media_id))
+        return {
+            "results": [
+                {
+                    "key": "trailer123",
+                    "site": "YouTube",
+                    "type": "Trailer",
+                    "official": True,
+                }
+            ]
+        }
 
     def season(self, show_id, season_number):
         return {
@@ -167,6 +181,21 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(payload["rows"][0]["title"], "Continue Watching")
         self.assertEqual(payload["rows"][0]["items"][0]["watch"]["position_seconds"], 60.0)
+
+    def test_movie_extras_fetch_only_small_video_payload_and_current_watch_state(self) -> None:
+        movie = self.fake_tmdb.movie()
+        self.app.state.set_position(self.profile_id, movie, 60, 600)
+        response, payload = self.dispatch_json(
+            "GET",
+            "/api/media/movie/550/extras?profile_id=" + self.profile_id,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.fake_tmdb.video_calls, [("movie", 550)])
+        self.assertEqual(payload["media"]["id"], 550)
+        self.assertEqual(payload["media"]["media_type"], "movie")
+        self.assertEqual(payload["media"]["videos"]["results"][0]["key"], "trailer123")
+        self.assertEqual(payload["media"]["watch"]["position_seconds"], 60.0)
+        self.assertNotIn("overview", payload["media"])
 
     def test_play_and_progress_endpoints_use_documented_videasy_urls(self) -> None:
         movie = self.fake_tmdb.movie()

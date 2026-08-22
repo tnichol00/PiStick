@@ -44,6 +44,7 @@ PROFILE_RE = re.compile(r"/api/profiles/([A-Za-z0-9_-]+)")
 PROFILE_ACTIVATE_RE = re.compile(r"/api/profiles/([A-Za-z0-9_-]+)/activate")
 DISCOVER_RE = re.compile(r"/api/discover/(movie|tv)")
 MEDIA_RE = re.compile(r"/api/media/(movie|tv)/(\d+)")
+MEDIA_EXTRAS_RE = re.compile(r"/api/media/(movie|tv)/(\d+)/extras")
 SEASON_RE = re.compile(r"/api/tv/(\d+)/season/(\d+)")
 SYSTEM_ACTIONS = {
     ("/api/system/wifi/scan", "POST"): "wifi-scan",
@@ -430,6 +431,24 @@ class PiStickApplication:
                     profile_id, payload["items"]
                 )
                 return Response.json(payload)
+
+            match = MEDIA_EXTRAS_RE.fullmatch(path)
+            if match and method == "GET":
+                profile_id = self._profile_id(self._query_value(query, "profile_id"))
+                media_type = match.group(1)
+                media_id = _integer(match.group(2), "TMDB ID")
+                # List cards already carry every visible movie field. Fetch only
+                # the missing trailer metadata instead of downloading the full
+                # title record again, then attach the latest watch status.
+                result = self.state.decorate(
+                    profile_id,
+                    {
+                        "id": media_id,
+                        "media_type": media_type,
+                        "videos": self.tmdb.videos(media_type, media_id),
+                    },
+                )
+                return Response.json({"media": result})
 
             match = MEDIA_RE.fullmatch(path)
             if match and method == "GET":

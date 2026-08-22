@@ -6,7 +6,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from pistick_server.tmdb import DISK_CACHE_LIMIT, TMDBClient, TMDBError
+from pistick_server.tmdb import (
+    DISK_CACHE_LIMIT,
+    TMDB_API_TIMEOUT,
+    TMDBClient,
+    TMDBError,
+    _connect_ipv4,
+)
 
 
 class LowMemoryHomeTests(unittest.TestCase):
@@ -114,6 +120,18 @@ class LowMemoryHomeTests(unittest.TestCase):
                             }
                         ],
                     }
+                if endpoint.endswith("/videos"):
+                    return {
+                        "results": [
+                            {
+                                "key": "small-trailer",
+                                "site": "YouTube",
+                                "type": "Trailer",
+                                "official": True,
+                                "size": 1080,
+                            }
+                        ]
+                    }
                 return {
                     "id": 1399,
                     "name": "Game of Thrones",
@@ -148,6 +166,7 @@ class LowMemoryHomeTests(unittest.TestCase):
             client._request = fake_request
             details = client.details("tv", 1399)
             season = client.season(1399, 1)
+            videos = client.videos("movie", 550)
 
         self.assertEqual(calls[0], ("/tv/1399", {"append_to_response": "videos"}))
         self.assertNotIn("credits", details)
@@ -156,6 +175,9 @@ class LowMemoryHomeTests(unittest.TestCase):
         self.assertNotIn("published_at", details["videos"]["results"][0])
         self.assertNotIn("crew", season["episodes"][0])
         self.assertNotIn("vote_average", season["episodes"][0])
+        self.assertEqual(calls[2], ("/movie/550/videos", None))
+        self.assertEqual(videos["results"][0]["key"], "small-trailer")
+        self.assertNotIn("size", videos["results"][0])
 
     def test_gzip_response_is_requested_and_decoded(self) -> None:
         class FakeResponse:
@@ -192,14 +214,184 @@ class LowMemoryHomeTests(unittest.TestCase):
             ) as opener:
                 payload = client._request("/configuration", cache=False)
 
-        opener.assert_called_once_with("api.themoviedb.org", timeout=15)
+        opener.assert_called_once_with("api.themoviedb.org", timeout=TMDB_API_TIMEOUT)
         method, target, headers = connection.request_args
         self.assertEqual(method, "GET")
         self.assertTrue(target.startswith("/3/configuration?"))
         headers = {key.lower(): value for key, value in headers.items()}
         self.assertEqual(headers["accept-encoding"], "gzip")
-        self.assertTrue(connection.closed)
+        self.assertEqual(headers["connection"], "keep-alive")
+        self.assertIs(connection._create_connection, _connect_ipv4)
+        self.assertFalse(connection.closed)
         self.assertEqual(payload, {"ok": True})
+
+    def test_successive_requests_reuse_one_tls_connection(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            @staticmethod
+            def getheader(_name):
+                return None
+
+            @staticmethod
+            def read():
+                return b'{"ok":true}'
+
+        class FakeConnection:
+            def __init__(self):
+                self.requests = []
+                self.closed = False
+
+            def request(self, method, target, headers):
+                self.requests.append((method, target, headers))
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = TMDBClient(lambda: "token", Path(temporary))
+            connection = FakeConnection()
+            with patch(
+                "pistick_server.tmdb.HTTPSConnection", return_value=connection
+            ) as opener:
+                client._request("/configuration", cache=False)
+                client._request("/configuration", cache=False)
+
+        opener.assert_called_once_with(
+            "api.themoviedb.org", timeout=TMDB_API_TIMEOUT
+        )
+        self.assertEqual(len(connection.requests), 2)
+        self.assertFalse(connection.closed)
+
+    def test_dead_keep_alive_socket_reconnects_once(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            @staticmethod
+            def getheader(_name):
+                return None
+
+            @staticmethod
+            def read():
+                return b'{"ok":true}'
+
+        class FirstConnection:
+            def __init__(self):
+                self.requests = 0
+                self.closed = False
+
+            def request(self, *_args, **_kwargs):
+                self.requests += 1
+                if self.requests > 1:
+                    raise OSError("server closed idle socket")
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            def close(self):
+                self.closed = True
+
+        class ReplacementConnection:
+            def __init__(self):
+                self.requests = 0
+
+            def request(self, *_args, **_kwargs):
+                self.requests += 1
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            @staticmethod
+            def close():
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = TMDBClient(lambda: "token", Path(temporary))
+            first = FirstConnection()
+            replacement = ReplacementConnection()
+            with patch(
+                "pistick_server.tmdb.HTTPSConnection",
+                side_effect=[first, replacement],
+            ) as opener:
+                client._request("/configuration", cache=False)
+                client._request("/configuration", cache=False)
+
+        self.assertEqual(opener.call_count, 2)
+        self.assertTrue(first.closed)
+        self.assertEqual(replacement.requests, 1)
+
+    def test_keep_alive_timeout_is_not_retried(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            @staticmethod
+            def getheader(_name):
+                return None
+
+            @staticmethod
+            def read():
+                return b'{"ok":true}'
+
+        class TimeoutConnection:
+            def __init__(self):
+                self.requests = 0
+                self.closed = False
+
+            def request(self, *_args, **_kwargs):
+                self.requests += 1
+                if self.requests > 1:
+                    raise TimeoutError("offline")
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = TMDBClient(lambda: "token", Path(temporary))
+            connection = TimeoutConnection()
+            with patch(
+                "pistick_server.tmdb.HTTPSConnection", return_value=connection
+            ) as opener:
+                client._request("/configuration", cache=False)
+                with self.assertRaises(TMDBError):
+                    client._request("/configuration", cache=False)
+
+        opener.assert_called_once()
+        self.assertTrue(connection.closed)
+
+    def test_video_endpoint_keeps_only_ui_fields_and_uses_long_cache(self) -> None:
+        compact = TMDBClient._compact_payload(
+            "/movie/550/videos",
+            {
+                "id": 550,
+                "results": [
+                    {
+                        "key": "trailer123",
+                        "site": "YouTube",
+                        "type": "Trailer",
+                        "official": True,
+                        "published_at": "unused",
+                        "size": 1080,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(compact["results"][0]["key"], "trailer123")
+        self.assertNotIn("published_at", compact["results"][0])
+        self.assertNotIn("size", compact["results"][0])
+        self.assertEqual(
+            TMDBClient._cache_ttl("/movie/550/videos"),
+            7 * 24 * 60 * 60,
+        )
 
     def test_http_authentication_error_is_reported_and_connection_closes(self) -> None:
         class RejectedResponse:

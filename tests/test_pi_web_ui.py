@@ -175,6 +175,127 @@ class PiWebUIContractTests(unittest.TestCase):
         self.assertIn(r"player\.videasy\.(to|net)", source)
         self.assertIn("if (!videasy && !youtube)", source)
 
+    def test_movie_dialog_renders_before_slow_metadata_request_finishes(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is not installed")
+        harness = textwrap.dedent(
+            r"""
+            const assert = require("assert");
+            const fs = require("fs");
+            const vm = require("vm");
+
+            let source = fs.readFileSync(process.argv[1], "utf8");
+            const bootstrapLine = '  document.addEventListener("DOMContentLoaded", bootstrap);';
+            assert(source.includes(bootstrapLine));
+            source = source.replace(
+              bootstrapLine,
+              "  globalThis.__pistickDetailsTest = { state: state, ui: ui, openDetails: openDetails };"
+            );
+            const renderStart = source.indexOf("  function renderDetails(media) {");
+            const renderEnd = source.indexOf("\n  function openDetails(media, refresh) {", renderStart);
+            assert(renderStart >= 0 && renderEnd > renderStart);
+            source = source.slice(0, renderStart) +
+              "  function renderDetails(media) { state.detailsMedia = media; globalThis.__detailRenders.push(media); }\n" +
+              source.slice(renderEnd + 1);
+
+            const fetchCalls = [];
+            let releaseFetch;
+            const document = {
+              documentElement: { classList: { toggle: function () {} } },
+              addEventListener: function () {}
+            };
+            const window = {
+              location: { search: "?platform=pi-zero-w" },
+              addEventListener: function () {},
+              clearTimeout: function () {},
+              setTimeout: function () { return 1; }
+            };
+            const context = vm.createContext({
+              URLSearchParams: URLSearchParams,
+              console: console,
+              document: document,
+              fetch: function (path) {
+                fetchCalls.push(path);
+                return new Promise(function (resolve) { releaseFetch = resolve; });
+              },
+              window: window,
+              __detailRenders: []
+            });
+            vm.runInContext(source, context, { filename: process.argv[1] });
+            const hooks = context.__pistickDetailsTest;
+            hooks.state.activeProfile = { id: "profile-1" };
+            hooks.ui.detailsDialog = {
+              open: false,
+              dataset: {},
+              showModal: function () { this.open = true; }
+            };
+            hooks.ui.detailsContent = {};
+            hooks.ui.toast = { textContent: "", classList: { add: function () {}, remove: function () {} } };
+
+            const movie = {
+              id: 550,
+              media_type: "movie",
+              title: "Fight Club",
+              overview: "Already available from the home screen."
+            };
+            hooks.openDetails(movie, false);
+            assert.strictEqual(hooks.ui.detailsDialog.open, true);
+            assert.strictEqual(context.__detailRenders.length, 1);
+            assert.strictEqual(context.__detailRenders[0].title, "Fight Club");
+            assert.strictEqual(fetchCalls.length, 1);
+            assert.strictEqual(
+              fetchCalls[0],
+              "/api/media/movie/550/extras?profile_id=profile-1"
+            );
+
+            (async function () {
+              releaseFetch({
+                ok: true,
+                json: async function () {
+                  return { media: { id: 550, media_type: "movie", videos: { results: [{ key: "abc123", site: "YouTube", type: "Trailer" }] } } };
+                }
+              });
+              await new Promise(setImmediate);
+              await new Promise(setImmediate);
+              assert.strictEqual(context.__detailRenders.length, 2);
+              assert.strictEqual(
+                context.__detailRenders[1].overview,
+                "Already available from the home screen."
+              );
+              assert.strictEqual(context.__detailRenders[1].videos.results[0].key, "abc123");
+
+              hooks.openDetails(movie, false);
+              assert.strictEqual(context.__detailRenders.length, 3);
+              assert.strictEqual(fetchCalls.length, 1);
+
+              hooks.openDetails(movie, true);
+              assert.strictEqual(context.__detailRenders.length, 4);
+              assert.strictEqual(fetchCalls.length, 2);
+              releaseFetch({
+                ok: true,
+                json: async function () {
+                  return { media: { id: 550, media_type: "movie", videos: { results: [] } } };
+                }
+              });
+              await new Promise(setImmediate);
+              await new Promise(setImmediate);
+              assert.strictEqual(context.__detailRenders.length, 5);
+            })().catch(function (error) {
+              console.error(error);
+              process.exitCode = 1;
+            });
+            """
+        )
+        completed = subprocess.run(
+            [node, "-e", harness, str(STATIC / "app.js")],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

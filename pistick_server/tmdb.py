@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -14,6 +15,7 @@ from urllib.parse import urlencode
 
 
 TMDB_API_HOST = "api.themoviedb.org"
+TMDB_API_TIMEOUT = 12
 MEMORY_CACHE_LIMIT = 12
 DISK_CACHE_LIMIT = 128
 LIST_ITEM_FIELDS = (
@@ -42,6 +44,38 @@ EPISODE_FIELDS = (
 )
 
 
+def _connect_ipv4(
+    address: tuple[str, int],
+    timeout: object = socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: tuple[str, int] | None = None,
+) -> socket.socket:
+    """Open the TMDB socket over IPv4 without a slow unusable-IPv6 fallback."""
+    host, port = address
+    last_error: OSError | None = None
+    for family, socktype, protocol, _canonical, target in socket.getaddrinfo(
+        host,
+        port,
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    ):
+        connection = None
+        try:
+            connection = socket.socket(family, socktype, protocol)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                connection.settimeout(timeout)
+            if source_address:
+                connection.bind(source_address)
+            connection.connect(target)
+            return connection
+        except OSError as exc:
+            last_error = exc
+            if connection is not None:
+                connection.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"Could not resolve an IPv4 address for {host}.")
+
+
 class TMDBError(RuntimeError):
     """A user-safe TMDB request error."""
 
@@ -58,6 +92,8 @@ class TMDBClient:
         self.cache_dir = Path(cache_dir)
         self._memory: dict[str, tuple[float, dict[str, object]]] = {}
         self._lock = threading.RLock()
+        self._network_lock = threading.Lock()
+        self._connection: HTTPSConnection | None = None
         self._writes_since_prune = 0
         self._prune_disk_cache()
 
@@ -69,6 +105,11 @@ class TMDBClient:
             return 15 * 60
         if "/season/" in endpoint:
             return 24 * 60 * 60
+        if endpoint.endswith("/videos"):
+            return 7 * 24 * 60 * 60
+        parts = endpoint.strip("/").split("/")
+        if len(parts) == 2 and parts[0] in {"movie", "tv"} and parts[1].isdigit():
+            return 7 * 24 * 60 * 60
         if endpoint.endswith("/popular") or endpoint.endswith("/upcoming"):
             return 30 * 60
         return 6 * 60 * 60
@@ -121,6 +162,18 @@ class TMDBClient:
                 ]
                 if isinstance(episodes, list)
                 else [],
+            }
+
+        if endpoint.endswith("/videos"):
+            results = payload.get("results")
+            return {
+                "results": [
+                    cls._fields(video, VIDEO_FIELDS)
+                    for video in results
+                    if isinstance(video, dict)
+                ]
+                if isinstance(results, list)
+                else []
             }
 
         parts = endpoint.strip("/").split("/")
@@ -229,6 +282,65 @@ class TMDBClient:
             # A cache cleanup failure must never stop playback or browsing.
             return
 
+    def _close_connection_unlocked(self) -> None:
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _new_connection_unlocked(self) -> HTTPSConnection:
+        connection = HTTPSConnection(TMDB_API_HOST, timeout=TMDB_API_TIMEOUT)
+        # The original Pi Zero W commonly has IPv6 enabled without working IPv6
+        # internet. Python otherwise tries that dead route before IPv4 for every
+        # new TLS connection, which can add an entire socket timeout.
+        connection._create_connection = _connect_ipv4
+        self._connection = connection
+        return connection
+
+    def _network_get(
+        self,
+        target: str,
+        token: str,
+    ) -> tuple[int, bytes, str]:
+        """Use one serialized keep-alive connection and retry only a stale socket."""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
+            "User-Agent": "PiStick-LocalServer/0.1",
+        }
+        with self._network_lock:
+            reused = self._connection is not None
+            connection = self._connection or self._new_connection_unlocked()
+            for attempt in range(2):
+                try:
+                    connection.request("GET", target, headers=headers)
+                    response = connection.getresponse()
+                    raw = response.read()
+                    status = int(response.status)
+                    content_encoding = str(
+                        response.getheader("Content-Encoding") or ""
+                    )
+                    should_close = str(
+                        response.getheader("Connection") or ""
+                    ).lower() == "close"
+                    if should_close or status >= 400:
+                        self._close_connection_unlocked()
+                    return status, raw, content_encoding
+                except (HTTPException, TimeoutError, OSError) as exc:
+                    self._close_connection_unlocked()
+                    # Retrying a timeout can double a genuine outage to 24 s.
+                    # Retry only a reused socket that failed immediately.
+                    if not reused or attempt or isinstance(exc, TimeoutError):
+                        raise
+                    connection = self._new_connection_unlocked()
+                    reused = False
+        raise OSError("TMDB connection failed.")
+
     def _request(
         self,
         endpoint: str,
@@ -252,22 +364,8 @@ class TMDBClient:
                 return compact
 
         target = f"/3{endpoint}?{urlencode(query)}"
-        connection = HTTPSConnection(TMDB_API_HOST, timeout=15)
         try:
-            connection.request(
-                "GET",
-                target,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "User-Agent": "PiStick-LocalServer/0.1",
-                },
-            )
-            response = connection.getresponse()
-            raw = response.read()
-            status = int(response.status)
-            content_encoding = str(response.getheader("Content-Encoding") or "")
+            status, raw, content_encoding = self._network_get(target, token)
         except (HTTPException, TimeoutError, OSError) as exc:
             stale = self._read_stale_cache(key) if cache else None
             if stale is not None:
@@ -275,9 +373,6 @@ class TMDBClient:
             raise TMDBError(
                 "Could not reach TMDB. Check the internet connection.", 502
             ) from exc
-        finally:
-            connection.close()
-
         if status >= 400:
             stale = self._read_stale_cache(key) if cache else None
             if stale is not None and status >= 500:
@@ -423,6 +518,21 @@ class TMDBClient:
             ]
         }
         return result
+
+    def videos(self, media_type: str, media_id: int) -> dict[str, object]:
+        """Fetch only the small metadata block a movie card does not have."""
+        if media_type not in {"movie", "tv"}:
+            raise TMDBError("Media type must be movie or tv.", 400)
+        if int(media_id) < 1:
+            raise TMDBError("TMDB ID is invalid.", 400)
+        payload = self._request(f"/{media_type}/{int(media_id)}/videos")
+        return {
+            "results": [
+                {key: video[key] for key in VIDEO_FIELDS if video.get(key) is not None}
+                for video in payload.get("results", [])
+                if isinstance(video, dict)
+            ]
+        }
 
     def season(self, show_id: int, season_number: int) -> dict[str, object]:
         if int(show_id) < 1 or int(season_number) < 0:

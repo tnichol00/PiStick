@@ -11,6 +11,12 @@
     currentView: "profiles",
     loadToken: 0,
     detailsMedia: null,
+    detailsToken: 0,
+    detailsCache: {},
+    detailsCacheOrder: [],
+    detailsRequests: {},
+    detailsRequestCount: 0,
+    detailsPrefetchTimer: null,
     player: null,
     toastTimer: null,
     manageProfiles: false,
@@ -31,6 +37,8 @@
   var PROGRESS_SAVE_INTERVAL_MS = 15000;
   var GAMEPAD_ACTIVE_POLL_MS = 50;
   var GAMEPAD_IDLE_POLL_MS = 1000;
+  var DETAILS_CACHE_LIMIT = 8;
+  var DETAILS_PREFETCH_DELAY_MS = 300;
 
   function element(tag, className, text) {
     var node = document.createElement(tag);
@@ -117,6 +125,90 @@
     }
     if (!response.ok) throw new Error(payload.error || "Request failed (" + response.status + ").");
     return payload;
+  }
+
+  function detailsKey(media) {
+    return activeProfileId() + ":" + String(media.media_type || "") + ":" + Number(media.id || 0);
+  }
+
+  function rememberDetails(key, media) {
+    var previous = state.detailsCacheOrder.indexOf(key);
+    if (previous >= 0) state.detailsCacheOrder.splice(previous, 1);
+    state.detailsCache[key] = media;
+    state.detailsCacheOrder.push(key);
+    while (state.detailsCacheOrder.length > DETAILS_CACHE_LIMIT) {
+      delete state.detailsCache[state.detailsCacheOrder.shift()];
+    }
+  }
+
+  function requestDetails(media, force) {
+    var key = detailsKey(media);
+    if (force && state.detailsCache[key]) {
+      delete state.detailsCache[key];
+      var cachedIndex = state.detailsCacheOrder.indexOf(key);
+      if (cachedIndex >= 0) state.detailsCacheOrder.splice(cachedIndex, 1);
+    }
+    if (!force && state.detailsCache[key]) return Promise.resolve(state.detailsCache[key]);
+    if (state.detailsRequests[key]) {
+      if (!force) return state.detailsRequests[key];
+      var pending = state.detailsRequests[key];
+      return pending.then(function () {
+        return requestDetails(media, true);
+      }, function () {
+        return requestDetails(media, true);
+      });
+    }
+
+    var base = "/api/media/" + encodeURIComponent(media.media_type) + "/" + Number(media.id);
+    var path = media.media_type === "movie" ? base + "/extras" : base;
+    var request = api(query(path, { profile_id: activeProfileId() }), { timeout: 18000 }).then(function (payload) {
+      var fresh = payload.media || {};
+      var merged = Object.assign({}, media, fresh);
+      if (force && !Object.prototype.hasOwnProperty.call(fresh, "watch")) delete merged.watch;
+      rememberDetails(key, merged);
+      return merged;
+    });
+    state.detailsRequests[key] = request;
+    state.detailsRequestCount += 1;
+    request.then(function () {
+      if (state.detailsRequests[key] === request) {
+        delete state.detailsRequests[key];
+        state.detailsRequestCount -= 1;
+      }
+    }, function () {
+      if (state.detailsRequests[key] === request) {
+        delete state.detailsRequests[key];
+        state.detailsRequestCount -= 1;
+      }
+    });
+    return request;
+  }
+
+  function cancelDetailsPrefetch() {
+    if (state.detailsPrefetchTimer !== null) {
+      window.clearTimeout(state.detailsPrefetchTimer);
+      state.detailsPrefetchTimer = null;
+    }
+  }
+
+  function scheduleDetailsPrefetch(media) {
+    cancelDetailsPrefetch();
+    var key = detailsKey(media);
+    if (
+      !state.activeProfile ||
+      state.detailsCache[key] ||
+      state.detailsRequests[key] ||
+      state.detailsRequestCount
+    ) return;
+    state.detailsPrefetchTimer = window.setTimeout(function () {
+      state.detailsPrefetchTimer = null;
+      requestDetails(media, false).catch(function () {});
+    }, DETAILS_PREFETCH_DELAY_MS);
+  }
+
+  function warmDetailsControl(control, media) {
+    control._pistickMedia = media;
+    return control;
   }
 
   function showToast(message) {
@@ -310,7 +402,10 @@
   }
 
   function mediaCard(media) {
-    var card = button("", "media-card", function () { openDetails(media); });
+    var card = warmDetailsControl(
+      button("", "media-card", function () { openDetails(media); }),
+      media
+    );
     card.setAttribute("aria-label", "Open " + titleOf(media));
     var copy = element("div", "card-copy");
     copy.append(element("p", "card-title", titleOf(media)));
@@ -345,7 +440,10 @@
     content.append(element("p", "meta-line", mediaMeta(media)));
     if (media.overview) content.append(element("p", "hero-overview", media.overview));
     var actions = element("div", "button-row");
-    actions.append(button("View details", "primary-button", function () { openDetails(media); }));
+    actions.append(warmDetailsControl(
+      button("View details", "primary-button", function () { openDetails(media); }),
+      media
+    ));
     section.append(content);
     content.append(actions);
     return section;
@@ -645,27 +743,34 @@
     }, 40);
   }
 
-  async function openDetails(media, refresh) {
+  function openDetails(media, refresh) {
+    cancelDetailsPrefetch();
+    var token = ++state.detailsToken;
+    var key = detailsKey(media);
+    var cached = refresh ? null : state.detailsCache[key];
+    var preview = cached ? Object.assign({}, cached, media) : media;
+    if (cached && !Object.prototype.hasOwnProperty.call(media, "watch")) delete preview.watch;
     if (!ui.detailsDialog.open) ui.detailsDialog.showModal();
-    ui.detailsContent.replaceChildren(element("div", "loading-page", "Loading title details…"));
-    try {
-      var payload = await api(query("/api/media/" + encodeURIComponent(media.media_type) + "/" + Number(media.id), {
-        profile_id: activeProfileId()
-      }));
-      renderDetails(payload.media);
-      if (refresh && state.currentView === "home") {
-        // The dialog remains open; Home is refreshed after it closes.
-        ui.detailsDialog.dataset.refreshHome = "1";
-      }
-    } catch (error) {
-      var card = element("div", "error-state");
-      card.append(element("h2", "", "Could not load this title"));
-      card.append(element("p", "muted", error.message));
-      ui.detailsContent.replaceChildren(card);
+    // Every visible field and the Watch button already exist on the list card,
+    // so paint them now instead of blocking the dialog on TMDB.
+    renderDetails(preview);
+    if (refresh && state.currentView === "home") {
+      // The dialog remains open; Home is refreshed after it closes.
+      ui.detailsDialog.dataset.refreshHome = "1";
     }
+    if (cached) return;
+
+    requestDetails(media, Boolean(refresh)).then(function (details) {
+      if (token !== state.detailsToken || !ui.detailsDialog.open) return;
+      renderDetails(details);
+    }).catch(function (error) {
+      if (token === state.detailsToken && ui.detailsDialog.open) showToast(error.message);
+    });
   }
 
   function closeDetails() {
+    state.detailsToken += 1;
+    cancelDetailsPrefetch();
     if (ui.detailsDialog.open) ui.detailsDialog.close();
   }
 
@@ -1329,6 +1434,14 @@
     ui.toast = document.getElementById("toast");
 
     ui.brandButton.addEventListener("click", renderHome);
+    // One delegated listener replaces four closures on every card. A short
+    // controller-focus dwell warms only one title at a time.
+    ui.app.addEventListener("focusin", function (event) {
+      if (event.target && event.target._pistickMedia) {
+        scheduleDetailsPrefetch(event.target._pistickMedia);
+      }
+    });
+    ui.app.addEventListener("focusout", cancelDetailsPrefetch);
     document.querySelectorAll(".nav-button").forEach(function (node) {
       node.addEventListener("click", function () {
         if (node.dataset.view === "home") renderHome();
