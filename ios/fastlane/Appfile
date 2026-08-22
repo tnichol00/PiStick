@@ -1,2 +1,0 @@
-app_identifier(ENV.fetch("PISTICK_BUNDLE_ID", "app.pistick.PiStick"))
-team_id(ENV["APPLE_TEAM_ID"])
