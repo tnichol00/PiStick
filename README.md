@@ -1,41 +1,36 @@
-# PiStick for Android
+# Install PiStick for Android
 
-This branch contains the standalone Android edition of PiStick. It is an installable Android APK with the PiStick interface bundled inside the application and a native Android data/network layer.
+## Requirements
 
-There is no PiStick web server in this branch. The app does not run Python, bind a port, load its interface from localhost, connect to a Raspberry Pi, or depend on another PiStick installation.
+- A phone or tablet running Android 8.0 or newer
+- An internet connection
+- A free [TMDB account](https://www.themoviedb.org/signup)
 
-## Features
+## 1. Download the APK
 
-- Same PiStick home, Movies, TV Shows, search, profiles, details, and player experience
-- Direct HTTPS metadata requests to TMDB
-- Videasy movie/episode playback and YouTube trailers in the in-app player
-- Per-profile watch history, Continue Watching, and resume positions stored privately on the phone
-- TMDB credential encrypted with an AES-GCM key held by Android Keystore
-- Parallel home-screen loading plus bounded in-memory response caching
-- Fullscreen playback, controller/keyboard handling, and WebView renderer-crash recovery
-- No cleartext network traffic, pop-up windows, file chooser, camera, or microphone permission
+1. Open the [latest PiStick release](https://github.com/tnichol00/PiStick/releases/latest) on the Android device.
+2. Under **Assets**, download the file whose name ends in `.apk`.
 
-## Install the provided APK
+The current V1.1 file is named [`PiStick-AndroidV1.1.apk`](https://github.com/tnichol00/PiStick/releases/download/V1.1/PiStick-AndroidV1.1.apk). Its size of approximately 0.13 MB is expected because PiStick uses the WebView already built into Android.
 
-On an Android 8.0 or newer phone, allow APK installation for the app you use to open the file, then open `PiStick-Android.apk`. Android may label it as a development build because the downloadable test APK is debug-signed.
+## 2. Allow APK installation
 
-The first launch asks for a TMDB Read Access Token or v3 API key. PiStick validates it directly with TMDB and stores only the encrypted value on the device.
+1. Open the downloaded APK from the browser notification or the **Downloads** folder.
+2. If Android blocks it, select **Settings** and enable **Allow from this source** for the browser or Files app being used.
+3. Return to the installer and select **Install**.
 
-## Build from source
+Android may describe PiStick as a development or externally downloaded app because this APK is installed outside Google Play.
 
-The Android Studio/Gradle project is in [`android`](android). With JDK 17 and Android SDK 35 installed:
+## 3. Complete first-time setup
 
-```bash
-cd android
-./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
-```
+1. Open **PiStick**.
+2. Enter either the long TMDB **API Read Access Token** or the shorter TMDB v3 API key.
+3. Select **Save and Continue**.
 
-The resulting installable APK is:
+PiStick validates the credential with TMDB and then opens the profile screen.
 
-```text
-android/app/build/outputs/apk/debug/app-debug.apk
-```
+## Update PiStick
 
-For a production or Play Store build, configure your own long-lived Android signing key and build the release variant. Never commit the key or its passwords.
+Download the newest APK from the [Releases page](https://github.com/tnichol00/PiStick/releases) and open it. Android normally offers to update the existing installation while retaining its data.
 
-See [`android/README.md`](android/README.md) for the implementation and security architecture.
+If Android reports that the update cannot be installed because its signature differs, uninstall the existing PiStick app before installing the new APK. Uninstalling also removes the profiles and watch history stored by that installation.
