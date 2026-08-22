@@ -1,17 +1,9 @@
-# PiStick
-<img src="assets/pistick-icon.png" alt="PiStick logo" width="128">
+# Install PiStick
 
-PiStick is an app originally made to mimic a Netflix style experience and pull content from Videasy servers.
-It was designed to simplify the piracy experience and provide an intitive interface for everyone.
+Choose the version made for your device:
 
-For Windows Standalone App guide click here.
-
-For Windows Server guide click here.
-
-For IOS app, email me at tnichol00@gmail.com and ask for access to the pistick app.
-
-For Android App guide, click here.
-
-For Raspberry Pi guide, click here.
-
-Feel free to email me about any questions or concerns.
+- **Windows standalone app:** [Click here for the installation guide](WINDOWS_STANDALONE_README.md).
+- **Windows local-network server:** [Click here for the installation guide](https://github.com/tnichol00/PiStick/blob/agent/windows-local-server/README.md).
+- **Android app:** [Click here for the installation guide](https://github.com/tnichol00/PiStick/blob/android/README.md).
+- **Raspberry Pi Zero W:** [Click here for the installation guide](https://github.com/tnichol00/PiStick/blob/Pi-Zero-W/README.md).
+- **iPhone and iPad:** [Click here for the TestFlight installation guide](https://github.com/tnichol00/PiStick/blob/agent/ios-standalone/README.md).
