@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <size android:width="320dp" android:height="180dp" />
+            <gradient
+                android:angle="0"
+                android:endColor="#09090B"
+                android:startColor="#1B1028" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+    <item
+        android:width="148dp"
+        android:height="148dp"
+        android:gravity="center">
+        <bitmap
+            android:antialias="true"
+            android:filter="true"
+            android:gravity="fill"
+            android:src="@drawable/pistick_icon" />
+    </item>
+</layer-list>

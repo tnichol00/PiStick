@@ -313,7 +313,7 @@ final class TmdbClient implements AutoCloseable {
             connection.setReadTimeout(20_000);
             connection.setRequestMethod("GET");
             connection.setRequestProperty("Accept", "application/json");
-            connection.setRequestProperty("User-Agent", "PiStick-Android/1.0");
+            connection.setRequestProperty("User-Agent", "PiStick-FireTV/" + BuildConfig.VERSION_NAME);
             if (bearer) connection.setRequestProperty("Authorization", "Bearer " + credential);
             connection.setInstanceFollowRedirects(false);
 

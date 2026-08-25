@@ -1,38 +1,35 @@
-# PiStick for Android
-
-PiStick for Android is a self-contained Android application. It does not connect to a Raspberry Pi, start a Python process, bind a network port, host localhost pages, or require a PiStick server. The familiar PiStick interface is packaged in the APK, while profiles, watch state, TMDB requests, and secure credential storage are implemented in native Android code.
+# Install a locally built PiStick Fire TV APK
 
 ## Requirements
 
-- Android 8.0 (API 26) or newer
-- Internet access for TMDB images/metadata, trailers, and Videasy playback
-- A free TMDB Read Access Token or v3 API key
+- JDK 17
+- Android SDK Platform 36 and Build Tools 35.0.0 or newer
+- An Android-based Fire TV device running Fire OS 6 (API 25) or newer
+- ADB from Android SDK Platform Tools
 
-The TMDB credential is validated directly with TMDB and encrypted with an AES-GCM key held by Android Keystore. It is excluded from Android backup and device-transfer data.
+## 1. Build the APK
 
-## Build
-
-Open this `android` folder in Android Studio, or use the included Gradle wrapper:
+From this `android` directory, run:
 
 ```bash
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-The installable development APK is written to:
+The installable APK is created at `app/build/outputs/apk/debug/app-debug.apk`.
 
-```text
-app/build/outputs/apk/debug/app-debug.apk
+## 2. Prepare Fire TV
+
+1. Open **Settings → My Fire TV → About**.
+2. Highlight the device name and press **Select** seven times if **Developer Options** is hidden.
+3. Open **Developer Options** and turn on **ADB Debugging**.
+4. Find the device address under **About → Network**.
+
+## 3. Install and launch
+
+```bash
+adb connect FIRE_TV_IP:5555
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell monkey -p app.pistick.firetv -c android.intent.category.LEANBACK_LAUNCHER 1
 ```
 
-For a distributable release, configure your own long-lived Android signing key and run `./gradlew assembleRelease`. Never commit the signing key or its passwords.
-
-## Architecture
-
-- `MainActivity`: hardened Android WebView host, navigation lock, fullscreen playback, and renderer-crash recovery
-- `PiStickBridge` / `PiStickApi`: authenticated in-process interface used by the bundled UI
-- `TmdbClient`: direct HTTPS TMDB client with parallel home loading and bounded in-memory caching
-- `CredentialStore`: Android Keystore-backed AES-GCM credential encryption
-- `StateStore`: atomic private JSON persistence for profiles, watch history, and resume positions
-- `assets/web`: the packaged PiStick interface; these static files are loaded from the APK and are not served over HTTP
-
-The bridge uses a random per-WebView secret that is injected only into the top-level bundled document. This prevents untrusted cross-origin player frames from invoking native app operations through Android's JavaScript bridge.
+Replace `FIRE_TV_IP` with the address displayed by Fire TV and approve the debugging prompt on the television.

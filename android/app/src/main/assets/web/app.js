@@ -12,6 +12,9 @@
     progressTimer: null,
     toastTimer: null,
     manageProfiles: false,
+    profilesReturnHome: false,
+    detailsReturnFocus: null,
+    settingsReturnFocus: null,
     gamepadPrevious: {},
     gamepadCooldown: 0
   };
@@ -240,7 +243,8 @@
     return row;
   }
 
-  function renderProfiles(manage) {
+  function renderProfiles(manage, returnToHome) {
+    if (typeof returnToHome === "boolean") state.profilesReturnHome = returnToHome;
     state.currentView = "profiles";
     state.manageProfiles = Boolean(manage);
     setHeader(false);
@@ -345,7 +349,7 @@
 
   async function renderHome() {
     if (!state.activeProfile) {
-      renderProfiles(false);
+      renderProfiles(false, false);
       return;
     }
     state.currentView = "home";
@@ -391,7 +395,7 @@
   }
 
   async function renderDiscover(kind) {
-    if (!state.activeProfile) return renderProfiles(false);
+    if (!state.activeProfile) return renderProfiles(false, false);
     state.currentView = kind;
     setHeader(true);
     setActiveNav(kind);
@@ -410,7 +414,7 @@
   async function renderSearch(searchText) {
     var cleaned = String(searchText || "").trim();
     if (!cleaned) return renderHome();
-    if (!state.activeProfile) return renderProfiles(false);
+    if (!state.activeProfile) return renderProfiles(false, false);
     state.currentView = "search";
     setHeader(true);
     setActiveNav("");
@@ -609,7 +613,10 @@
   }
 
   async function openDetails(media, refresh) {
-    if (!ui.detailsDialog.open) ui.detailsDialog.showModal();
+    if (!ui.detailsDialog.open) {
+      state.detailsReturnFocus = document.activeElement;
+      ui.detailsDialog.showModal();
+    }
     ui.detailsContent.replaceChildren(element("div", "loading-page", "Loading title details…"));
     try {
       var payload = await api(query("/api/media/" + encodeURIComponent(media.media_type) + "/" + Number(media.id), {
@@ -629,7 +636,10 @@
   }
 
   function closeDetails() {
-    if (ui.detailsDialog.open) ui.detailsDialog.close();
+    if (!ui.detailsDialog.open) return;
+    ui.detailsDialog.close();
+    restoreFocus(state.detailsReturnFocus);
+    state.detailsReturnFocus = null;
   }
 
   async function playResumeEpisode(show, resume) {
@@ -751,9 +761,9 @@
     }
   }
 
-  async function closePlayer() {
+  function closePlayer() {
     if (!state.player) return;
-    await savePlayerProgress(true);
+    savePlayerProgress(true);
     state.player = null;
     ui.playerFrame.src = "about:blank";
     ui.playerOverlay.classList.add("hidden");
@@ -772,17 +782,37 @@
     ui.settingsMessage.classList.remove("success");
     ui.settingsToken.value = "";
     ui.settingsDialog.dataset.required = required ? "1" : "0";
-    if (!ui.settingsDialog.open) ui.settingsDialog.showModal();
+    if (!ui.settingsDialog.open) {
+      state.settingsReturnFocus = document.activeElement;
+      ui.settingsDialog.showModal();
+    }
     window.setTimeout(function () { ui.settingsToken.focus(); }, 40);
   }
 
   function closeSettings() {
     if (ui.settingsDialog.dataset.required === "1") return;
-    if (ui.settingsDialog.open) ui.settingsDialog.close();
+    if (!ui.settingsDialog.open) return;
+    ui.settingsDialog.close();
+    restoreFocus(state.settingsReturnFocus);
+    state.settingsReturnFocus = null;
+  }
+
+  function restoreFocus(node) {
+    window.setTimeout(function () {
+      if (node && node.isConnected && typeof node.focus === "function") node.focus();
+      else focusFirst();
+    }, 30);
+  }
+
+  function focusRoot() {
+    if (state.player && ui.playerOverlay) return ui.playerOverlay;
+    if (ui.settingsDialog && ui.settingsDialog.open) return ui.settingsDialog;
+    if (ui.detailsDialog && ui.detailsDialog.open) return ui.detailsDialog;
+    return document;
   }
 
   function visibleFocusable() {
-    return Array.from(document.querySelectorAll("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")).filter(function (node) {
+    return Array.from(focusRoot().querySelectorAll("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")).filter(function (node) {
       var rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== "hidden";
     });
@@ -843,17 +873,119 @@
   }
 
   function backAction() {
-    if (state.player) return closePlayer();
-    if (ui.settingsDialog.open) return closeSettings();
-    if (ui.detailsDialog.open) return closeDetails();
-    if (state.currentView !== "home" && state.activeProfile) return renderHome();
-    renderProfiles(false);
+    if (state.player) {
+      closePlayer();
+      return true;
+    }
+    if (ui.settingsDialog.open) {
+      closeSettings();
+      return true;
+    }
+    if (ui.detailsDialog.open) {
+      closeDetails();
+      return true;
+    }
+    if (state.manageProfiles) {
+      renderProfiles(false);
+      return true;
+    }
+    if (state.currentView === "profiles") {
+      if (state.profilesReturnHome && state.activeProfile) {
+        renderHome();
+        return true;
+      }
+      return false;
+    }
+    if (state.currentView !== "home" && state.activeProfile) {
+      renderHome();
+      return true;
+    }
+    return false;
   }
 
   function playerDirectional(direction) {
     if (direction === "left") postPlayerCommand("seek-relative", { offsetSeconds: -10 });
     if (direction === "right") postPlayerCommand("seek-relative", { offsetSeconds: 10 });
   }
+
+  function adjustTextCaret(target, direction) {
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return false;
+    if (direction !== "left" && direction !== "right") return false;
+    var start = Number(target.selectionStart || 0);
+    var end = Number(target.selectionEnd || start);
+    var next = direction === "left" ? Math.max(0, start - 1) : Math.min(target.value.length, end + 1);
+    target.setSelectionRange(next, next);
+    return true;
+  }
+
+  function adjustSelect(target, direction) {
+    if (!(target instanceof HTMLSelectElement)) return false;
+    var delta = (direction === "left" || direction === "up") ? -1
+      : ((direction === "right" || direction === "down") ? 1 : 0);
+    if (!delta) return false;
+    var next = Math.max(0, Math.min(target.options.length - 1, target.selectedIndex + delta));
+    if (next === target.selectedIndex) return false;
+    target.selectedIndex = next;
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  function remoteAction(action) {
+    var direction = { left: "left", right: "right", up: "up", down: "down" }[action];
+    if (direction) {
+      var target = document.activeElement;
+      if (state.player && (direction === "left" || direction === "right")) {
+        playerDirectional(direction);
+      } else if (!adjustTextCaret(target, direction) && !adjustSelect(target, direction)) {
+        moveFocus(direction);
+      }
+      return true;
+    }
+    if (action === "select") {
+      if (state.player) {
+        postPlayerCommand("toggle");
+        return true;
+      }
+      var active = document.activeElement;
+      if (active && typeof active.click === "function") active.click();
+      else focusFirst();
+      return true;
+    }
+    if (action === "back") return backAction();
+    if (action === "menu") {
+      if (state.player) postPlayerCommand("subtitles-english-toggle");
+      else openSettings(false);
+      return true;
+    }
+    if (action === "play-pause" && state.player) {
+      postPlayerCommand("toggle");
+      return true;
+    }
+    if ((action === "play" || action === "pause") && state.player) {
+      postPlayerCommand(action);
+      return true;
+    }
+    if (action === "rewind" && state.player) {
+      playerDirectional("left");
+      return true;
+    }
+    if (action === "fast-forward" && state.player) {
+      playerDirectional("right");
+      return true;
+    }
+    if (action === "stop" && state.player) {
+      closePlayer();
+      return true;
+    }
+    return false;
+  }
+
+  window.PiStickFireTV = Object.freeze({
+    handle: function (action) {
+      try { return remoteAction(String(action || "")); }
+      catch (error) { return true; }
+    }
+  });
 
   function setupKeyboard() {
     document.addEventListener("keydown", function (event) {
@@ -894,11 +1026,7 @@
   function pollGamepads(timestamp) {
     var gamepads = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter(Boolean) : [];
     gamepads.forEach(function (gamepad) {
-      gamepadEdge(gamepad, "a", gamepadPressed(gamepad, 0), function () {
-        if (state.player) postPlayerCommand("toggle");
-        else if (document.activeElement && typeof document.activeElement.click === "function") document.activeElement.click();
-        else focusFirst();
-      });
+      gamepadEdge(gamepad, "a", gamepadPressed(gamepad, 0), function () { remoteAction("select"); });
       gamepadEdge(gamepad, "b", gamepadPressed(gamepad, 1), backAction);
       gamepadEdge(gamepad, "x", gamepadPressed(gamepad, 2), function () {
         if (state.player) postPlayerCommand("subtitles-english-toggle");
@@ -955,7 +1083,7 @@
       event.preventDefault();
       renderSearch(ui.searchInput.value);
     });
-    ui.profileButton.addEventListener("click", function () { renderProfiles(false); });
+    ui.profileButton.addEventListener("click", function () { renderProfiles(false, true); });
     ui.settingsButton.addEventListener("click", function () { openSettings(false); });
     ui.detailsClose.addEventListener("click", closeDetails);
     ui.settingsClose.addEventListener("click", closeSettings);
@@ -1025,7 +1153,7 @@
       await refreshProfiles();
       if (!state.status.tmdb_configured) openSettings(true);
       if (state.activeProfile) await renderHome();
-      else renderProfiles(false);
+      else renderProfiles(false, false);
     } catch (error) {
       errorPage(error, bootstrap);
     }

@@ -8,6 +8,7 @@ import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Base64;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -47,6 +48,7 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BACKGROUND);
         getWindow().setNavigationBarColor(BACKGROUND);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        hideSystemUi();
 
         root = new FrameLayout(this);
         root.setBackgroundColor(BACKGROUND);
@@ -68,8 +70,12 @@ public final class MainActivity extends Activity {
         WebView candidate = new WebView(this);
         candidate.setBackgroundColor(BACKGROUND);
         candidate.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-        candidate.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            candidate.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true);
+        }
         candidate.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        candidate.setFocusable(true);
+        candidate.setFocusableInTouchMode(true);
 
         android.webkit.WebSettings settings = candidate.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -87,7 +93,8 @@ public final class MainActivity extends Activity {
         settings.setSupportZoom(false);
         settings.setTextZoom(100);
         settings.setOffscreenPreRaster(true);
-        settings.setUserAgentString(settings.getUserAgentString() + " PiStick-Android/" + BuildConfig.VERSION_NAME);
+        settings.setUseWideViewPort(true);
+        settings.setUserAgentString(settings.getUserAgentString() + " PiStick-FireTV/" + BuildConfig.VERSION_NAME);
 
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
@@ -96,7 +103,9 @@ public final class MainActivity extends Activity {
         String secret = bridgeSecret();
         PiStickBridge candidateBridge = new PiStickBridge(this, candidate, secret);
         candidate.addJavascriptInterface(candidateBridge, "PiStickAndroid");
-        candidate.setWebViewClient(new PiStickWebViewClient());
+        candidate.setWebViewClient(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new RendererAwareWebViewClient()
+                : new PiStickWebViewClient());
         candidate.setWebChromeClient(new PiStickChromeClient());
 
         webView = candidate;
@@ -108,9 +117,12 @@ public final class MainActivity extends Activity {
 
         try {
             String html = readAsset("web/index.html");
-            String injection = "<script>window.__PISTICK_ANDROID_SECRET__='" + secret + "';</script>";
+            String injection = "<script>window.__PISTICK_ANDROID_SECRET__='" + secret
+                    + "';window.__PISTICK_FIRE_TV__=true;"
+                    + "document.documentElement.classList.add('fire-tv');</script>";
             html = html.replace("</head>", injection + "</head>");
             candidate.loadDataWithBaseURL(ASSET_ROOT, html, "text/html", StandardCharsets.UTF_8.name(), null);
+            candidate.requestFocus(View.FOCUS_DOWN);
         } catch (IOException error) {
             showFatalError("PiStick resources are missing. Reinstall the app.");
         }
@@ -140,12 +152,8 @@ public final class MainActivity extends Activity {
         }
         WebView current = webView;
         if (current == null || !backPending.compareAndSet(false, true)) return;
-        String script = "(function(){"
-                + "var p=document.getElementById('player-overlay');"
-                + "if(p&&!p.classList.contains('hidden')){document.getElementById('player-close').click();return true;}"
-                + "var d=document.getElementById('details-dialog');if(d&&d.open){d.close();return true;}"
-                + "var s=document.getElementById('settings-dialog');if(s&&s.open){"
-                + "if(s.dataset.required!=='1')s.close();return true;}return false;})()";
+        String script = "(function(){return Boolean(window.PiStickFireTV"
+                + "&&window.PiStickFireTV.handle('back'));})()";
         current.evaluateJavascript(script, value -> {
             backPending.set(false);
             if (!"true".equals(value)) finishAfterTransition();
@@ -160,6 +168,34 @@ public final class MainActivity extends Activity {
     }
 
     @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        String action = FireTvRemote.actionForKeyCode(event.getKeyCode());
+        if (action == null) return super.dispatchKeyEvent(event);
+        if (customView != null && !FireTvRemote.BACK.equals(action)) {
+            return super.dispatchKeyEvent(event);
+        }
+
+        if (event.getAction() == KeyEvent.ACTION_UP) {
+            if (FireTvRemote.BACK.equals(action)) handleBack();
+            return true;
+        }
+        if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
+        if (FireTvRemote.BACK.equals(action)) return true;
+        if (event.getRepeatCount() > 0 && !FireTvRemote.isRepeatable(action)) return true;
+        dispatchRemoteAction(action);
+        return true;
+    }
+
+    private void dispatchRemoteAction(String action) {
+        WebView current = webView;
+        if (current == null) return;
+        current.evaluateJavascript(
+                "window.PiStickFireTV&&window.PiStickFireTV.handle('" + action + "');",
+                null
+        );
+    }
+
+    @Override
     protected void onPause() {
         if (webView != null) webView.onPause();
         super.onPause();
@@ -168,7 +204,14 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        hideSystemUi();
         if (webView != null) webView.onResume();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && customView == null) hideSystemUi();
     }
 
     @Override
@@ -220,7 +263,7 @@ public final class MainActivity extends Activity {
         root.removeView(customView);
         customView = null;
         if (webView != null) webView.setVisibility(View.VISIBLE);
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        hideSystemUi();
         if (customViewCallback != null) customViewCallback.onCustomViewHidden();
         customViewCallback = null;
     }
@@ -241,7 +284,18 @@ public final class MainActivity extends Activity {
         return Base64.encodeToString(random, Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE);
     }
 
-    private final class PiStickWebViewClient extends WebViewClient {
+    private void hideSystemUi() {
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        );
+    }
+
+    private class PiStickWebViewClient extends WebViewClient {
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             Uri url = request.getUrl();
@@ -257,8 +311,15 @@ public final class MainActivity extends Activity {
             handler.cancel();
         }
 
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.O)
+    private final class RendererAwareWebViewClient extends PiStickWebViewClient {
         @Override
-        public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+        public boolean onRenderProcessGone(
+                WebView view,
+                android.webkit.RenderProcessGoneDetail detail
+        ) {
             hideCustomView();
             destroyWebView();
             root.post(MainActivity.this::createWebView);

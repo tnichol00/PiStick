@@ -4,15 +4,14 @@ plugins {
 
 android {
     namespace "app.pistick.android"
-    compileSdk 35
-    buildToolsVersion "35.0.0"
+    compileSdk 36
 
     defaultConfig {
-        applicationId "app.pistick.android"
-        minSdk 26
-        targetSdk 35
+        applicationId "app.pistick.firetv"
+        minSdk 25
+        targetSdk 36
         versionCode 1
-        versionName "1.0.0"
+        versionName "1.0.0-firetv"
 
         testInstrumentationRunner "android.test.InstrumentationTestRunner"
     }

@@ -1,0 +1,44 @@
+name: Fire TV CI
+
+on:
+  push:
+    branches: [firetv]
+  pull_request:
+    branches: [firetv]
+    paths:
+      - "android/**"
+      - ".github/workflows/firetv-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android 16 SDK
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Verify Fire TV architecture
+        run: android/scripts/verify_firetv.sh
+      - name: Test, lint, and build
+        working-directory: android
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
+      - name: Verify installable Fire TV APK
+        run: android/scripts/verify_firetv.sh android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Name APK
+        run: |
+          mkdir -p android/dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk android/dist/PiStick-Fire-TV-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PiStick-Fire-TV-debug
+          path: android/dist/PiStick-Fire-TV-debug.apk
+          if-no-files-found: error

@@ -622,6 +622,56 @@ textarea::placeholder { color: #85858d; }
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
 }
 
+html.fire-tv {
+  --safe-area-top: 0px;
+  --safe-area-right: 0px;
+  --safe-area-left: 0px;
+  --header-height: 86px;
+}
+
+.fire-tv body { min-width: 720px; }
+
+.fire-tv .site-header {
+  --header-side-padding: max(48px, 5vw);
+  gap: 20px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+
+.fire-tv .main-nav { display: flex; }
+.fire-tv .search-form { width: min(330px, 24vw); margin-left: auto; }
+.fire-tv .icon-button { display: grid; }
+.fire-tv .player-fullscreen { display: inline-flex; }
+.fire-tv .controller-hint { display: block; padding: 10px 5vw 14px; font-size: 14px; }
+
+.fire-tv .page,
+.fire-tv .content-rows,
+.fire-tv .hero-content { padding-left: max(48px, 5vw); padding-right: max(48px, 5vw); }
+
+.fire-tv .profiles-page { padding: 6vh 5vw; }
+.fire-tv .details-dialog { width: min(1380px, 90vw); max-height: 90vh; }
+.fire-tv .settings-dialog { max-width: min(720px, 90vw); max-height: 90vh; }
+.fire-tv .media-row { scroll-padding-inline: 5vw; scrollbar-width: none; }
+.fire-tv .media-row::-webkit-scrollbar { display: none; }
+
+.fire-tv button:focus,
+.fire-tv input:focus,
+.fire-tv textarea:focus,
+.fire-tv select:focus,
+.fire-tv [tabindex]:focus {
+  outline: 4px solid var(--focus);
+  outline-offset: 4px;
+}
+
+.fire-tv .media-card:focus,
+.fire-tv .profile-card:focus { position: relative; z-index: 3; }
+.fire-tv .media-card:focus { transform: translateY(-5px) scale(1.035); background: #18181c; }
+.fire-tv .episode-card:focus { background: #27272d; }
+.fire-tv button,
+.fire-tv input,
+.fire-tv textarea,
+.fire-tv select { scroll-margin: 12vh 5vw; }
+
 @media (max-width: 850px) {
   .site-header { --header-side-padding: 13px; gap: 8px; }
   .brand { font-size: 19px; }

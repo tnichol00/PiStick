@@ -6,13 +6,12 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -25,6 +24,7 @@ import java.util.UUID;
 final class StateStore {
     static final String[] AVATARS = {"red", "blue", "green", "purple", "orange", "teal"};
     static final int MAXIMUM_PROFILES = 8;
+    private static final long MAXIMUM_STATE_BYTES = 8L * 1024L * 1024L;
 
     private final File file;
     private JSONObject data;
@@ -539,28 +539,35 @@ final class StateStore {
         } catch (IOException error) {
             throw new PiStickException("PiStick could not save watch progress.", error);
         }
-        try {
-            try {
-                Files.move(
-                        temporary.toPath(),
-                        file.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING
-                );
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        if (!temporary.renameTo(file)) {
+            File backup = new File(file.getPath() + ".bak");
+            //noinspection ResultOfMethodCallIgnored
+            backup.delete();
+            boolean movedOriginal = !file.exists() || file.renameTo(backup);
+            boolean movedReplacement = movedOriginal && temporary.renameTo(file);
+            if (movedReplacement) {
+                //noinspection ResultOfMethodCallIgnored
+                backup.delete();
+                return;
             }
-        } catch (IOException error) {
+            if (movedOriginal && backup.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                backup.renameTo(file);
+            }
             //noinspection ResultOfMethodCallIgnored
             temporary.delete();
-            throw new PiStickException("PiStick could not finish saving watch progress.", error);
+            throw new PiStickException("PiStick could not finish saving watch progress.");
         }
     }
 
     private static JSONObject read(File file) {
-        if (!file.isFile()) return defaultData();
-        try {
-            String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        if (!file.isFile() || file.length() > MAXIMUM_STATE_BYTES) return defaultData();
+        try (FileInputStream input = new FileInputStream(file);
+             ByteArrayOutputStream output = new ByteArrayOutputStream((int) Math.max(32, file.length()))) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+            String content = new String(output.toByteArray(), StandardCharsets.UTF_8);
             return new JSONObject(content);
         } catch (IOException | JSONException ignored) {
             return defaultData();
