@@ -12,7 +12,7 @@ web_app="$source_root/assets/web/app.js"
 require_text() {
   local file="$1"
   local expected="$2"
-  if ! rg --fixed-strings --quiet -- "$expected" "$file"; then
+  if ! grep --fixed-strings --quiet -- "$expected" "$file"; then
     echo "Missing required Fire TV setting in ${file#$project_root/}: $expected" >&2
     exit 1
   fi
@@ -35,12 +35,12 @@ require_text "$activity_source" 'window.PiStickFireTV'
 require_text "$web_app" 'window.PiStickFireTV'
 require_text "$web_app" 'focusRoot()'
 
-if rg --quiet 'java\.nio\.file' "$source_root/java"; then
+if grep --recursive --extended-regexp --quiet 'java\.nio\.file' "$source_root/java"; then
   echo "API 26-only java.nio.file usage prevents Fire OS 6 support." >&2
   exit 1
 fi
 
-if rg --quiet 'ServerSocket|NanoHTTPD|localhost:[0-9]|127\.0\.0\.1:[0-9]|python(3)? -m http|Flask|FastAPI' "$source_root"; then
+if grep --recursive --extended-regexp --quiet 'ServerSocket|NanoHTTPD|localhost:[0-9]|127\.0\.0\.1:[0-9]|python(3)? -m http|Flask|FastAPI' "$source_root"; then
   echo "A web server or localhost dependency was found in the standalone Fire TV app." >&2
   exit 1
 fi
