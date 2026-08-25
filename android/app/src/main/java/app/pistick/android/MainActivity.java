@@ -160,13 +160,6 @@ public final class MainActivity extends Activity {
         });
     }
 
-    @SuppressWarnings("deprecation")
-    @Override
-    public void onBackPressed() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) handleBack();
-        else super.onBackPressed();
-    }
-
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         String action = FireTvRemote.actionForKeyCode(event.getKeyCode());
