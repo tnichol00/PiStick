@@ -7,17 +7,22 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Base64;
+import android.view.InputDevice;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
 import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
@@ -33,7 +38,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class MainActivity extends Activity {
     private static final int BACKGROUND = Color.rgb(9, 9, 11);
-    private static final String ASSET_ROOT = "file:///android_asset/web/";
+    private static final String APP_HOST = "app.pistick.local";
+    private static final String APP_ORIGIN = "https://" + APP_HOST;
+    private static final String ASSET_ROOT = APP_ORIGIN + "/";
 
     private FrameLayout root;
     private WebView webView;
@@ -83,7 +90,7 @@ public final class MainActivity extends Activity {
         settings.setDatabaseEnabled(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setAllowContentAccess(false);
-        settings.setAllowFileAccess(true);
+        settings.setAllowFileAccess(false);
         settings.setAllowFileAccessFromFileURLs(false);
         settings.setAllowUniversalAccessFromFileURLs(false);
         settings.setMixedContentMode(android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW);
@@ -92,7 +99,9 @@ public final class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setSupportZoom(false);
         settings.setTextZoom(100);
-        settings.setOffscreenPreRaster(true);
+        // This WebView is always attached and visible. Pre-rasterizing its large
+        // 1080p/4K surface wastes memory and GPU time on Fire TV hardware.
+        settings.setOffscreenPreRaster(false);
         settings.setUseWideViewPort(true);
         settings.setUserAgentString(settings.getUserAgentString() + " PiStick-FireTV/" + BuildConfig.VERSION_NAME);
 
@@ -121,7 +130,15 @@ public final class MainActivity extends Activity {
                     + "';window.__PISTICK_FIRE_TV__=true;"
                     + "document.documentElement.classList.add('fire-tv');</script>";
             html = html.replace("</head>", injection + "</head>");
-            candidate.loadDataWithBaseURL(ASSET_ROOT, html, "text/html", StandardCharsets.UTF_8.name(), null);
+            // A real HTTPS origin gives embedded players a valid Referer. A
+            // file:// parent causes YouTube iframe error 153.
+            candidate.loadDataWithBaseURL(
+                    ASSET_ROOT + "index.html",
+                    html,
+                    "text/html",
+                    StandardCharsets.UTF_8.name(),
+                    null
+            );
             candidate.requestFocus(View.FOCUS_DOWN);
         } catch (IOException error) {
             showFatalError("PiStick resources are missing. Reinstall the app.");
@@ -186,6 +203,71 @@ public final class MainActivity extends Activity {
                 "window.PiStickFireTV&&window.PiStickFireTV.handle('" + action + "');",
                 null
         );
+    }
+
+    void showSoftKeyboard() {
+        WebView current = webView;
+        if (current == null) return;
+        current.post(() -> {
+            if (webView != current || isFinishing() || isDestroyed()) return;
+            current.requestFocus(View.FOCUS_DOWN);
+            InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (keyboard == null) return;
+            keyboard.restartInput(current);
+            keyboard.showSoftInput(current, InputMethodManager.SHOW_IMPLICIT);
+        });
+    }
+
+    void hideSoftKeyboard() {
+        WebView current = webView;
+        if (current == null) return;
+        InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (keyboard != null) keyboard.hideSoftInputFromWindow(current.getWindowToken(), 0);
+    }
+
+    void requestPlayerAutostart() {
+        WebView current = webView;
+        if (current == null) return;
+        // Videasy presents a full-player click-to-start surface on TV browsers.
+        // A single native center tap supplies the trusted gesture that an
+        // injected cross-origin script cannot provide.
+        current.postDelayed(() -> {
+            if (webView != current || isFinishing() || isDestroyed() || customView != null) return;
+            int width = current.getWidth();
+            int height = current.getHeight();
+            if (width <= 0 || height <= 0) return;
+            long downTime = SystemClock.uptimeMillis();
+            float x = width / 2f;
+            float y = height / 2f;
+            MotionEvent down = MotionEvent.obtain(
+                    downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0
+            );
+            MotionEvent up = MotionEvent.obtain(
+                    downTime, downTime + 45, MotionEvent.ACTION_UP, x, y, 0
+            );
+            down.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+            up.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+            try {
+                current.dispatchTouchEvent(down);
+                current.dispatchTouchEvent(up);
+            } finally {
+                down.recycle();
+                up.recycle();
+            }
+        }, 450);
+    }
+
+    void sendPlayerKey(String action) {
+        WebView current = webView;
+        int keyCode = FireTvRemote.keyCodeForAction(action);
+        if (current == null || keyCode == KeyEvent.KEYCODE_UNKNOWN) return;
+        current.post(() -> {
+            if (webView != current || isFinishing() || isDestroyed()) return;
+            current.requestFocus(View.FOCUS_DOWN);
+            long eventTime = SystemClock.uptimeMillis();
+            current.dispatchKeyEvent(new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_DOWN, keyCode, 0));
+            current.dispatchKeyEvent(new KeyEvent(eventTime, eventTime + 25, KeyEvent.ACTION_UP, keyCode, 0));
+        });
     }
 
     @Override
@@ -290,11 +372,34 @@ public final class MainActivity extends Activity {
 
     private class PiStickWebViewClient extends WebViewClient {
         @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            Uri url = request.getUrl();
+            if (!"https".equalsIgnoreCase(url.getScheme()) || !APP_HOST.equalsIgnoreCase(url.getHost())) {
+                return null;
+            }
+            String path = url.getPath();
+            try {
+                if ("/styles.css".equals(path)) {
+                    return new WebResourceResponse("text/css", StandardCharsets.UTF_8.name(),
+                            getAssets().open("web/styles.css"));
+                }
+                if ("/app.js".equals(path)) {
+                    return new WebResourceResponse("application/javascript", StandardCharsets.UTF_8.name(),
+                            getAssets().open("web/app.js"));
+                }
+            } catch (IOException ignored) {
+                // The initial asset check will show a clear reinstall message.
+            }
+            return null;
+        }
+
+        @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             Uri url = request.getUrl();
             String scheme = url.getScheme() == null ? "" : url.getScheme().toLowerCase(Locale.ROOT);
             if (request.isForMainFrame()) {
-                return !("file".equals(scheme) || "about".equals(scheme));
+                boolean localApp = "https".equals(scheme) && APP_HOST.equalsIgnoreCase(url.getHost());
+                return !(localApp || "about".equals(scheme));
             }
             return !("https".equals(scheme) || "about".equals(scheme));
         }

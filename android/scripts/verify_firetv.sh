@@ -32,8 +32,17 @@ require_text "$remote_source" 'KEYCODE_DPAD_CENTER'
 require_text "$remote_source" 'KEYCODE_MEDIA_PLAY_PAUSE'
 require_text "$remote_source" 'KEYCODE_MEDIA_FAST_FORWARD'
 require_text "$activity_source" 'window.PiStickFireTV'
+require_text "$activity_source" 'APP_ORIGIN = "https://" + APP_HOST'
+require_text "$activity_source" 'shouldInterceptRequest'
+require_text "$activity_source" 'showSoftKeyboard()'
+require_text "$activity_source" 'requestPlayerAutostart()'
 require_text "$web_app" 'window.PiStickFireTV'
 require_text "$web_app" 'focusRoot()'
+require_text "$web_app" 'moveRailFocus(current, direction)'
+require_text "$web_app" 'nativeUi("showKeyboard")'
+require_text "$web_app" 'nativeUi("requestPlayerAutostart")'
+require_text "$web_app" 'enablejsapi=1&playsinline=1&origin='
+require_text "$web_app" 'FIRE_TV ? "w342" : "w500"'
 
 if grep --recursive --extended-regexp --quiet 'java\.nio\.file' "$source_root/java"; then
   echo "API 26-only java.nio.file usage prevents Fire OS 6 support." >&2

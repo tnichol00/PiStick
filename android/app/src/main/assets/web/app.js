@@ -15,13 +15,36 @@
     profilesReturnHome: false,
     detailsReturnFocus: null,
     settingsReturnFocus: null,
+    textEntry: null,
     gamepadPrevious: {},
-    gamepadCooldown: 0
+    gamepadCooldown: 0,
+    gamepadFrame: 0
   };
 
   var ui = {};
   var nativeRequests = {};
   var nextNativeRequest = 0;
+  var FIRE_TV = Boolean(window.__PISTICK_FIRE_TV__);
+
+  function nativeUi(method) {
+    if (!window.PiStickAndroid || typeof window.PiStickAndroid[method] !== "function") return;
+    try {
+      window.PiStickAndroid[method](String(window.__PISTICK_ANDROID_SECRET__ || ""));
+    } catch (error) { /* The native UI helper is best effort. */ }
+  }
+
+  function nativePlayerKey(action) {
+    if (!window.PiStickAndroid || typeof window.PiStickAndroid.sendPlayerKey !== "function") return false;
+    try {
+      window.PiStickAndroid.sendPlayerKey(
+        String(window.__PISTICK_ANDROID_SECRET__ || ""),
+        String(action || "")
+      );
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
 
   function decodeBase64JSON(encoded) {
     var bytes = Uint8Array.from(window.atob(encoded), function (character) {
@@ -280,12 +303,13 @@
 
   function poster(media) {
     var wrap = element("div", "poster-wrap");
-    var url = imageUrl(media.poster_path, "w500");
+    var url = imageUrl(media.poster_path, FIRE_TV ? "w342" : "w500");
     if (url) {
       var image = element("img");
       image.src = url;
       image.alt = "";
       image.loading = "lazy";
+      image.decoding = "async";
       image.addEventListener("error", function () {
         wrap.replaceChildren(element("div", "poster-fallback", titleOf(media)));
       });
@@ -328,11 +352,13 @@
 
   function hero(media) {
     var section = element("section", "hero");
-    var backdrop = imageUrl(media.backdrop_path, "original");
+    var backdrop = imageUrl(media.backdrop_path, FIRE_TV ? "w1280" : "original");
     if (backdrop) {
       var image = element("img", "hero-backdrop");
       image.src = backdrop;
       image.alt = "";
+      image.decoding = "async";
+      image.fetchPriority = "high";
       section.append(image);
     }
     var content = element("div", "hero-content");
@@ -367,7 +393,8 @@
       if (!rows.childElementCount) rows.append(element("div", "empty-state", "No titles are available right now."));
       fragment.append(rows);
       ui.app.replaceChildren(fragment);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      scrollPageTop();
+      window.setTimeout(focusHomeStart, 30);
     } catch (error) {
       if (token !== state.loadToken) return;
       errorPage(error, renderHome);
@@ -405,7 +432,8 @@
       var payload = await api(query("/api/discover/" + kind, { profile_id: activeProfileId() }));
       if (token !== state.loadToken) return;
       resultPage(kind === "movie" ? "Movies" : "TV Shows", "POPULAR RIGHT NOW", payload.items || []);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      scrollPageTop();
+      window.setTimeout(focusPageStart, 30);
     } catch (error) {
       if (token === state.loadToken) errorPage(error, function () { renderDiscover(kind); });
     }
@@ -424,7 +452,8 @@
       var payload = await api(query("/api/search", { q: cleaned, profile_id: activeProfileId() }));
       if (token !== state.loadToken) return;
       resultPage("Search results", "RESULTS FOR “" + cleaned.toUpperCase() + "”", payload.items || []);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      scrollPageTop();
+      window.setTimeout(focusPageStart, 30);
     } catch (error) {
       if (token === state.loadToken) errorPage(error, function () { renderSearch(cleaned); });
     }
@@ -512,12 +541,13 @@
   function episodeCard(show, episode) {
     var card = button("", "episode-card", function () { startPlayback(show, episode); });
     card.setAttribute("aria-label", "Play episode " + episode.episode_number + ", " + (episode.name || ""));
-    var stillUrl = imageUrl(episode.still_path, "w500");
+    var stillUrl = imageUrl(episode.still_path, FIRE_TV ? "w300" : "w500");
     if (stillUrl) {
       var still = element("img", "episode-still");
       still.src = stillUrl;
       still.alt = "";
       still.loading = "lazy";
+      still.decoding = "async";
       card.append(still);
     } else {
       card.append(element("div", "episode-still poster-fallback", "Episode " + episode.episode_number));
@@ -587,11 +617,12 @@
     state.detailsMedia = media;
     var root = element("div");
     var backdrop = element("section", "details-backdrop");
-    var image = imageUrl(media.backdrop_path, "original");
+    var image = imageUrl(media.backdrop_path, FIRE_TV ? "w1280" : "original");
     if (image) {
       var picture = element("img");
       picture.src = image;
       picture.alt = "";
+      picture.decoding = "async";
       backdrop.append(picture);
     }
     var copy = element("div", "details-copy");
@@ -635,19 +666,16 @@
     }
   }
 
-  function closeDetails() {
+  function closeDetails(restoreAfterClose) {
     if (!ui.detailsDialog.open) return;
+    var returnFocus = state.detailsReturnFocus;
     ui.detailsDialog.close();
-    restoreFocus(state.detailsReturnFocus);
     state.detailsReturnFocus = null;
+    if (restoreAfterClose !== false) restoreFocus(returnFocus);
   }
 
-  async function playResumeEpisode(show, resume) {
-    var holder = document.createElement("div");
-    var episodes = await loadSeason(show, Number(resume.season_number || 1), holder);
-    var episode = episodes.find(function (candidate) {
-      return Number(candidate.episode_number) === Number(resume.episode_number || 1);
-    }) || {
+  function playResumeEpisode(show, resume) {
+    var episode = {
       season_number: Number(resume.season_number || 1),
       episode_number: Number(resume.episode_number || 1),
       name: "Episode " + Number(resume.episode_number || 1)
@@ -676,7 +704,10 @@
   }
 
   function openTrailer(title, key) {
-    var url = "https://www.youtube-nocookie.com/embed/" + encodeURIComponent(key) + "?autoplay=1&rel=0&modestbranding=1&cc_load_policy=0";
+    var origin = window.location.origin === "null" ? "https://app.pistick.local" : window.location.origin;
+    var url = "https://www.youtube-nocookie.com/embed/" + encodeURIComponent(key)
+      + "?autoplay=1&rel=0&cc_load_policy=0&enablejsapi=1&playsinline=1&origin="
+      + encodeURIComponent(origin);
     openPlayer(title, url, null, null, true);
   }
 
@@ -688,7 +719,8 @@
       showToast("The player URL was rejected.");
       return;
     }
-    closeDetails();
+    var playerReturnFocus = state.detailsReturnFocus;
+    closeDetails(false);
     state.player = {
       media: media,
       episode: episode,
@@ -696,7 +728,11 @@
       position: 0,
       duration: 0,
       lastSavedAt: 0,
-      saving: false
+      saving: false,
+      isVideasy: isVideasyPlayer,
+      autoStartRequested: false,
+      autoStartTimer: 0,
+      returnFocus: playerReturnFocus
     };
     ui.playerTitle.textContent = title;
     if (isVideasyPlayer) {
@@ -708,10 +744,10 @@
     } else {
       ui.playerFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock");
     }
-    ui.playerFrame.src = playerUrl;
     ui.playerOverlay.classList.remove("hidden");
     document.body.style.overflow = "hidden";
-    ui.playerClose.focus();
+    ui.playerFrame.src = playerUrl;
+    window.requestAnimationFrame(function () { ui.playerFrame.focus(); });
   }
 
   function decodePlayerMessage(value) {
@@ -763,12 +799,14 @@
 
   function closePlayer() {
     if (!state.player) return;
+    var returnFocus = state.player.returnFocus;
+    window.clearTimeout(state.player.autoStartTimer);
     savePlayerProgress(true);
     state.player = null;
     ui.playerFrame.src = "about:blank";
     ui.playerOverlay.classList.add("hidden");
     document.body.style.overflow = "";
-    if (state.currentView === "home") renderHome();
+    restoreFocus(returnFocus);
   }
 
   function postPlayerCommand(action, extra) {
@@ -778,6 +816,7 @@
   }
 
   function openSettings(required) {
+    if (state.textEntry) finishTextEntry();
     ui.settingsMessage.textContent = state.status && state.status.tmdb_configured ? "A credential is already saved. Paste a new one only to replace it." : "A TMDB credential is required before titles can load.";
     ui.settingsMessage.classList.remove("success");
     ui.settingsToken.value = "";
@@ -792,6 +831,7 @@
   function closeSettings() {
     if (ui.settingsDialog.dataset.required === "1") return;
     if (!ui.settingsDialog.open) return;
+    if (state.textEntry) finishTextEntry();
     ui.settingsDialog.close();
     restoreFocus(state.settingsReturnFocus);
     state.settingsReturnFocus = null;
@@ -799,9 +839,13 @@
 
   function restoreFocus(node) {
     window.setTimeout(function () {
-      if (node && node.isConnected && typeof node.focus === "function") node.focus();
+      if (node && node.isConnected && typeof node.focus === "function") focusAndReveal(node);
       else focusFirst();
     }, 30);
+  }
+
+  function scrollPageTop() {
+    window.scrollTo({ top: 0, behavior: FIRE_TV ? "auto" : "smooth" });
   }
 
   function focusRoot() {
@@ -813,37 +857,171 @@
 
   function visibleFocusable() {
     return Array.from(focusRoot().querySelectorAll("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")).filter(function (node) {
-      var rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== "hidden";
+      return node.getClientRects().length > 0 && node.offsetWidth > 0 && node.offsetHeight > 0;
     });
+  }
+
+  function focusAndReveal(node, block, inline) {
+    if (!node || typeof node.focus !== "function") return false;
+    node.focus({ preventScroll: true });
+    if (typeof node.scrollIntoView === "function" && !node.closest(".site-header")) {
+      node.scrollIntoView({
+        behavior: FIRE_TV ? "auto" : "smooth",
+        block: block || "nearest",
+        inline: inline || "nearest"
+      });
+    }
+    return true;
   }
 
   function focusFirst() {
     var nodes = visibleFocusable();
-    if (nodes.length) nodes[0].focus();
+    if (nodes.length) focusAndReveal(nodes[0]);
   }
 
-  function moveFocus(direction) {
-    var current = document.activeElement;
-    if (current && current.classList && current.classList.contains("media-card") && (direction === "left" || direction === "right")) {
-      var rail = current.closest(".media-row");
-      if (rail) {
-        var cards = Array.from(rail.querySelectorAll(".media-card"));
-        var index = cards.indexOf(current);
-        if (index >= 0 && cards.length) {
-          var next = direction === "right" ? (index + 1) % cards.length : (index - 1 + cards.length) % cards.length;
-          cards[next].focus();
-          cards[next].scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
-          return;
-        }
+  function focusHomeStart() {
+    var featured = document.querySelector(".hero .primary-button");
+    if (featured) focusAndReveal(featured, "nearest", "nearest");
+    else focusPageStart();
+  }
+
+  function focusPageStart() {
+    var first = document.querySelector("#app .media-card, #app button, #app input, #app select");
+    if (first) focusAndReveal(first, "nearest", "nearest");
+  }
+
+  function headerControls() {
+    return Array.from(ui.header.querySelectorAll("button:not([disabled]), input:not([disabled])")).filter(function (node) {
+      return node.getClientRects().length > 0;
+    });
+  }
+
+  function activeHeaderTarget() {
+    return ui.header.querySelector(".nav-button.active") || ui.brandButton;
+  }
+
+  function firstContentTarget() {
+    if (state.currentView === "home") {
+      return document.querySelector(".hero .primary-button") || document.querySelector(".media-row .media-card");
+    }
+    return document.querySelector("#app .media-card, #app button, #app input, #app select");
+  }
+
+  function moveHeaderFocus(current, direction) {
+    var controls = headerControls();
+    var index = controls.indexOf(current);
+    if (index < 0) return false;
+    if (direction === "left" && index > 0) return focusAndReveal(controls[index - 1]);
+    if (direction === "right" && index + 1 < controls.length) return focusAndReveal(controls[index + 1]);
+    if (direction === "down") return focusAndReveal(firstContentTarget(), "center", "nearest");
+    return true;
+  }
+
+  function closestCardAtScreenX(rail, screenX) {
+    var cards = Array.from(rail.querySelectorAll(".media-card"));
+    var best = null;
+    var distance = Infinity;
+    cards.forEach(function (card) {
+      var rect = card.getBoundingClientRect();
+      var candidateDistance = Math.abs(rect.left + rect.width / 2 - screenX);
+      if (candidateDistance < distance) {
+        best = card;
+        distance = candidateDistance;
       }
+    });
+    return best;
+  }
+
+  function moveRailFocus(current, direction) {
+    var rail = current.closest(".media-row");
+    if (!rail) return false;
+    var cards = Array.from(rail.querySelectorAll(".media-card"));
+    var index = cards.indexOf(current);
+    if (index < 0 || !cards.length) return false;
+    if (direction === "left" || direction === "right") {
+      var next = direction === "right"
+        ? (index + 1) % cards.length
+        : (index - 1 + cards.length) % cards.length;
+      return focusAndReveal(cards[next], "nearest", "center");
     }
+
+    var sections = Array.from(document.querySelectorAll(".content-rows .media-section"));
+    var section = rail.closest(".media-section");
+    var sectionIndex = sections.indexOf(section);
+    if (direction === "up" && sectionIndex === 0) {
+      return focusAndReveal(document.querySelector(".hero .primary-button"), "nearest", "nearest");
+    }
+    var targetIndex = direction === "up" ? sectionIndex - 1 : sectionIndex + 1;
+    if (targetIndex < 0 || targetIndex >= sections.length) return true;
+    var currentRect = current.getBoundingClientRect();
+    var targetRail = sections[targetIndex].querySelector(".media-row");
+    var target = targetRail && closestCardAtScreenX(targetRail, currentRect.left + currentRect.width / 2);
+    return focusAndReveal(target, "center", "center");
+  }
+
+  function gridRows(grid) {
+    var rows = [];
+    Array.from(grid.querySelectorAll(".media-card")).forEach(function (card) {
+      var top = card.offsetTop;
+      var row = rows.find(function (candidate) { return Math.abs(candidate.top - top) < 4; });
+      if (!row) {
+        row = { top: top, cards: [] };
+        rows.push(row);
+      }
+      row.cards.push(card);
+    });
+    rows.sort(function (left, right) { return left.top - right.top; });
+    return rows;
+  }
+
+  function moveGridFocus(current, direction) {
+    var grid = current.closest(".media-grid");
+    if (!grid) return false;
+    var rows = gridRows(grid);
+    var rowIndex = rows.findIndex(function (row) { return row.cards.indexOf(current) >= 0; });
+    if (rowIndex < 0) return false;
+    var row = rows[rowIndex];
+    var column = row.cards.indexOf(current);
+    if (direction === "left" || direction === "right") {
+      var horizontal = direction === "left" ? column - 1 : column + 1;
+      if (horizontal >= 0 && horizontal < row.cards.length) {
+        return focusAndReveal(row.cards[horizontal], "nearest", "center");
+      }
+      return true;
+    }
+    if (direction === "up" && rowIndex === 0) {
+      return focusAndReveal(activeHeaderTarget());
+    }
+    var targetRowIndex = direction === "up" ? rowIndex - 1 : rowIndex + 1;
+    if (targetRowIndex < 0 || targetRowIndex >= rows.length) return true;
+    var currentRect = current.getBoundingClientRect();
+    var target = rows[targetRowIndex].cards.reduce(function (best, card) {
+      if (!best) return card;
+      var targetX = currentRect.left + currentRect.width / 2;
+      var bestRect = best.getBoundingClientRect();
+      var cardRect = card.getBoundingClientRect();
+      return Math.abs(cardRect.left + cardRect.width / 2 - targetX)
+        < Math.abs(bestRect.left + bestRect.width / 2 - targetX) ? card : best;
+    }, null);
+    return focusAndReveal(target, "center", "center");
+  }
+
+  function moveEpisodeFocus(current, direction) {
+    if (direction !== "up" && direction !== "down") return false;
+    var cards = Array.from(current.closest(".episodes-list").querySelectorAll(".episode-card"));
+    var index = cards.indexOf(current);
+    if (direction === "up" && index === 0) {
+      return focusAndReveal(ui.detailsDialog.querySelector(".season-select, .primary-button"), "nearest", "nearest");
+    }
+    var target = direction === "up" ? index - 1 : index + 1;
+    if (target < 0 || target >= cards.length) return true;
+    return focusAndReveal(cards[target], "center", "nearest");
+  }
+
+  function spatialFocus(current, direction) {
     var candidates = visibleFocusable();
-    if (!candidates.length) return;
-    if (!current || candidates.indexOf(current) < 0) {
-      candidates[0].focus();
-      return;
-    }
+    if (!candidates.length) return false;
+    if (!current || candidates.indexOf(current) < 0) return focusAndReveal(candidates[0]);
     var origin = current.getBoundingClientRect();
     var ox = origin.left + origin.width / 2;
     var oy = origin.top + origin.height / 2;
@@ -866,13 +1044,31 @@
         best = candidate;
       }
     });
-    if (best) {
-      best.focus();
-      best.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+    return focusAndReveal(best);
+  }
+
+  function moveFocus(direction) {
+    var current = document.activeElement;
+    if (current && current.closest && current.closest(".site-header")) return moveHeaderFocus(current, direction);
+    if (current && current.classList && current.classList.contains("media-card")) {
+      if (current.closest(".media-row")) return moveRailFocus(current, direction);
+      if (current.closest(".media-grid")) return moveGridFocus(current, direction);
     }
+    if (current && current.classList && current.classList.contains("episode-card")) {
+      if (moveEpisodeFocus(current, direction)) return true;
+    }
+    if (current && current.closest && current.closest(".hero")) {
+      if (direction === "up") return focusAndReveal(activeHeaderTarget());
+      if (direction === "down") return focusAndReveal(document.querySelector(".media-row .media-card"), "center", "center");
+    }
+    return spatialFocus(current, direction);
   }
 
   function backAction() {
+    if (state.textEntry) {
+      finishTextEntry();
+      return true;
+    }
     if (state.player) {
       closePlayer();
       return true;
@@ -908,11 +1104,38 @@
     if (direction === "right") postPlayerCommand("seek-relative", { offsetSeconds: 10 });
   }
 
+  function isTextEntryTarget(target) {
+    return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+  }
+
+  function beginTextEntry(target) {
+    if (!isTextEntryTarget(target)) return false;
+    state.textEntry = target;
+    target.focus();
+    if (typeof target.setSelectionRange === "function") {
+      var end = target.value.length;
+      target.setSelectionRange(end, end);
+    }
+    target.click();
+    nativeUi("showKeyboard");
+    return true;
+  }
+
+  function finishTextEntry() {
+    state.textEntry = null;
+    nativeUi("hideKeyboard");
+  }
+
   function adjustTextCaret(target, direction) {
-    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return false;
+    if (!isTextEntryTarget(target) || state.textEntry !== target) return false;
     if (direction !== "left" && direction !== "right") return false;
     var start = Number(target.selectionStart || 0);
     var end = Number(target.selectionEnd || start);
+    if ((direction === "left" && start === 0 && end === 0)
+        || (direction === "right" && start === target.value.length && end === target.value.length)) {
+      finishTextEntry();
+      return false;
+    }
     var next = direction === "left" ? Math.max(0, start - 1) : Math.min(target.value.length, end + 1);
     target.setSelectionRange(next, next);
     return true;
@@ -934,8 +1157,10 @@
     var direction = { left: "left", right: "right", up: "up", down: "down" }[action];
     if (direction) {
       var target = document.activeElement;
-      if (state.player && (direction === "left" || direction === "right")) {
-        playerDirectional(direction);
+      if (state.player) {
+        if (!nativePlayerKey(direction) && (direction === "left" || direction === "right")) {
+          playerDirectional(direction);
+        }
       } else if (!adjustTextCaret(target, direction) && !adjustSelect(target, direction)) {
         moveFocus(direction);
       }
@@ -943,10 +1168,11 @@
     }
     if (action === "select") {
       if (state.player) {
-        postPlayerCommand("toggle");
+        if (!nativePlayerKey("select")) postPlayerCommand("toggle");
         return true;
       }
       var active = document.activeElement;
+      if (beginTextEntry(active)) return true;
       if (active && typeof active.click === "function") active.click();
       else focusFirst();
       return true;
@@ -958,23 +1184,23 @@
       return true;
     }
     if (action === "play-pause" && state.player) {
-      postPlayerCommand("toggle");
+      if (!nativePlayerKey("play-pause")) postPlayerCommand("toggle");
       return true;
     }
     if ((action === "play" || action === "pause") && state.player) {
-      postPlayerCommand(action);
+      if (!nativePlayerKey(action)) postPlayerCommand(action);
       return true;
     }
     if (action === "rewind" && state.player) {
-      playerDirectional("left");
+      if (!nativePlayerKey("rewind")) playerDirectional("left");
       return true;
     }
     if (action === "fast-forward" && state.player) {
-      playerDirectional("right");
+      if (!nativePlayerKey("fast-forward")) playerDirectional("right");
       return true;
     }
     if (action === "stop" && state.player) {
-      closePlayer();
+      if (!nativePlayerKey("stop")) closePlayer();
       return true;
     }
     return false;
@@ -1046,7 +1272,11 @@
         else moveFocus(direction);
       }
     });
-    window.requestAnimationFrame(pollGamepads);
+    state.gamepadFrame = gamepads.length ? window.requestAnimationFrame(pollGamepads) : 0;
+  }
+
+  function startGamepadPolling() {
+    if (!state.gamepadFrame) state.gamepadFrame = window.requestAnimationFrame(pollGamepads);
   }
 
   async function bootstrap() {
@@ -1081,6 +1311,7 @@
     });
     ui.searchForm.addEventListener("submit", function (event) {
       event.preventDefault();
+      finishTextEntry();
       renderSearch(ui.searchInput.value);
     });
     ui.profileButton.addEventListener("click", function () { renderProfiles(false, true); });
@@ -1088,6 +1319,16 @@
     ui.detailsClose.addEventListener("click", closeDetails);
     ui.settingsClose.addEventListener("click", closeSettings);
     ui.playerClose.addEventListener("click", closePlayer);
+    ui.playerFrame.addEventListener("load", function () {
+      var player = state.player;
+      if (!player || !player.isVideasy || player.autoStartRequested) return;
+      player.autoStartRequested = true;
+      player.autoStartTimer = window.setTimeout(function () {
+        if (state.player !== player) return;
+        ui.playerFrame.focus();
+        nativeUi("requestPlayerAutostart");
+      }, 2200);
+    });
     ui.playerFullscreen.addEventListener("click", function () {
       var target = ui.playerOverlay;
       if (document.fullscreenElement) document.exitFullscreen();
@@ -1109,6 +1350,7 @@
     });
     ui.settingsForm.addEventListener("submit", async function (event) {
       event.preventDefault();
+      finishTextEntry();
       var token = ui.settingsToken.value.trim();
       ui.settingsMessage.textContent = "Validating with TMDB…";
       ui.settingsMessage.classList.remove("success");
@@ -1127,6 +1369,11 @@
         ui.settingsMessage.textContent = error.message;
       }
     });
+    [ui.searchInput, ui.settingsToken].forEach(function (input) {
+      input.addEventListener("blur", function () {
+        if (state.textEntry === input) state.textEntry = null;
+      });
+    });
 
     window.addEventListener("message", function (event) {
       if (!state.player || state.player.trailer) return;
@@ -1135,6 +1382,10 @@
       if (!progress || !(progress.position >= 0) || !(progress.duration > 0)) return;
       state.player.position = progress.position;
       state.player.duration = progress.duration;
+      if (progress.position > 0) {
+        window.clearTimeout(state.player.autoStartTimer);
+        state.player.autoStartTimer = 0;
+      }
       savePlayerProgress(false);
     });
     document.addEventListener("visibilitychange", function () {
@@ -1143,9 +1394,12 @@
     window.addEventListener("gamepadconnected", function (event) {
       showToast("Controller connected: " + (event.gamepad.id || "Gamepad"));
       focusFirst();
+      startGamepadPolling();
     });
     setupKeyboard();
-    window.requestAnimationFrame(pollGamepads);
+    if (navigator.getGamepads && Array.from(navigator.getGamepads()).some(Boolean)) {
+      startGamepadPolling();
+    }
 
     loadingPage("Starting PiStick…", false);
     try {

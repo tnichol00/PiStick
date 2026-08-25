@@ -300,9 +300,13 @@ final class PiStickApi implements AutoCloseable {
         return value;
     }
 
-    private String playbackUrl(String path, double resumeSeconds) {
+    static String playbackUrl(String path, double resumeSeconds) {
         int seconds = Math.max(0, (int) resumeSeconds);
-        return "https://player.videasy.to" + path + (seconds > 0 ? "?progress=" + seconds : "");
+        StringBuilder url = new StringBuilder("https://player.videasy.to").append(path);
+        url.append("?autoplay=true");
+        if (path.startsWith("/tv/")) url.append("&autoplayNextEpisode=true");
+        if (seconds > 0) url.append("&progress=").append(seconds);
+        return url.toString();
     }
 
     private static boolean matches(List<String> parts, String... expected) {

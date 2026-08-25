@@ -209,7 +209,7 @@ final class TmdbClient implements AutoCloseable {
         }
         JSONObject payload = request(
                 "/" + mediaType + "/" + id,
-                parameters("append_to_response", "videos,credits"),
+                parameters("append_to_response", "videos"),
                 null,
                 DETAIL_CACHE_MILLIS
         );
@@ -231,7 +231,9 @@ final class TmdbClient implements AutoCloseable {
         JSONArray candidates = payload.optJSONArray("episodes");
         if (candidates != null) {
             for (int index = 0; index < candidates.length(); index++) {
-                JSONObject episode = JsonUtils.copy(candidates.optJSONObject(index));
+                JSONObject episode = JsonUtils.selected(candidates.optJSONObject(index),
+                        "id", "name", "overview", "air_date", "still_path", "runtime",
+                        "season_number", "episode_number");
                 int number = episode.optInt("episode_number", 0);
                 if (number <= 0) continue;
                 JsonUtils.put(episode, "season_number", episode.optInt("season_number", seasonNumber));
@@ -262,7 +264,7 @@ final class TmdbClient implements AutoCloseable {
             JSONObject item = normalize(candidates.optJSONObject(index), mediaType);
             String kind = item.optString("media_type", "");
             if (("movie".equals(kind) || "tv".equals(kind)) && item.optInt("id", 0) > 0) {
-                result.put(item);
+                result.put(listItem(item));
             }
         }
         return result;
@@ -282,6 +284,12 @@ final class TmdbClient implements AutoCloseable {
         if (date.isEmpty()) date = result.optString("first_air_date", "");
         JsonUtils.put(result, "year", date.length() >= 4 ? date.substring(0, 4) : "");
         return result;
+    }
+
+    private JSONObject listItem(JSONObject item) {
+        return JsonUtils.selected(item,
+                "id", "media_type", "title", "name", "year", "release_date", "first_air_date",
+                "poster_path", "backdrop_path", "overview", "vote_average");
     }
 
     private JSONObject request(

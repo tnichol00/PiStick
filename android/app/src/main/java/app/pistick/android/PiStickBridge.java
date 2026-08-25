@@ -1,6 +1,5 @@
 package app.pistick.android;
 
-import android.app.Activity;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
@@ -19,7 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class PiStickBridge implements AutoCloseable {
     private static final int MAX_MESSAGE_LENGTH = 256 * 1024;
 
-    private final Activity activity;
+    private final MainActivity activity;
     private final WebView webView;
     private final String secret;
     private final PiStickApi api;
@@ -31,7 +30,7 @@ final class PiStickBridge implements AutoCloseable {
     });
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    PiStickBridge(Activity activity, WebView webView, String secret) {
+    PiStickBridge(MainActivity activity, WebView webView, String secret) {
         this.activity = activity;
         this.webView = webView;
         this.secret = secret;
@@ -65,6 +64,30 @@ final class PiStickBridge implements AutoCloseable {
                 respond(requestId, false, payload);
             }
         });
+    }
+
+    @JavascriptInterface
+    public void showKeyboard(String candidateSecret) {
+        if (closed.get() || !validSecret(candidateSecret)) return;
+        mainHandler.post(activity::showSoftKeyboard);
+    }
+
+    @JavascriptInterface
+    public void hideKeyboard(String candidateSecret) {
+        if (closed.get() || !validSecret(candidateSecret)) return;
+        mainHandler.post(activity::hideSoftKeyboard);
+    }
+
+    @JavascriptInterface
+    public void requestPlayerAutostart(String candidateSecret) {
+        if (closed.get() || !validSecret(candidateSecret)) return;
+        mainHandler.post(activity::requestPlayerAutostart);
+    }
+
+    @JavascriptInterface
+    public void sendPlayerKey(String candidateSecret, String action) {
+        if (closed.get() || !validSecret(candidateSecret)) return;
+        mainHandler.post(() -> activity.sendPlayerKey(action));
     }
 
     private boolean validSecret(String candidate) {

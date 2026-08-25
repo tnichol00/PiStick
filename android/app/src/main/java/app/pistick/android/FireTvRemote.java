@@ -58,4 +58,20 @@ final class FireTvRemote {
     static boolean isRepeatable(String action) {
         return UP.equals(action) || DOWN.equals(action) || LEFT.equals(action) || RIGHT.equals(action);
     }
+
+    static int keyCodeForAction(String action) {
+        if (UP.equals(action)) return KeyEvent.KEYCODE_DPAD_UP;
+        if (DOWN.equals(action)) return KeyEvent.KEYCODE_DPAD_DOWN;
+        if (LEFT.equals(action)) return KeyEvent.KEYCODE_DPAD_LEFT;
+        if (RIGHT.equals(action)) return KeyEvent.KEYCODE_DPAD_RIGHT;
+        if (SELECT.equals(action)) return KeyEvent.KEYCODE_DPAD_CENTER;
+        if (PLAY_PAUSE.equals(action)) return KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE;
+        if (PLAY.equals(action)) return KeyEvent.KEYCODE_MEDIA_PLAY;
+        if (PAUSE.equals(action)) return KeyEvent.KEYCODE_MEDIA_PAUSE;
+        if (REWIND.equals(action)) return KeyEvent.KEYCODE_MEDIA_REWIND;
+        if (FAST_FORWARD.equals(action)) return KeyEvent.KEYCODE_MEDIA_FAST_FORWARD;
+        if (MENU.equals(action)) return KeyEvent.KEYCODE_MENU;
+        if (STOP.equals(action)) return KeyEvent.KEYCODE_MEDIA_STOP;
+        return KeyEvent.KEYCODE_UNKNOWN;
+    }
 }

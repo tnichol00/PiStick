@@ -33,4 +33,16 @@ public final class FireTvRemoteTest {
         assertFalse(FireTvRemote.isRepeatable(FireTvRemote.SELECT));
         assertFalse(FireTvRemote.isRepeatable(FireTvRemote.PLAY_PAUSE));
     }
+
+    @Test
+    public void convertsPlayerActionsBackToNativeKeys() {
+        assertEquals(KeyEvent.KEYCODE_DPAD_RIGHT,
+                FireTvRemote.keyCodeForAction(FireTvRemote.RIGHT));
+        assertEquals(KeyEvent.KEYCODE_DPAD_CENTER,
+                FireTvRemote.keyCodeForAction(FireTvRemote.SELECT));
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                FireTvRemote.keyCodeForAction(FireTvRemote.PLAY_PAUSE));
+        assertEquals(KeyEvent.KEYCODE_UNKNOWN,
+                FireTvRemote.keyCodeForAction("invalid"));
+    }
 }
