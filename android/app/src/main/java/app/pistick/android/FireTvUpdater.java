@@ -1,5 +1,6 @@
 package app.pistick.android;
 
+import android.annotation.SuppressLint;
 import android.app.DownloadManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -60,6 +61,7 @@ final class FireTvUpdater implements AutoCloseable {
     private File pendingFile;
     private boolean waitingForInstallPermission;
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     FireTvUpdater(MainActivity activity) {
         this.activity = activity;
         this.downloads = (DownloadManager) activity.getSystemService(Context.DOWNLOAD_SERVICE);
