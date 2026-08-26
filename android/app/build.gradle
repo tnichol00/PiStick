@@ -2,6 +2,17 @@ plugins {
     id "com.android.application"
 }
 
+def fireTvKeystorePath = System.getenv("FIRETV_KEYSTORE_PATH")
+def fireTvKeystorePassword = System.getenv("FIRETV_KEYSTORE_PASSWORD")
+def fireTvKeyAlias = System.getenv("FIRETV_KEY_ALIAS")
+def fireTvKeyPassword = System.getenv("FIRETV_KEY_PASSWORD")
+def fireTvReleaseSigningConfigured = [
+        fireTvKeystorePath,
+        fireTvKeystorePassword,
+        fireTvKeyAlias,
+        fireTvKeyPassword
+].every { value -> value != null && !value.trim().isEmpty() }
+
 android {
     namespace "app.pistick.android"
     compileSdk 36
@@ -10,14 +21,25 @@ android {
         applicationId "app.pistick.firetv"
         minSdk 25
         targetSdk 36
-        versionCode 2
-        versionName "1.0.1-firetv"
+        versionCode 3
+        versionName "1.0.2-firetv"
 
         testInstrumentationRunner "android.test.InstrumentationTestRunner"
     }
 
     buildFeatures {
         buildConfig true
+    }
+
+    signingConfigs {
+        if (fireTvReleaseSigningConfigured) {
+            fireTvRelease {
+                storeFile file(fireTvKeystorePath)
+                storePassword fireTvKeystorePassword
+                keyAlias fireTvKeyAlias
+                keyPassword fireTvKeyPassword
+            }
+        }
     }
 
     buildTypes {
@@ -28,6 +50,9 @@ android {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            if (fireTvReleaseSigningConfigured) {
+                signingConfig signingConfigs.fireTvRelease
+            }
         }
     }
 
@@ -38,6 +63,14 @@ android {
 
     testOptions {
         unitTests.returnDefaultValues = true
+    }
+}
+
+tasks.register("verifyFireTvReleaseSigning") {
+    doLast {
+        if (!fireTvReleaseSigningConfigured) {
+            throw new GradleException("The four FIRETV release-signing environment variables are required.")
+        }
     }
 }
 

@@ -7,7 +7,12 @@ build_file="$project_root/app/build.gradle"
 source_root="$project_root/app/src/main"
 remote_source="$source_root/java/app/pistick/android/FireTvRemote.java"
 activity_source="$source_root/java/app/pistick/android/MainActivity.java"
+bridge_source="$source_root/java/app/pistick/android/PiStickBridge.java"
+release_source="$source_root/java/app/pistick/android/FireTvRelease.java"
+updater_source="$source_root/java/app/pistick/android/FireTvUpdater.java"
 web_app="$source_root/assets/web/app.js"
+web_index="$source_root/assets/web/index.html"
+web_styles="$source_root/assets/web/styles.css"
 
 require_text() {
   local file="$1"
@@ -19,6 +24,7 @@ require_text() {
 }
 
 require_text "$manifest" 'android.intent.category.LEANBACK_LAUNCHER'
+require_text "$manifest" 'android.permission.REQUEST_INSTALL_PACKAGES'
 require_text "$manifest" 'android:banner="@drawable/pistick_tv_banner"'
 require_text "$manifest" 'android.hardware.touchscreen" android:required="false"'
 require_text "$manifest" 'android.hardware.faketouch" android:required="false"'
@@ -31,11 +37,25 @@ require_text "$build_file" 'targetSdk 36'
 require_text "$remote_source" 'KEYCODE_DPAD_CENTER'
 require_text "$remote_source" 'KEYCODE_MEDIA_PLAY_PAUSE'
 require_text "$remote_source" 'KEYCODE_MEDIA_FAST_FORWARD'
+require_text "$remote_source" 'LONG_SEEK_SECONDS = 5 * 60'
+require_text "$remote_source" 'SEEK_STEP_SECONDS = 10'
 require_text "$activity_source" 'window.PiStickFireTV'
 require_text "$activity_source" 'APP_ORIGIN = "https://" + APP_HOST'
 require_text "$activity_source" 'shouldInterceptRequest'
 require_text "$activity_source" 'showSoftKeyboard()'
 require_text "$activity_source" 'requestPlayerAutostart()'
+require_text "$activity_source" 'void seekPlayer(int offsetSeconds)'
+require_text "$activity_source" 'dispatchFullscreenPlayerEvent(event, action)'
+require_text "$activity_source" 'seekCustomView(-FireTvRemote.LONG_SEEK_SECONDS)'
+require_text "$activity_source" 'seekCustomView(FireTvRemote.LONG_SEEK_SECONDS)'
+require_text "$activity_source" 'new FireTvUpdater(this)'
+require_text "$bridge_source" 'public void checkForUpdates(String candidateSecret)'
+require_text "$bridge_source" 'public void seekPlayer(String candidateSecret, int offsetSeconds)'
+require_text "$release_source" 'PiStick-Fire-TV-v([1-9][0-9]*)'
+require_text "$release_source" '"https".equalsIgnoreCase(uri.getScheme())'
+require_text "$updater_source" 'api.github.com/repos/tnichol00/PiStick/releases'
+require_text "$updater_source" 'canRequestPackageInstalls()'
+require_text "$updater_source" '!installedSigners.equals(archiveSigners)'
 require_text "$web_app" 'window.PiStickFireTV'
 require_text "$web_app" 'focusRoot()'
 require_text "$web_app" 'moveRailFocus(current, direction)'
@@ -43,6 +63,12 @@ require_text "$web_app" 'nativeUi("showKeyboard")'
 require_text "$web_app" 'nativeUi("requestPlayerAutostart")'
 require_text "$web_app" 'enablejsapi=1&playsinline=1&origin='
 require_text "$web_app" 'FIRE_TV ? "w342" : "w500"'
+require_text "$web_app" 'nativePlayerSeek(-300)'
+require_text "$web_app" 'nativePlayerSeek(300)'
+require_text "$web_index" 'id="update-button"'
+require_text "$web_styles" '.fire-tv .player-toolbar,'
+require_text "$web_styles" 'width: 100vw;'
+require_text "$web_styles" 'height: 100vh;'
 
 if grep --recursive --extended-regexp --quiet 'java\.nio\.file' "$source_root/java"; then
   echo "API 26-only java.nio.file usage prevents Fire OS 6 support." >&2
@@ -81,4 +107,4 @@ if [[ $# -gt 0 ]]; then
   unzip -tq "$apk"
 fi
 
-echo "Fire TV checks passed: TV launcher, remote controls, API 25 compatibility, bundled UI, and no web server."
+echo "Fire TV checks passed: fullscreen playback, exact remote controls, verified updates, API 25 compatibility, bundled UI, and no web server."

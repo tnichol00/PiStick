@@ -44,5 +44,18 @@ public final class FireTvRemoteTest {
                 FireTvRemote.keyCodeForAction(FireTvRemote.PLAY_PAUSE));
         assertEquals(KeyEvent.KEYCODE_UNKNOWN,
                 FireTvRemote.keyCodeForAction("invalid"));
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                FireTvRemote.playerKeyCodeForAction(FireTvRemote.SELECT));
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                FireTvRemote.playerKeyCodeForAction(FireTvRemote.PLAY_PAUSE));
+    }
+
+    @Test
+    public void convertsExactSeekDurationsToTenSecondPlayerSteps() {
+        assertEquals(1, FireTvRemote.seekPressCount(10));
+        assertEquals(1, FireTvRemote.seekPressCount(-10));
+        assertEquals(30, FireTvRemote.seekPressCount(5 * 60));
+        assertEquals(30, FireTvRemote.seekPressCount(-5 * 60));
+        assertEquals(0, FireTvRemote.seekPressCount(0));
     }
 }

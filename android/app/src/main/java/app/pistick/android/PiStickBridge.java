@@ -90,6 +90,22 @@ final class PiStickBridge implements AutoCloseable {
         mainHandler.post(() -> activity.sendPlayerKey(action));
     }
 
+    @JavascriptInterface
+    public void seekPlayer(String candidateSecret, int offsetSeconds) {
+        if (closed.get() || !validSecret(candidateSecret)) return;
+        if (offsetSeconds != -FireTvRemote.LONG_SEEK_SECONDS
+                && offsetSeconds != -FireTvRemote.SEEK_STEP_SECONDS
+                && offsetSeconds != FireTvRemote.SEEK_STEP_SECONDS
+                && offsetSeconds != FireTvRemote.LONG_SEEK_SECONDS) return;
+        mainHandler.post(() -> activity.seekPlayer(offsetSeconds));
+    }
+
+    @JavascriptInterface
+    public void checkForUpdates(String candidateSecret) {
+        if (closed.get() || !validSecret(candidateSecret)) return;
+        mainHandler.post(activity::checkForUpdates);
+    }
+
     private boolean validSecret(String candidate) {
         return MessageDigest.isEqual(
                 secret.getBytes(StandardCharsets.UTF_8),

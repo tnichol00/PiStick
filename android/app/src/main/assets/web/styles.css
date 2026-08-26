@@ -137,6 +137,8 @@ textarea::placeholder { color: #85858d; }
   font-size: 18px;
 }
 
+.update-button.working { color: var(--red-2); }
+
 #app { min-height: calc(100vh - var(--header-height)); outline: none; }
 
 .page {
@@ -643,8 +645,18 @@ html.fire-tv {
 .fire-tv .main-nav { display: flex; }
 .fire-tv .search-form { width: min(330px, 24vw); margin-left: auto; }
 .fire-tv .icon-button { display: grid; }
-.fire-tv .player-fullscreen { display: inline-flex; }
-.fire-tv .controller-hint { display: block; padding: 10px 5vw 14px; font-size: 14px; }
+.fire-tv .player-overlay {
+  display: block;
+  background: #000;
+}
+.fire-tv .player-toolbar,
+.fire-tv .controller-hint { display: none; }
+.fire-tv .player-frame-wrap {
+  position: absolute;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+}
 
 .fire-tv .page,
 .fire-tv .content-rows,

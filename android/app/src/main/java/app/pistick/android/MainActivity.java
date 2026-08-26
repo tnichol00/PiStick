@@ -28,6 +28,8 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
+import org.json.JSONObject;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -45,6 +47,7 @@ public final class MainActivity extends Activity {
     private FrameLayout root;
     private WebView webView;
     private PiStickBridge bridge;
+    private FireTvUpdater updater;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
     private final AtomicBoolean backPending = new AtomicBoolean(false);
@@ -60,6 +63,7 @@ public final class MainActivity extends Activity {
         root = new FrameLayout(this);
         root.setBackgroundColor(BACKGROUND);
         setContentView(root);
+        updater = new FireTvUpdater(this);
         createWebView();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -181,9 +185,7 @@ public final class MainActivity extends Activity {
     public boolean dispatchKeyEvent(KeyEvent event) {
         String action = FireTvRemote.actionForKeyCode(event.getKeyCode());
         if (action == null) return super.dispatchKeyEvent(event);
-        if (customView != null && !FireTvRemote.BACK.equals(action)) {
-            return super.dispatchKeyEvent(event);
-        }
+        if (customView != null) return dispatchFullscreenPlayerEvent(event, action);
 
         if (event.getAction() == KeyEvent.ACTION_UP) {
             if (FireTvRemote.BACK.equals(action)) handleBack();
@@ -193,6 +195,36 @@ public final class MainActivity extends Activity {
         if (FireTvRemote.BACK.equals(action)) return true;
         if (event.getRepeatCount() > 0 && !FireTvRemote.isRepeatable(action)) return true;
         dispatchRemoteAction(action);
+        return true;
+    }
+
+    private boolean dispatchFullscreenPlayerEvent(KeyEvent event, String action) {
+        if (event.getAction() == KeyEvent.ACTION_UP) {
+            if (FireTvRemote.BACK.equals(action)) hideCustomView();
+            return true;
+        }
+        if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
+        if (FireTvRemote.BACK.equals(action)) return true;
+        if (event.getRepeatCount() > 0 && !FireTvRemote.isRepeatable(action)) return true;
+        if (FireTvRemote.LEFT.equals(action)) {
+            seekCustomView(-FireTvRemote.SEEK_STEP_SECONDS);
+            return true;
+        }
+        if (FireTvRemote.RIGHT.equals(action)) {
+            seekCustomView(FireTvRemote.SEEK_STEP_SECONDS);
+            return true;
+        }
+        if (FireTvRemote.REWIND.equals(action)) {
+            seekCustomView(-FireTvRemote.LONG_SEEK_SECONDS);
+            return true;
+        }
+        if (FireTvRemote.FAST_FORWARD.equals(action)) {
+            seekCustomView(FireTvRemote.LONG_SEEK_SECONDS);
+            return true;
+        }
+        View target = customView;
+        int keyCode = FireTvRemote.playerKeyCodeForAction(action);
+        if (target != null && keyCode != KeyEvent.KEYCODE_UNKNOWN) dispatchPlayerKey(target, keyCode);
         return true;
     }
 
@@ -264,10 +296,67 @@ public final class MainActivity extends Activity {
         current.post(() -> {
             if (webView != current || isFinishing() || isDestroyed()) return;
             current.requestFocus(View.FOCUS_DOWN);
-            long eventTime = SystemClock.uptimeMillis();
-            current.dispatchKeyEvent(new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_DOWN, keyCode, 0));
-            current.dispatchKeyEvent(new KeyEvent(eventTime, eventTime + 25, KeyEvent.ACTION_UP, keyCode, 0));
+            dispatchPlayerKey(current, keyCode);
         });
+    }
+
+    void seekPlayer(int offsetSeconds) {
+        WebView current = webView;
+        if (current == null || offsetSeconds == 0) return;
+        int keyCode = offsetSeconds < 0 ? KeyEvent.KEYCODE_DPAD_LEFT : KeyEvent.KEYCODE_DPAD_RIGHT;
+        int presses = FireTvRemote.seekPressCount(offsetSeconds);
+        for (int index = 0; index < presses; index++) {
+            current.postDelayed(() -> {
+                if (webView != current || isFinishing() || isDestroyed()) return;
+                current.requestFocus(View.FOCUS_DOWN);
+                dispatchPlayerKey(current, keyCode);
+            }, index * 20L);
+        }
+    }
+
+    void checkForUpdates() {
+        FireTvUpdater current = updater;
+        if (current != null) current.checkForUpdates();
+    }
+
+    void sendUpdateStatus(String status, String message, int versionCode) {
+        JSONObject payload = new JSONObject();
+        JsonUtils.put(payload, "status", status);
+        JsonUtils.put(payload, "message", message);
+        JsonUtils.put(payload, "version_code", versionCode);
+        String encoded = Base64.encodeToString(
+                payload.toString().getBytes(StandardCharsets.UTF_8),
+                Base64.NO_WRAP
+        );
+        WebView current = webView;
+        if (current == null) return;
+        current.post(() -> {
+            if (webView != current || isFinishing() || isDestroyed()) return;
+            current.evaluateJavascript(
+                    "window.PiStickFireTV&&window.PiStickFireTV.update(\"" + encoded + "\");",
+                    null
+            );
+        });
+    }
+
+    private void seekCustomView(int offsetSeconds) {
+        View target = customView;
+        if (target == null || offsetSeconds == 0) return;
+        int keyCode = offsetSeconds < 0 ? KeyEvent.KEYCODE_DPAD_LEFT : KeyEvent.KEYCODE_DPAD_RIGHT;
+        int presses = FireTvRemote.seekPressCount(offsetSeconds);
+        for (int index = 0; index < presses; index++) {
+            root.postDelayed(() -> {
+                if (customView != target || isFinishing() || isDestroyed()) return;
+                target.requestFocus(View.FOCUS_DOWN);
+                dispatchPlayerKey(target, keyCode);
+            }, index * 20L);
+        }
+    }
+
+    private void dispatchPlayerKey(View target, int keyCode) {
+        long eventTime = SystemClock.uptimeMillis();
+        target.dispatchKeyEvent(new KeyEvent(eventTime, eventTime, KeyEvent.ACTION_DOWN, keyCode, 0));
+        target.dispatchKeyEvent(new KeyEvent(eventTime, eventTime + 8, KeyEvent.ACTION_UP, keyCode, 0));
     }
 
     @Override
@@ -281,6 +370,7 @@ public final class MainActivity extends Activity {
         super.onResume();
         hideSystemUi();
         if (webView != null) webView.onResume();
+        if (updater != null) updater.onResume();
     }
 
     @Override
@@ -292,6 +382,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         hideCustomView();
+        FireTvUpdater oldUpdater = updater;
+        updater = null;
+        if (oldUpdater != null) oldUpdater.close();
         destroyWebView();
         super.onDestroy();
     }

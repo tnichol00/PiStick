@@ -3,6 +3,8 @@ package app.pistick.android;
 import android.view.KeyEvent;
 
 final class FireTvRemote {
+    static final int SEEK_STEP_SECONDS = 10;
+    static final int LONG_SEEK_SECONDS = 5 * 60;
     static final String UP = "up";
     static final String DOWN = "down";
     static final String LEFT = "left";
@@ -59,6 +61,12 @@ final class FireTvRemote {
         return UP.equals(action) || DOWN.equals(action) || LEFT.equals(action) || RIGHT.equals(action);
     }
 
+    static int seekPressCount(int offsetSeconds) {
+        int seconds = Math.abs(offsetSeconds);
+        if (seconds == 0) return 0;
+        return Math.max(1, (seconds + SEEK_STEP_SECONDS - 1) / SEEK_STEP_SECONDS);
+    }
+
     static int keyCodeForAction(String action) {
         if (UP.equals(action)) return KeyEvent.KEYCODE_DPAD_UP;
         if (DOWN.equals(action)) return KeyEvent.KEYCODE_DPAD_DOWN;
@@ -73,5 +81,10 @@ final class FireTvRemote {
         if (MENU.equals(action)) return KeyEvent.KEYCODE_MENU;
         if (STOP.equals(action)) return KeyEvent.KEYCODE_MEDIA_STOP;
         return KeyEvent.KEYCODE_UNKNOWN;
+    }
+
+    static int playerKeyCodeForAction(String action) {
+        if (SELECT.equals(action)) return KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE;
+        return keyCodeForAction(action);
     }
 }

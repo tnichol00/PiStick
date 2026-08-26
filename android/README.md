@@ -33,3 +33,23 @@ adb shell monkey -p app.pistick.firetv -c android.intent.category.LEANBACK_LAUNC
 ```
 
 Replace `FIRE_TV_IP` with the address displayed by Fire TV and approve the debugging prompt on the television.
+
+## Publish an updateable release
+
+Fire TV releases must always use one permanent Android signing key. Configure these GitHub Actions repository secrets:
+
+- `FIRETV_KEYSTORE_BASE64`: the base64-encoded JKS file
+- `FIRETV_KEYSTORE_PASSWORD`: the keystore password
+- `FIRETV_KEY_ALIAS`: the key alias
+- `FIRETV_KEY_PASSWORD`: the key password
+
+Increase `versionCode` and `versionName` in `app/build.gradle`, commit the change to `firetv`, and create a tag whose numeric suffix exactly equals the Android version code. For example, version code 3 uses:
+
+```bash
+git tag firetv-v3
+git push origin firetv-v3
+```
+
+The Fire TV Release workflow tests, lints, signs, verifies, and publishes `PiStick-Fire-TV-v3.apk`. The in-app updater only accepts stable release assets following that exact naming pattern, whose package name, version, SHA-256 digest, and signing certificate all pass verification.
+
+Do not replace or regenerate the signing key. Android will reject an in-place update signed by a different key. A device currently running a debug-signed APK needs one uninstall and reinstall of the first permanently signed release; later releases then update in place.

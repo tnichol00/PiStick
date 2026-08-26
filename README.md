@@ -11,14 +11,16 @@ PiStick Fire TV is a standalone native APK. It does not need a Raspberry Pi or P
 
 ## 1. Download the Fire TV APK
 
-To use the build made automatically from this branch:
+For the stable, updateable build, open [PiStick Releases](https://github.com/tnichol00/PiStick/releases) and download the newest file named `PiStick-Fire-TV-vNUMBER.apk`. Do not use a file whose name says Android phone.
+
+To test the newest development build from this branch instead:
 
 1. Open the [`firetv` branch Actions page](https://github.com/tnichol00/PiStick/actions/workflows/firetv-ci.yml?query=branch%3Afiretv).
 2. Open the newest successful **Fire TV CI** run.
 3. Under **Artifacts**, download **PiStick-Fire-TV-debug**.
 4. Unzip the download to get `PiStick-Fire-TV-debug.apk`.
 
-If a Fire TV APK has been added to [PiStick Releases](https://github.com/tnichol00/PiStick/releases), use that release APK instead. Do not use an APK whose name says Android phone.
+Development APKs are debug-signed and may not update over a stable release.
 
 ## 2. Enable Fire TV developer options
 
@@ -36,10 +38,10 @@ If a Fire TV APK has been added to [PiStick Releases](https://github.com/tnichol
 
 ```bash
 adb connect FIRE_TV_IP:5555
-adb install -r PiStick-Fire-TV-debug.apk
+adb install -r PiStick-Fire-TV-v3.apk
 ```
 
-Replace `FIRE_TV_IP` with the address shown by Fire TV. Accept the debugging prompt on the television. If `adb install -r` reports an incompatible signature, uninstall the existing PiStick Fire TV build and install again; uninstalling removes that installation's profiles and watch history.
+Replace `FIRE_TV_IP` with the address shown by Fire TV and replace the APK filename with the exact file you downloaded (`PiStick-Fire-TV-debug.apk` for a development build). Accept the debugging prompt on the television. If `adb install -r` reports an incompatible signature, uninstall the existing PiStick Fire TV build and install again; uninstalling removes that installation's profiles and watch history.
 
 ## 4. Open and set up PiStick
 
@@ -47,8 +49,12 @@ Replace `FIRE_TV_IP` with the address shown by Fire TV. Accept the debugging pro
 2. Enter either the long TMDB **API Read Access Token** or the shorter TMDB v3 API key.
 3. Select **Validate and save**, then choose or create a profile.
 
-Use the D-pad to move, **Select** to open or play/pause, **Back** to close a screen, and **Menu** to toggle subtitles during playback.
+During playback, PiStick fills the screen automatically. **Select** or **Play/Pause** toggles playback, **Left/Right** skips 10 seconds, **Rewind/Fast-forward** skips five minutes, **Back** closes playback, and **Menu** toggles subtitles.
 
 ## Update PiStick Fire TV
 
-Download the newer Fire TV APK and run the same `adb install -r` command. Android retains the app configuration when the package and signing key match.
+Select **Update App** beside the Settings icon. PiStick checks the stable GitHub releases for a newer Fire TV APK, downloads it, verifies its GitHub SHA-256 digest, package name, version, and signing certificate, and then opens Fire OS's installer. The first update may ask you to allow PiStick under **Install unknown apps**. Confirm **Install** on the Fire TV screen.
+
+Android replaces the old app code while retaining PiStick's configuration, profiles, and watch history. PiStick removes its obsolete downloaded update APKs the next time it starts.
+
+If the installed copy is an older debug-signed build, the first stable APK can report an incompatible signature. This transition requires one uninstall and reinstall; uninstalling removes that installation's TMDB credential, profiles, and watch history. Stable releases signed with the same permanent key can update in place afterward.

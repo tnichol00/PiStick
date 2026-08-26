@@ -46,6 +46,54 @@
     }
   }
 
+  function nativePlayerSeek(offsetSeconds) {
+    if (!window.PiStickAndroid || typeof window.PiStickAndroid.seekPlayer !== "function") return false;
+    try {
+      window.PiStickAndroid.seekPlayer(
+        String(window.__PISTICK_ANDROID_SECRET__ || ""),
+        Number(offsetSeconds || 0)
+      );
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function checkForUpdates() {
+    if (!FIRE_TV || !window.PiStickAndroid
+        || typeof window.PiStickAndroid.checkForUpdates !== "function") {
+      showToast("Updates are only available in the PiStick Fire TV app.");
+      return;
+    }
+    ui.updateButton.disabled = true;
+    ui.updateButton.classList.add("working");
+    ui.updateButton.textContent = "Checking…";
+    showToast("Checking GitHub for a Fire TV update…");
+    try {
+      window.PiStickAndroid.checkForUpdates(String(window.__PISTICK_ANDROID_SECRET__ || ""));
+    } catch (error) {
+      finishUpdateButton();
+      showToast("PiStick could not start the update check.");
+    }
+  }
+
+  function finishUpdateButton() {
+    if (!ui.updateButton) return;
+    ui.updateButton.disabled = false;
+    ui.updateButton.classList.remove("working");
+    ui.updateButton.textContent = "Update App";
+  }
+
+  function handleUpdateStatus(encoded) {
+    var payload;
+    try { payload = decodeBase64JSON(String(encoded || "")); }
+    catch (error) { payload = { status: "error", message: "PiStick received an invalid update response." }; }
+    var status = String(payload.status || "error");
+    if (status === "current" || status === "error" || status === "installing") finishUpdateButton();
+    showToast(String(payload.message || "PiStick update status changed."));
+    return true;
+  }
+
   function decodeBase64JSON(encoded) {
     var bytes = Uint8Array.from(window.atob(encoded), function (character) {
       return character.charCodeAt(0);
@@ -1100,8 +1148,9 @@
   }
 
   function playerDirectional(direction) {
-    if (direction === "left") postPlayerCommand("seek-relative", { offsetSeconds: -10 });
-    if (direction === "right") postPlayerCommand("seek-relative", { offsetSeconds: 10 });
+    var seconds = direction === "left" ? -10 : (direction === "right" ? 10 : 0);
+    if (!seconds) return;
+    if (!nativePlayerSeek(seconds)) postPlayerCommand("seek-relative", { offsetSeconds: seconds });
   }
 
   function isTextEntryTarget(target) {
@@ -1158,9 +1207,8 @@
     if (direction) {
       var target = document.activeElement;
       if (state.player) {
-        if (!nativePlayerKey(direction) && (direction === "left" || direction === "right")) {
-          playerDirectional(direction);
-        }
+        if (direction === "left" || direction === "right") playerDirectional(direction);
+        else nativePlayerKey(direction);
       } else if (!adjustTextCaret(target, direction) && !adjustSelect(target, direction)) {
         moveFocus(direction);
       }
@@ -1168,7 +1216,7 @@
     }
     if (action === "select") {
       if (state.player) {
-        if (!nativePlayerKey("select")) postPlayerCommand("toggle");
+        if (!nativePlayerKey("play-pause")) postPlayerCommand("toggle");
         return true;
       }
       var active = document.activeElement;
@@ -1192,11 +1240,11 @@
       return true;
     }
     if (action === "rewind" && state.player) {
-      if (!nativePlayerKey("rewind")) playerDirectional("left");
+      if (!nativePlayerSeek(-300)) postPlayerCommand("seek-relative", { offsetSeconds: -300 });
       return true;
     }
     if (action === "fast-forward" && state.player) {
-      if (!nativePlayerKey("fast-forward")) playerDirectional("right");
+      if (!nativePlayerSeek(300)) postPlayerCommand("seek-relative", { offsetSeconds: 300 });
       return true;
     }
     if (action === "stop" && state.player) {
@@ -1210,7 +1258,8 @@
     handle: function (action) {
       try { return remoteAction(String(action || "")); }
       catch (error) { return true; }
-    }
+    },
+    update: handleUpdateStatus
   });
 
   function setupKeyboard() {
@@ -1286,6 +1335,7 @@
     ui.searchForm = document.getElementById("search-form");
     ui.searchInput = document.getElementById("search-input");
     ui.profileButton = document.getElementById("profile-button");
+    ui.updateButton = document.getElementById("update-button");
     ui.settingsButton = document.getElementById("settings-button");
     ui.detailsDialog = document.getElementById("details-dialog");
     ui.detailsContent = document.getElementById("details-content");
@@ -1315,6 +1365,7 @@
       renderSearch(ui.searchInput.value);
     });
     ui.profileButton.addEventListener("click", function () { renderProfiles(false, true); });
+    ui.updateButton.addEventListener("click", checkForUpdates);
     ui.settingsButton.addEventListener("click", function () { openSettings(false); });
     ui.detailsClose.addEventListener("click", closeDetails);
     ui.settingsClose.addEventListener("click", closeSettings);
