@@ -7,6 +7,7 @@ build_file="$project_root/app/build.gradle"
 source_root="$project_root/app/src/main"
 remote_source="$source_root/java/app/pistick/android/FireTvRemote.java"
 activity_source="$source_root/java/app/pistick/android/MainActivity.java"
+ad_blocker_source="$source_root/java/app/pistick/android/WebAdBlocker.java"
 bridge_source="$source_root/java/app/pistick/android/PiStickBridge.java"
 release_source="$source_root/java/app/pistick/android/FireTvRelease.java"
 updater_source="$source_root/java/app/pistick/android/FireTvUpdater.java"
@@ -43,6 +44,16 @@ require_text "$activity_source" 'window.PiStickFireTV'
 require_text "$activity_source" 'APP_ORIGIN = "https://" + APP_HOST'
 require_text "$activity_source" 'shouldInterceptRequest'
 require_text "$activity_source" 'showSoftKeyboard()'
+require_text "$activity_source" 'InputMethodManager.SHOW_FORCED'
+require_text "$activity_source" 'WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE'
+require_text "$activity_source" 'public boolean onCreateWindow('
+if [[ "$(grep --fixed-strings --count -- 'public boolean onCreateWindow(' "$activity_source")" -ne 1 ]]; then
+  echo "Exactly one popup-blocking WebView handler is required." >&2
+  exit 1
+fi
+require_text "$activity_source" 'WebAdBlocker.shouldBlock(url.toString())'
+require_text "$ad_blocker_source" 'doubleclick.net'
+require_text "$ad_blocker_source" 'popunder='
 require_text "$activity_source" 'requestPlayerAutostart()'
 require_text "$activity_source" 'void seekPlayer(int offsetSeconds)'
 require_text "$activity_source" 'dispatchFullscreenPlayerEvent(event, action)'
@@ -61,12 +72,23 @@ require_text "$web_app" 'window.PiStickFireTV'
 require_text "$web_app" 'focusRoot()'
 require_text "$web_app" 'moveRailFocus(current, direction)'
 require_text "$web_app" 'nativeUi("showKeyboard")'
+require_text "$web_app" 'input.addEventListener("click"'
+require_text "$web_app" 'state.currentView === "profiles" && !state.manageProfiles'
+if [[ "$(grep --fixed-strings --count -- 'openSettings(false)' "$web_app")" -ne 2 ]]; then
+  echo "Settings must only open from profile selection or its Fire TV Menu shortcut." >&2
+  exit 1
+fi
 require_text "$web_app" 'nativeUi("requestPlayerAutostart")'
 require_text "$web_app" 'enablejsapi=1&playsinline=1&origin='
 require_text "$web_app" 'FIRE_TV ? "w342" : "w500"'
 require_text "$web_app" 'nativePlayerSeek(-300)'
 require_text "$web_app" 'nativePlayerSeek(300)'
 require_text "$web_index" 'id="update-button"'
+require_text "$web_index" 'class="settings-update-row"'
+if grep --fixed-strings --quiet -- 'id="settings-button"' "$web_index"; then
+  echo "Settings must only be exposed from the profile-selection screen." >&2
+  exit 1
+fi
 require_text "$web_styles" '.fire-tv .player-toolbar,'
 require_text "$web_styles" 'width: 100vw;'
 require_text "$web_styles" 'height: 100vh;'

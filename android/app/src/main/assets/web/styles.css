@@ -580,6 +580,18 @@ textarea::placeholder { color: #85858d; }
 .field-label { display: block; margin: 22px 0 8px; font-weight: 800; }
 .settings-dialog textarea { resize: vertical; min-height: 105px; padding: 12px; line-height: 1.4; }
 .settings-dialog[data-required="1"] #settings-close { display: none; }
+.settings-update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid #303036;
+}
+.settings-update-row h3 { margin: 0 0 5px; font-size: 19px; }
+.settings-update-row p { margin: 0; }
+.settings-update-row .update-button { flex: 0 0 auto; }
 .form-message { min-height: 22px; margin: 10px 0; color: #ff9ca1; }
 .form-message.success { color: #7ce69a; }
 

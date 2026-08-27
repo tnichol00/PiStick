@@ -21,8 +21,8 @@ android {
         applicationId "app.pistick.firetv"
         minSdk 25
         targetSdk 36
-        versionCode 3
-        versionName "1.0.2-firetv"
+        versionCode 4
+        versionName "1.0.3-firetv"
 
         testInstrumentationRunner "android.test.InstrumentationTestRunner"
     }

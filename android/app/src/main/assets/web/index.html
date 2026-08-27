@@ -22,8 +22,6 @@
       <input id="search-input" type="search" maxlength="120" autocomplete="off" inputmode="search" enterkeyhint="search" placeholder="Search">
     </form>
     <button id="profile-button" class="profile-button" type="button">Profiles</button>
-    <button id="update-button" class="profile-button update-button" type="button">Update App</button>
-    <button id="settings-button" class="icon-button" type="button" aria-label="Settings" title="Settings">⚙</button>
   </header>
 
   <main id="app" tabindex="-1" aria-live="polite"></main>
@@ -44,9 +42,16 @@
       </div>
       <p class="muted">Your TMDB credential is validated directly with TMDB and encrypted using this device's Android Keystore. PiStick accepts either the long Read Access Token or the shorter v3 API key.</p>
       <label class="field-label" for="tmdb-token">TMDB Read Access Token or API key</label>
-      <textarea id="tmdb-token" rows="4" spellcheck="false" autocapitalize="none" autocomplete="off" placeholder="Paste your TMDB credential"></textarea>
+      <textarea id="tmdb-token" rows="4" spellcheck="false" autocapitalize="none" autocomplete="off" inputmode="text" placeholder="Paste your TMDB credential"></textarea>
       <p id="settings-message" class="form-message" role="status"></p>
       <button id="save-settings" class="primary-button full-button" type="submit">Validate and save</button>
+      <div class="settings-update-row">
+        <div>
+          <h3>App updates</h3>
+          <p class="muted">Check GitHub for the newest stable PiStick Fire TV release.</p>
+        </div>
+        <button id="update-button" class="secondary-button update-button" type="button">Update App</button>
+      </div>
     </form>
   </dialog>
 

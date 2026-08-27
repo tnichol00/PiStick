@@ -30,6 +30,7 @@ import android.widget.TextView;
 
 import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -57,7 +58,10 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(BACKGROUND);
         getWindow().setNavigationBarColor(BACKGROUND);
-        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        getWindow().setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                        | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+        );
         hideSystemUi();
 
         root = new FrameLayout(this);
@@ -90,6 +94,8 @@ public final class MainActivity extends Activity {
 
         android.webkit.WebSettings settings = candidate.getSettings();
         settings.setJavaScriptEnabled(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(false);
+        settings.setSupportMultipleWindows(false);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
@@ -103,6 +109,9 @@ public final class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setSupportZoom(false);
         settings.setTextZoom(100);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            settings.setSafeBrowsingEnabled(true);
+        }
         // This WebView is always attached and visible. Pre-rasterizing its large
         // 1080p/4K surface wastes memory and GPU time on Fire TV hardware.
         settings.setOffscreenPreRaster(false);
@@ -243,10 +252,21 @@ public final class MainActivity extends Activity {
         current.post(() -> {
             if (webView != current || isFinishing() || isDestroyed()) return;
             current.requestFocus(View.FOCUS_DOWN);
+            current.requestFocusFromTouch();
             InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
             if (keyboard == null) return;
+            getWindow().setSoftInputMode(
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                            | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+            );
             keyboard.restartInput(current);
             keyboard.showSoftInput(current, InputMethodManager.SHOW_IMPLICIT);
+            current.postDelayed(() -> {
+                if (webView != current || isFinishing() || isDestroyed()) return;
+                current.requestFocusFromTouch();
+                keyboard.restartInput(current);
+                keyboard.showSoftInput(current, InputMethodManager.SHOW_FORCED);
+            }, 120);
         });
     }
 
@@ -255,6 +275,10 @@ public final class MainActivity extends Activity {
         if (current == null) return;
         InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (keyboard != null) keyboard.hideSoftInputFromWindow(current.getWindowToken(), 0);
+        getWindow().setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                        | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+        );
     }
 
     void requestPlayerAutostart() {
@@ -452,6 +476,14 @@ public final class MainActivity extends Activity {
         return Base64.encodeToString(random, Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE);
     }
 
+    private static WebResourceResponse blockedResponse() {
+        return new WebResourceResponse(
+                "text/plain",
+                StandardCharsets.UTF_8.name(),
+                new ByteArrayInputStream(new byte[0])
+        );
+    }
+
     private void hideSystemUi() {
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE
@@ -467,28 +499,30 @@ public final class MainActivity extends Activity {
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
             Uri url = request.getUrl();
-            if (!"https".equalsIgnoreCase(url.getScheme()) || !APP_HOST.equalsIgnoreCase(url.getHost())) {
+            if ("https".equalsIgnoreCase(url.getScheme()) && APP_HOST.equalsIgnoreCase(url.getHost())) {
+                String path = url.getPath();
+                try {
+                    if ("/styles.css".equals(path)) {
+                        return new WebResourceResponse("text/css", StandardCharsets.UTF_8.name(),
+                                getAssets().open("web/styles.css"));
+                    }
+                    if ("/app.js".equals(path)) {
+                        return new WebResourceResponse("application/javascript", StandardCharsets.UTF_8.name(),
+                                getAssets().open("web/app.js"));
+                    }
+                } catch (IOException ignored) {
+                    // The initial asset check will show a clear reinstall message.
+                }
                 return null;
             }
-            String path = url.getPath();
-            try {
-                if ("/styles.css".equals(path)) {
-                    return new WebResourceResponse("text/css", StandardCharsets.UTF_8.name(),
-                            getAssets().open("web/styles.css"));
-                }
-                if ("/app.js".equals(path)) {
-                    return new WebResourceResponse("application/javascript", StandardCharsets.UTF_8.name(),
-                            getAssets().open("web/app.js"));
-                }
-            } catch (IOException ignored) {
-                // The initial asset check will show a clear reinstall message.
-            }
+            if (WebAdBlocker.shouldBlock(url.toString())) return blockedResponse();
             return null;
         }
 
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             Uri url = request.getUrl();
+            if (WebAdBlocker.shouldBlock(url.toString())) return true;
             String scheme = url.getScheme() == null ? "" : url.getScheme().toLowerCase(Locale.ROOT);
             if (request.isForMainFrame()) {
                 boolean localApp = "https".equals(scheme) && APP_HOST.equalsIgnoreCase(url.getHost());
@@ -520,6 +554,18 @@ public final class MainActivity extends Activity {
 
     private final class PiStickChromeClient extends WebChromeClient {
         @Override
+        public boolean onCreateWindow(
+                WebView view,
+                boolean isDialog,
+                boolean isUserGesture,
+                android.os.Message resultMsg
+        ) {
+            // Embedded players do not need secondary windows. Ad networks use
+            // them for popups and click-under tabs, so reject them completely.
+            return false;
+        }
+
+        @Override
         public void onShowCustomView(View view, CustomViewCallback callback) {
             showCustomView(view, callback);
         }
@@ -532,16 +578,6 @@ public final class MainActivity extends Activity {
         @Override
         public void onPermissionRequest(PermissionRequest request) {
             request.deny();
-        }
-
-        @Override
-        public boolean onCreateWindow(
-                WebView view,
-                boolean isDialog,
-                boolean isUserGesture,
-                android.os.Message resultMsg
-        ) {
-            return false;
         }
 
         @Override

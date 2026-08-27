@@ -38,7 +38,7 @@ Development APKs are debug-signed and may not update over a stable release.
 
 ```bash
 adb connect FIRE_TV_IP:5555
-adb install -r PiStick-Fire-TV-v3.apk
+adb install -r PiStick-Fire-TV-v4.apk
 ```
 
 Replace `FIRE_TV_IP` with the address shown by Fire TV and replace the APK filename with the exact file you downloaded (`PiStick-Fire-TV-debug.apk` for a development build). Accept the debugging prompt on the television. If `adb install -r` reports an incompatible signature, uninstall the existing PiStick Fire TV build and install again; uninstalling removes that installation's profiles and watch history.
@@ -53,7 +53,7 @@ During playback, PiStick fills the screen automatically. **Select** or **Play/Pa
 
 ## Update PiStick Fire TV
 
-Select **Update App** beside the Settings icon. PiStick checks the stable GitHub releases for a newer Fire TV APK, downloads it, verifies its GitHub SHA-256 digest, package name, version, and signing certificate, and then opens Fire OS's installer. The first update may ask you to allow PiStick under **Install unknown apps**. Confirm **Install** on the Fire TV screen.
+On the profile-selection screen, select **App Settings**, then select **Update App** inside Settings. PiStick checks the stable GitHub releases for a newer Fire TV APK, downloads it, verifies its GitHub SHA-256 digest, package name, version, and signing certificate, and then opens Fire OS's installer. The first update may ask you to allow PiStick under **Install unknown apps**. Confirm **Install** on the Fire TV screen.
 
 Android replaces the old app code while retaining PiStick's configuration, profiles, and watch history. PiStick removes its obsolete downloaded update APKs the next time it starts.
 

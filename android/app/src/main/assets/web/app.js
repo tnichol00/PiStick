@@ -227,7 +227,6 @@
     card.append(element("p", "muted", error.message || String(error)));
     var row = element("div", "button-row");
     if (retry) row.append(button("Try again", "primary-button", retry));
-    row.append(button("Settings", "secondary-button", function () { openSettings(false); }));
     card.append(row);
     page.append(card);
     ui.app.replaceChildren(page);
@@ -341,9 +340,11 @@
       panel.append(button("Manage Profiles", "secondary-button", function () { renderProfiles(true); }));
     }
 
-    var settings = button("App Settings", "nav-button", function () { openSettings(false); });
-    settings.style.marginTop = "18px";
-    panel.append(settings);
+    if (!manage) {
+      var settings = button("App Settings", "nav-button", function () { openSettings(false); });
+      settings.style.marginTop = "18px";
+      panel.append(settings);
+    }
     page.append(panel);
     ui.app.replaceChildren(page);
     window.setTimeout(focusFirst, 50);
@@ -864,6 +865,7 @@
   }
 
   function openSettings(required) {
+    if (!required && (state.currentView !== "profiles" || state.manageProfiles)) return;
     if (state.textEntry) finishTextEntry();
     ui.settingsMessage.textContent = state.status && state.status.tmdb_configured ? "A credential is already saved. Paste a new one only to replace it." : "A TMDB credential is required before titles can load.";
     ui.settingsMessage.classList.remove("success");
@@ -1165,7 +1167,6 @@
       var end = target.value.length;
       target.setSelectionRange(end, end);
     }
-    target.click();
     nativeUi("showKeyboard");
     return true;
   }
@@ -1228,7 +1229,7 @@
     if (action === "back") return backAction();
     if (action === "menu") {
       if (state.player) postPlayerCommand("subtitles-english-toggle");
-      else openSettings(false);
+      else if (state.currentView === "profiles" && !state.manageProfiles) openSettings(false);
       return true;
     }
     if (action === "play-pause" && state.player) {
@@ -1336,7 +1337,6 @@
     ui.searchInput = document.getElementById("search-input");
     ui.profileButton = document.getElementById("profile-button");
     ui.updateButton = document.getElementById("update-button");
-    ui.settingsButton = document.getElementById("settings-button");
     ui.detailsDialog = document.getElementById("details-dialog");
     ui.detailsContent = document.getElementById("details-content");
     ui.detailsClose = document.getElementById("details-close");
@@ -1366,7 +1366,6 @@
     });
     ui.profileButton.addEventListener("click", function () { renderProfiles(false, true); });
     ui.updateButton.addEventListener("click", checkForUpdates);
-    ui.settingsButton.addEventListener("click", function () { openSettings(false); });
     ui.detailsClose.addEventListener("click", closeDetails);
     ui.settingsClose.addEventListener("click", closeSettings);
     ui.playerClose.addEventListener("click", closePlayer);
@@ -1421,6 +1420,9 @@
       }
     });
     [ui.searchInput, ui.settingsToken].forEach(function (input) {
+      input.addEventListener("click", function () {
+        if (state.textEntry !== input) beginTextEntry(input);
+      });
       input.addEventListener("blur", function () {
         if (state.textEntry === input) state.textEntry = null;
       });
