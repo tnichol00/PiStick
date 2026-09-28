@@ -94,6 +94,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         shell: bash
         run: |
+          test "$(gh repo view tnichol00/PrintPulse --json isPrivate --jq .isPrivate)" = true || { echo '::error::Use encrypted export for a public repository; IPA profiles contain device identifiers.'; exit 1; }
           test -s ios/build/PrintPulse.ipa
           tag="ios-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh release create "$tag" ios/build/PrintPulse.ipa \
