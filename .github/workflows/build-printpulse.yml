@@ -1,0 +1,81 @@
+name: Build PrintPulse using existing Apple signing
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: Distribution method
+        required: true
+        type: choice
+        options: [testflight, adhoc]
+        default: adhoc
+permissions:
+  contents: read
+concurrency:
+  group: printpulse-ios-signing
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      PRINTPULSE_BUNDLE_ID: com.tnichol00.PrintPulse
+      MATCH_REPOSITORY: ${{ vars.MATCH_REPOSITORY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      PRINTPULSE_BUILD_NUMBER: ${{ github.run_number }}
+      DISTRIBUTION: ${{ inputs.distribution }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: tnichol00/PrintPulse
+          ref: main
+          token: ${{ secrets.GH_PAT }}
+      - name: Verify signing configuration
+        shell: bash
+        run: |
+          missing=()
+          for name in PRINTPULSE_BUNDLE_ID MATCH_REPOSITORY APPLE_TEAM_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_PRIVATE_KEY MATCH_PASSWORD GH_PAT; do
+            if [[ -z "${!name}" ]]; then missing+=("$name"); fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::Apple signing is not connected. Missing settings: ${missing[*]}"
+            exit 1
+          fi
+          [[ "$PRINTPULSE_BUNDLE_ID" =~ ^[A-Za-z0-9]+(\.[A-Za-z0-9-]+)+$ ]] || { echo '::error::Invalid bundle identifier'; exit 1; }
+          [[ "$MATCH_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo '::error::Invalid signing repository'; exit 1; }
+      - name: Prepare signing-repository access
+        shell: bash
+        run: |
+          authorization="$(printf 'x-access-token:%s' "$GH_PAT" | base64 | tr -d '\n')"
+          echo "::add-mask::$authorization"
+          echo "MATCH_GIT_BASIC_AUTHORIZATION=$authorization" >> "$GITHUB_ENV"
+          echo "MATCH_REPOSITORY_URL=https://github.com/${MATCH_REPOSITORY}.git" >> "$GITHUB_ENV"
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: ios
+      - name: Build and sign app and widget
+        working-directory: ios
+        run: bundle exec fastlane ios distribute
+      - name: Save signed IPA in private PrintPulse repository
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        shell: bash
+        run: |
+          test -s ios/build/PrintPulse.ipa
+          tag="ios-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" ios/build/PrintPulse.ipa \
+            --repo tnichol00/PrintPulse --target "$(git rev-parse HEAD)" --prerelease \
+            --title "PrintPulse for iPhone (${DISTRIBUTION})" \
+            --notes "Signed PrintPulse settings app and home-screen widget. Distribution: ${DISTRIBUTION}. On-device validation is pending."
