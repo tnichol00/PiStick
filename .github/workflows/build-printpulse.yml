@@ -8,6 +8,10 @@ on:
         type: choice
         options: [testflight, adhoc]
         default: adhoc
+      export_certificate:
+        description: Optional public PEM certificate for encrypted IPA download
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -67,8 +71,25 @@ jobs:
       - name: Build and sign app and widget
         working-directory: ios
         run: bundle exec fastlane ios distribute
+      - name: Encrypt IPA for local download
+        if: success() && inputs.export_certificate != ''
+        env:
+          EXPORT_CERTIFICATE: ${{ inputs.export_certificate }}
+        shell: bash
+        run: |
+          printf '%s\n' "$EXPORT_CERTIFICATE" > "$RUNNER_TEMP/printpulse-export.pem"
+          openssl cms -encrypt -binary -aes-256-cbc -in ios/build/PrintPulse.ipa \
+            -out ios/build/PrintPulse.ipa.p7m -outform DER "$RUNNER_TEMP/printpulse-export.pem"
+      - name: Save encrypted IPA
+        if: success() && inputs.export_certificate != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: PrintPulse-encrypted-IPA
+          path: ios/build/PrintPulse.ipa.p7m
+          retention-days: 3
+          if-no-files-found: error
       - name: Save signed IPA in private PrintPulse repository
-        if: success()
+        if: success() && inputs.export_certificate == ''
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         shell: bash
